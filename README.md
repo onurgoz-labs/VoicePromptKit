@@ -1,6 +1,15 @@
 # PromptChecker
 
-Claude Code plugin that audits prompts for conflicting instructions, dominating directives, behavioural drift, and gaps.
+Claude Code plugin that audits prompts through **four lenses**:
+
+| Lens | Looks for | Implementer |
+|---|---|---|
+| **Conflict** | Rules that logically contradict each other (e.g. "always formal" + "be casual") | `conflict-lens` agent (static) |
+| **Dominance** | Rules that silently override others by position, length, specificity, recency, or role-override patterns | `dominance-lens` agent (static) |
+| **Gap** | Undefined edge cases, ambiguous terms, missing failure modes | `gap-lens` agent (static) |
+| **Drift** | Behavioural drift between the prompt's stated rules and the model's actual output, surfaced via adversarial scenarios run against a real LLM | `scenario-generator` → `behavior-runner` → `judge` pipeline (dynamic) |
+
+The lens registry lives in `lib/lenses.ts`. Extending the toolkit with a 5th lens means adding an entry there and wiring an implementer agent.
 
 ## Usage
 
@@ -25,13 +34,13 @@ anchors:
 ---
 ```
 
-## How it works
+## Pipeline
 
-1. Static lenses extract rules and detect conflicts, dominance, gaps (parallel).
-2. Scenario generator builds adversarial tests from rules, anchors, and probe templates.
-3. Behaviour runner executes them against Claude (default) or OpenAI/Codex.
-4. Judge applies rule assertions + LLM rubric to score each run.
-5. Reporters emit inline annotations and/or Markdown/HTML/JSON files.
+1. **Parse frontmatter** (`lib/frontmatter-cli.ts`) — type, target model, anchors, output formats.
+2. **Extract rules** (`rule-extractor` agent) — atomic, line-anchored, categorised obligations.
+3. **Static lenses run in parallel** — conflict + dominance + gap all consume the rule list.
+4. **Drift lens (dynamic pipeline)** — scenarios are generated, run against Claude (default) or OpenAI/Codex, judged with rule assertions + LLM rubric.
+5. **Reporters** — inline annotations on the prompt file, plus optional Markdown / HTML / JSON files under `.promptcheck/`.
 
 ## Environment
 
