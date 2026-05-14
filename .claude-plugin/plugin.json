@@ -1,0 +1,19 @@
+{
+  "name": "promptchecker",
+  "version": "0.1.0",
+  "description": "Audit prompts for conflicts, dominance, behavioural drift, and gaps.",
+  "author": "onur@redrose.io",
+  "homepage": "https://github.com/onurgoz/PromptChecker",
+  "commands": ["commands/prompt-check.md"],
+  "agents": [
+    "agents/prompt-check-orchestrator.md",
+    "agents/rule-extractor.md",
+    "agents/conflict-detector.md",
+    "agents/priority-analyzer.md",
+    "agents/gap-finder.md",
+    "agents/scenario-generator.md",
+    "agents/behavior-runner.md",
+    "agents/judge.md"
+  ],
+  "skills": ["skills/prompt-check/SKILL.md"]
+}
