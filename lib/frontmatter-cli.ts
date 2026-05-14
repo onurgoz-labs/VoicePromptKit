@@ -12,4 +12,6 @@ async function main(): Promise<void> {
   process.stdout.write(JSON.stringify({ frontmatter, bodyLength: body.length }));
 }
 
-void main();
+if (import.meta.url === `file://${process.argv[1]}`) {
+  void main();
+}
