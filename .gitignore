@@ -38,3 +38,12 @@ coverage/
 
 # Notes worktree
 /notes/
+
+# Claude Code local-only settings
+.claude/settings.local.json
+
+# >>> sync-notes managed entries >>>
+# Notes worktree (tracked in notes branch)
+/.notes
+/notes/
+# <<< sync-notes managed entries <<<
