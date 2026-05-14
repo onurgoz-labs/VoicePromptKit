@@ -1,7 +1,7 @@
 import yaml from 'js-yaml';
 import { Frontmatter } from './types';
 
-const FRONTMATTER_REGEX = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/;
+const FRONTMATTER_REGEX = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/;
 
 export function parsePromptFile(raw: string): { frontmatter: Frontmatter; body: string } {
   const match = raw.match(FRONTMATTER_REGEX);
@@ -15,5 +15,5 @@ export function parsePromptFile(raw: string): { frontmatter: Frontmatter; body: 
 }
 
 export function stripPromptCheckerAnnotations(body: string): string {
-  return body.replace(/^<!-- PROMPTCHECK \[.*?\] L\d+[^>]*-->\n?/gm, '');
+  return body.replace(/^<!-- PROMPTCHECK \[.*?\] L\d+[^>]*-->\r?\n?/gm, '');
 }

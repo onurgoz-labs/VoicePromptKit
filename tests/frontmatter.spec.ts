@@ -32,4 +32,12 @@ describe('parsePromptFile', () => {
     const raw = `---\ntype: invalid_type\n---\nbody`;
     expect(() => parsePromptFile(raw)).toThrow();
   });
+
+  it('handles CRLF line endings (cross-platform)', () => {
+    const raw = `---\r\ntype: system\r\nexpand_count: 2\r\n---\r\nWindows body\r\n`;
+    const { frontmatter, body } = parsePromptFile(raw);
+    expect(frontmatter.type).toBe('system');
+    expect(frontmatter.expand_count).toBe(2);
+    expect(body.trim()).toBe('Windows body');
+  });
 });
