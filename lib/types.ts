@@ -21,7 +21,6 @@ export interface LensManifest {
   description: string;
   implementer: string[];
   artefacts: string[];
-  reportSection: 'conflicts' | 'dominances' | 'gaps' | 'drift';
 }
 
 export const Anchor = z.object({
