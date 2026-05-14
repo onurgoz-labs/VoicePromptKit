@@ -22,4 +22,8 @@ describe('selectAdapter', () => {
   it('throws when no rule matches', () => {
     expect(() => selectAdapter({ model: 'mystery-1' })).toThrow();
   });
+  it('throws on invalid PROMPTCHECK_PROVIDER value', () => {
+    expect(() => selectAdapter({ model: 'claude-opus-4-7', env: { PROMPTCHECK_PROVIDER: 'gemini' } }))
+      .toThrow(/PROMPTCHECK_PROVIDER="gemini" is invalid/);
+  });
 });

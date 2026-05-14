@@ -8,9 +8,15 @@ export interface SelectOpts {
   env?: Record<string, string | undefined>;
 }
 
+const VALID_PROVIDERS = new Set(['anthropic', 'openai']);
+
 export function selectAdapter(opts: SelectOpts): IAdapter {
   const env = opts.env ?? process.env;
-  const envProvider = env.PROMPTCHECK_PROVIDER as 'anthropic' | 'openai' | undefined;
+  const rawEnv = env.PROMPTCHECK_PROVIDER;
+  if (rawEnv !== undefined && !VALID_PROVIDERS.has(rawEnv)) {
+    throw new Error(`PROMPTCHECK_PROVIDER="${rawEnv}" is invalid. Expected one of: ${[...VALID_PROVIDERS].join(', ')}.`);
+  }
+  const envProvider = rawEnv as 'anthropic' | 'openai' | undefined;
 
   const provider = opts.providerOverride ?? envProvider ?? inferProvider(opts.model);
   if (!provider) {
