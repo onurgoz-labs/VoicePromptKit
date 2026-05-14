@@ -14,7 +14,8 @@
     "declaration": false,
     "sourceMap": true,
     "isolatedModules": true,
-    "verbatimModuleSyntax": false
+    "verbatimModuleSyntax": false,
+    "types": ["node"]
   },
   "include": ["lib/**/*.ts", "tests/**/*.ts"],
   "exclude": ["dist", "node_modules", "notes"]
