@@ -17,14 +17,14 @@ export class AnthropicAdapter implements IAdapter {
   async run(opts: RunOpts): Promise<RunResult> {
     const start = Date.now();
     try {
-      const system = opts.cacheSystemPrompt
-        ? [{ type: 'text' as const, text: opts.systemPrompt, cache_control: { type: 'ephemeral' as const } }]
+      const system: string | Anthropic.TextBlockParam[] = opts.cacheSystemPrompt
+        ? [{ type: 'text', text: opts.systemPrompt, cache_control: { type: 'ephemeral' } }]
         : opts.systemPrompt;
       const res = await this.client.messages.create({
         model: opts.model,
         max_tokens: opts.maxTokens ?? 1024,
         temperature: opts.temperature ?? 0,
-        system: system as never,
+        system,
         messages: [{ role: 'user', content: opts.userInput }],
       });
       const text = res.content
