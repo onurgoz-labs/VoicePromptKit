@@ -1,6 +1,6 @@
 ---
-name: gap-finder
-description: Surface undefined behaviours, ambiguous terms, and missing edge cases in a prompt.
+name: gap-lens
+description: Gap lens — surface undefined behaviours, ambiguous terms, and missing edge cases in a prompt.
 tools:
 ---
 

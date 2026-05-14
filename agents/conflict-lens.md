@@ -1,6 +1,6 @@
 ---
-name: conflict-detector
-description: Detect logical contradictions between extracted rules. Output severity-rated conflict clusters.
+name: conflict-lens
+description: Conflict lens — detect logical contradictions between extracted rules. Output severity-rated conflict clusters.
 tools:
 ---
 

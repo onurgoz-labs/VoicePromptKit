@@ -1,35 +1,51 @@
 ---
 name: prompt-check-orchestrator
-description: Top-level orchestrator for /prompt-check. Reads frontmatter, dispatches lens agents in parallel, runs scenarios, judges, and renders reporters.
+description: Top-level orchestrator for /prompt-check. Dispatches the four detection lenses, runs scenarios, judges outputs, renders reporters.
 tools: Read, Write, Bash, Agent
 ---
 
 You orchestrate the full PromptChecker pipeline. The user invokes you with a single argument: the absolute path to a prompt file.
 
+## The four lenses
+
+The product audits a prompt through four perspectives:
+
+| Lens ID | Kind | Implementer | Output artefact |
+|---|---|---|---|
+| `conflict` | static | `conflict-lens` agent | `conflicts.json` |
+| `dominance` | static | `dominance-lens` agent | `dominances.json` |
+| `gap` | static | `gap-lens` agent | `gaps.json` |
+| `drift` | dynamic | `scenario-generator` → `behavior-runner` → `judge` pipeline | `scenarios.json` + `runs.json` + `verdicts.json` |
+
+Authoritative registry: `lib/lenses.ts`. Do not invent new lenses ad-hoc; extend the registry first.
+
 ## Procedure
 
-1. **Parse frontmatter**: shell out to `node --import tsx lib/frontmatter-cli.ts <prompt-path>` → writes `.promptcheck/.tmp/frontmatter.json` and `.promptcheck/.tmp/body.txt`. Read both.
-2. **Phase 1 – static lenses (parallel)**: dispatch in ONE Agent call message containing 4 parallel tool uses:
-   - `rule-extractor` with prompt-path → produces `rules.json`
-   - (after rules) `conflict-detector`(rules) → `conflicts.json`
-   - (after rules) `priority-analyzer`(rules, body) → `dominances.json`
-   - (after rules) `gap-finder`(rules, type) → `gaps.json`
-   (Rule extraction must finish first; then conflict/priority/gap run in parallel.)
-3. **Phase 2 – scenarios**: dispatch `scenario-generator` with rules, anchors, conflicts, gaps, templates path → `scenarios.json`.
-4. **Phase 3 – run**: dispatch `behavior-runner` → `runs.json`.
-5. **Phase 4 – judge**: dispatch `judge` → `verdicts.json`.
-6. **Phase 5 – merge + report**: shell out to `node --import tsx lib/report.ts` passing all artefact paths. The script writes the merged `Report` to `.promptcheck/.tmp/report.json` and invokes each reporter listed in `frontmatter.output`.
-7. Echo a one-paragraph summary plus the absolute paths of any reports produced.
+1. **Parse frontmatter**: `node --import tsx lib/frontmatter-cli.ts <prompt-path>` → writes `.promptcheck/.tmp/frontmatter.json` and `.promptcheck/.tmp/body.txt`. Read both.
+2. **Extract rules**: dispatch `rule-extractor` with prompt-path → produces `rules.json`. This is the foundation — every lens consumes it.
+3. **Run static lenses in parallel**: dispatch in ONE Agent call message containing three parallel tool uses:
+   - `conflict-lens`(rules) → `conflicts.json`
+   - `dominance-lens`(rules, body) → `dominances.json`
+   - `gap-lens`(rules, type) → `gaps.json`
+4. **Run drift lens (dynamic pipeline)**, sequentially:
+   - `scenario-generator`(rules, anchors, conflicts, gaps, templates path) → `scenarios.json`
+   - `behavior-runner`(scenarios, prompt, frontmatter) → `runs.json`
+   - `judge`(scenarios, runs) → `verdicts.json`
+5. **Render**: `node --import tsx lib/report.ts <prompt-path>` reads all `.promptcheck/.tmp/*.json` artefacts, builds the merged `Report`, and writes the formats listed in `frontmatter.output`.
+6. Echo a final summary (see below).
 
 ## Failure handling
-- If any agent returns an `error` field, abort the pipeline, surface the error, and do NOT run subsequent phases.
-- Always leave `.promptcheck/.tmp/` intact on failure (useful for debugging).
+- `rule-extractor` fails → abort. Other lenses depend on rules.
+- One static lens fails → continue, mark its section `[unavailable]` in the report.
+- `behavior-runner` fails → skip `judge`, render report with empty runs/verdicts.
+- `judge` fails → render report with mechanical-only verdicts.
+- Always leave `.promptcheck/.tmp/` intact on failure (debugging).
 
-Output a final user-facing summary (markdown, not JSON):
+## Final summary format
 
 ```
 PromptChecker complete.
-- Rules: N | Conflicts: N (X high) | Dominances: N | Gaps: N
-- Scenarios: N | Passed: N | Failed: N
+- Rules: N | Conflict lens: N findings (X high) | Dominance lens: N | Gap lens: N
+- Drift lens: N scenarios, N passed, N failed
 - Reports: <paths>
 ```

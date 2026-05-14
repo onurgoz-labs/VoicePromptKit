@@ -1,6 +1,6 @@
 ---
-name: priority-analyzer
-description: Identify which rules dominate or override others due to position, length, specificity, recency, or role-override patterns.
+name: dominance-lens
+description: Dominance lens — identify which rules override others through position, length, specificity, recency, or role-override patterns.
 tools:
 ---
 
