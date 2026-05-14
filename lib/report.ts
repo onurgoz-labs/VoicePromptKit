@@ -5,29 +5,47 @@ import { writeHtmlReport } from './reporters/html';
 import { writeInlineReport } from './reporters/inline';
 import type { Report, OutputFormat } from './types';
 
+const TMP = '.promptcheck/.tmp';
+
+async function loadOptional<T>(path: string, fallback: T): Promise<T> {
+  try {
+    return JSON.parse(await readFile(path, 'utf8'));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return fallback;
+    process.stderr.write(`[report] ${path} malformed, falling back: ${(err as Error).message}\n`);
+    return fallback;
+  }
+}
+
 async function main(): Promise<void> {
   const promptPath = process.argv[2];
   if (!promptPath) throw new Error('Usage: report.ts <prompt-path>');
-  const fm = JSON.parse(await readFile('.promptcheck/.tmp/frontmatter.json', 'utf8')) as { output: OutputFormat[]; target_model: string; type?: string };
-  const rules = JSON.parse(await readFile('.promptcheck/.tmp/rules.json', 'utf8')).rules;
-  const conflicts = JSON.parse(await readFile('.promptcheck/.tmp/conflicts.json', 'utf8')).conflicts;
-  const dominances = JSON.parse(await readFile('.promptcheck/.tmp/dominances.json', 'utf8')).dominances;
-  const gaps = JSON.parse(await readFile('.promptcheck/.tmp/gaps.json', 'utf8')).gaps;
-  const scenarios = JSON.parse(await readFile('.promptcheck/.tmp/scenarios.json', 'utf8')).scenarios;
-  const runs = JSON.parse(await readFile('.promptcheck/.tmp/runs.json', 'utf8')).runs;
-  const verdicts = JSON.parse(await readFile('.promptcheck/.tmp/verdicts.json', 'utf8')).verdicts;
+  const fm = await loadOptional(`${TMP}/frontmatter.json`, { output: ['inline'] as OutputFormat[], target_model: 'unknown', type: undefined as string | undefined });
+  const rules = (await loadOptional<{ rules: unknown[] }>(`${TMP}/rules.json`, { rules: [] })).rules;
+  const conflicts = (await loadOptional<{ conflicts: unknown[] }>(`${TMP}/conflicts.json`, { conflicts: [] })).conflicts;
+  const dominances = (await loadOptional<{ dominances: unknown[] }>(`${TMP}/dominances.json`, { dominances: [] })).dominances;
+  const gaps = (await loadOptional<{ gaps: unknown[] }>(`${TMP}/gaps.json`, { gaps: [] })).gaps;
+  const scenarios = (await loadOptional<{ scenarios: unknown[] }>(`${TMP}/scenarios.json`, { scenarios: [] })).scenarios;
+  const runs = (await loadOptional<{ runs: unknown[] }>(`${TMP}/runs.json`, { runs: [] })).runs;
+  const verdicts = (await loadOptional<{ verdicts: unknown[] }>(`${TMP}/verdicts.json`, { verdicts: [] })).verdicts;
 
   const report: Report = {
     prompt_path: promptPath,
     prompt_type: fm.type as never,
     target_model: fm.target_model,
-    rules, conflicts, dominances, gaps, scenarios, runs, verdicts,
+    rules: rules as never,
+    conflicts: conflicts as never,
+    dominances: dominances as never,
+    gaps: gaps as never,
+    scenarios: scenarios as never,
+    runs: runs as never,
+    verdicts: verdicts as never,
     summary: {
       total_scenarios: scenarios.length,
-      passed: verdicts.filter((v: { pass: boolean }) => v.pass).length,
-      failed: verdicts.filter((v: { pass: boolean }) => !v.pass).length,
-      high_severity_findings: conflicts.filter((c: { severity: string }) => c.severity === 'high').length
-        + gaps.filter((g: { severity: string }) => g.severity === 'high').length,
+      passed: (verdicts as Array<{ pass: boolean }>).filter((v) => v.pass).length,
+      failed: (verdicts as Array<{ pass: boolean }>).filter((v) => !v.pass).length,
+      high_severity_findings: (conflicts as Array<{ severity: string }>).filter((c) => c.severity === 'high').length
+        + (gaps as Array<{ severity: string }>).filter((g) => g.severity === 'high').length,
     },
     generated_at: new Date().toISOString(),
   };
@@ -46,4 +64,6 @@ function basename(p: string): string {
   return p.split('/').pop()!.replace(/\.[^.]+$/, '');
 }
 
-void main();
+if (import.meta.url === `file://${process.argv[1]}`) {
+  void main();
+}
