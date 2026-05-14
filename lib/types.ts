@@ -12,6 +12,18 @@ export type RuleCategory = z.infer<typeof RuleCategory>;
 export const Severity = z.enum(['low', 'medium', 'high']);
 export type Severity = z.infer<typeof Severity>;
 
+export const LensId = z.enum(['conflict', 'dominance', 'gap', 'drift']);
+export type LensId = z.infer<typeof LensId>;
+
+export interface LensManifest {
+  id: LensId;
+  kind: 'static' | 'dynamic';
+  description: string;
+  implementer: string[];
+  artefacts: string[];
+  reportSection: 'conflicts' | 'dominances' | 'gaps' | 'drift';
+}
+
 export const Anchor = z.object({
   input: z.string(),
   expect_contains: z.array(z.string()).optional(),
