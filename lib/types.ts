@@ -37,6 +37,7 @@ export const Frontmatter = z.object({
   output: z.array(OutputFormat).default(['inline']),
   expand_count: z.number().int().nonnegative().default(5),
   anchors: z.array(Anchor).default([]),
+  executor: z.string().optional(),
 });
 export type Frontmatter = z.infer<typeof Frontmatter>;
 

@@ -40,6 +40,7 @@ type: system          # system | agent | vapi | task | chain
 target_model: claude-opus-4-7
 output: [inline, markdown]   # any of: inline | markdown | html | json
 expand_count: 5       # how many adversarial scenarios to synthesise
+executor: prompt-executor    # optional — see "Executor selection" below
 anchors:              # optional — your hand-picked test inputs
   - input: "I am furious! Your product is garbage!"
     rubric: "de-escalates; remains professional"
@@ -77,11 +78,24 @@ Never offer refunds outside the 30-day window.
 4. The **drift lens** runs as a dynamic pipeline: `scenario-generator` synthesises adversarial probes from the rules + anchors + probe templates; `behavior-runner` dispatches `prompt-executor` subagents per scenario (in parallel batches); `judge` evaluates outputs using deterministic assertions plus its own LLM reasoning for rubrics.
 5. Reporters emit inline annotations and/or files per the frontmatter `output` list.
 
-## Non-Claude target models (Codex / OpenAI / others)
+## Executor selection (Claude subagent vs. Codex / OpenAI MCP)
 
-If your `target_model` is `gpt-*` or `codex-*` and you have a Codex / OpenAI MCP server installed in your Claude Code settings, `behavior-runner` automatically routes through it. If no such MCP route is available, the plugin falls back to Claude's `prompt-executor` and adds a warning to the report — the simulated output is then Claude's best impression of how the target model would respond.
+The drift lens needs a way to actually invoke a model on each test scenario. The plugin uses an **explicit, opt-in chain** — no auto-routing based on `target_model`.
 
-The plugin itself ships zero provider integrations; transport is the user's MCP setup.
+Resolution order (highest first):
+
+1. **Frontmatter** `executor: <name>` on the prompt under test (per-prompt override).
+2. **Environment variable** `PROMPTCHECKER_EXECUTOR=<name>` (shell-wide default).
+3. **Built-in default** `prompt-executor`.
+
+Valid executor names:
+
+| Name | What it does |
+|---|---|
+| `prompt-executor` *(default)* | Dispatches a Claude subagent that simulates the prompt under test. No external dependency. |
+| `mcp-codex`, `mcp-openai`, … | Calls an MCP tool you've installed in Claude Code that fronts the target provider. You are responsible for the MCP server; the plugin discovers `mcp__<server>__*` tools at runtime. |
+
+If a non-default executor is selected but the corresponding MCP server isn't installed, `behavior-runner` falls back to `prompt-executor` and adds a `warnings[]` entry to the report. The plugin itself ships zero provider integrations; transport is the user's MCP setup.
 
 ## Development
 
