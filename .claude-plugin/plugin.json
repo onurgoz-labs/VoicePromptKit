@@ -13,6 +13,7 @@
     "agents/gap-lens.md",
     "agents/scenario-generator.md",
     "agents/behavior-runner.md",
+    "agents/prompt-executor.md",
     "agents/judge.md"
   ],
   "skills": ["skills/prompt-check/SKILL.md"]
