@@ -1,42 +1,56 @@
 ---
 name: behavior-runner
-description: Execute scenarios against the target model via the lib/runner.ts CLI. Aggregate Run[] results.
-tools: Bash, Read
+description: Drift-lens executor. For each scenario, dispatches a prompt-executor subagent and collects outputs into runs.json.
+tools: Read, Write, Agent
 ---
 
-You receive: `scenarios.json` path, the prompt-under-test file path, and frontmatter (model, provider override if any).
+You execute the drift lens. You receive paths to:
+- `.promptcheck/.tmp/scenarios.json` — the scenario set
+- `.promptcheck/.tmp/body.txt` — the prompt-under-test body (frontmatter stripped, produced by `frontmatter-cli`)
+- `.promptcheck/.tmp/frontmatter.json` — frontmatter (for `target_model` routing)
 
 ## Procedure
 
-1. Write a payload JSON file at `.promptcheck/.tmp/run-payload.json` containing:
-   ```json
-   {
-     "promptPath": "...",
-     "model": "...",
-     "providerOverride": "anthropic | openai | null",
-     "scenarios": [/* full Scenario[] */],
-     "cacheSystemPrompt": true
-   }
+1. Read `body.txt` (this is the system prompt being audited).
+2. Read `scenarios.json`.
+3. Inspect frontmatter `target_model`:
+   - **Claude family** (`claude-*`) or anything Claude Code can simulate → dispatch `prompt-executor` subagents (default).
+   - **Non-Claude** (`gpt-*`, `codex-*`, etc.) → if the user has a Codex/OpenAI MCP server installed, route via that MCP tool. If no MCP route is available, fall back to `prompt-executor` and **add a warning** to the output: `"warning": "<model> not directly accessible; simulated by Claude executor"`.
+4. For each scenario, dispatch in **parallel batches** (≤ 6 per message):
    ```
-2. Invoke: `node --import tsx lib/runner.ts .promptcheck/.tmp/run-payload.json`
-3. The runner writes `.promptcheck/.tmp/runs.json` and prints the same JSON to stdout.
-4. Read and return the JSON exactly as your output.
+   Agent({
+     subagent_type: "prompt-executor",
+     prompt: JSON.stringify({
+       system_prompt_under_test: <body.txt contents>,
+       scenario_input: <scenario.input>
+     }),
+     description: "exec scenario " + scenario.id
+   })
+   ```
+5. Collect each subagent's final message text as the `output` for that scenario.
+6. Write `.promptcheck/.tmp/runs.json`.
 
-## Output
+## Output schema
 
 ```json
 {
   "runs": [
     {
       "scenario_id": "S1",
-      "output": "<model output>",
-      "tokens": { "input": 100, "output": 40 },
-      "latency_ms": 1200,
-      "model": "claude-opus-4-7",
-      "provider": "anthropic"
+      "output": "<model output as plain text>",
+      "tokens": { "input": 0, "output": 0 },
+      "latency_ms": 0,
+      "model": "<frontmatter.target_model>",
+      "provider": "subagent | mcp-codex | ..."
     }
-  ]
+  ],
+  "warnings": ["<optional non-fatal notices>"]
 }
 ```
 
-If the runner exits non-zero, output `{"runs": [], "error": "<stderr>"}`.
+`tokens` and `latency_ms` are zero unless the executor surface provides them (MCP route may; subagent route does not).
+
+## Failure handling
+
+- If a single executor dispatch fails or returns empty output, record `output: ""` for that scenario and continue. Do not abort the whole run.
+- If MCP routing is requested but no MCP server is available, fall back and warn.
