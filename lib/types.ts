@@ -67,8 +67,12 @@ export const Dominance = z.object({
 });
 export type Dominance = z.infer<typeof Dominance>;
 
+export const GapKind = z.enum(['undefined_edge_case', 'ambiguous_term']);
+export type GapKind = z.infer<typeof GapKind>;
+
 export const Gap = z.object({
   id: z.string(),
+  kind: GapKind.optional(),
   description: z.string(),
   related_rule_ids: z.array(z.string()).default([]),
   severity: Severity,
