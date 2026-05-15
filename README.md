@@ -28,32 +28,13 @@ The plugin auto-loads in every Claude Code session after that. **No API keys, no
 
 ## Usage
 
+Just point it at any prompt file:
+
 ```
 /prompt-check path/to/your/prompt.md
 ```
 
-Your prompt file should start with YAML frontmatter so the plugin knows what kind of prompt it is and how to test it:
-
-```yaml
----
-type: system          # system | agent | vapi | task | chain
-target_model: claude-opus-4-7
-output: [inline, markdown]   # any of: inline | markdown | html | json
-expand_count: 5       # how many adversarial scenarios to synthesise
-executor: prompt-executor    # optional — see "Executor selection" below
-anchors:              # optional — your hand-picked test inputs
-  - input: "I am furious! Your product is garbage!"
-    rubric: "de-escalates; remains professional"
-  - input: "Can I get a refund 90 days after purchase?"
-    expect_contains: ["policy"]
-    rubric: "declines politely, cites the 30-day policy"
----
-[your prompt body here]
-```
-
-All frontmatter fields are optional; the plugin falls back to sensible defaults if you omit them. With no anchors and `expand_count: 0` you still get the three static lenses (conflict, dominance, gap) — no LLM calls happen.
-
-See [`examples/`](examples/) for sample prompts demonstrating each detection lens.
+That's it. No frontmatter required, no flags. The plugin uses sensible defaults: tests against `claude-opus-4-7`, generates 5 adversarial scenarios, writes inline annotations to the prompt file. See [`examples/`](examples/) for sample prompts demonstrating each detection lens.
 
 ## What the output looks like
 
@@ -68,40 +49,80 @@ Be casual and friendly to make customers feel at home.
 Never offer refunds outside the 30-day window.
 ```
 
-**Markdown / HTML reports** land under `.promptcheck/<prompt-name>-<date>.{md,html,json}` and include a summary table, a mermaid conflict graph, a dominance list, and the full drift-test matrix.
+**Reports** land under `.promptcheck/<prompt-name>-<date>.{md,html,json}` (whichever formats you configured) and include a summary table, a mermaid conflict graph, a dominance list, and the full drift-test matrix.
+
+## Customizing defaults
+
+The plugin's behaviour is layered, highest priority first:
+
+1. **Per-prompt frontmatter** (optional, see below) — overrides everything for one prompt.
+2. **Environment variables** (shell-wide) — change the defaults for every prompt in your session.
+3. **Built-in defaults** — applied when neither of the above is set.
+
+### Environment variables
+
+| Variable | Effect | Default |
+|---|---|---|
+| `PROMPTCHECKER_TARGET_MODEL` | Model name written into reports | `claude-opus-4-7` |
+| `PROMPTCHECKER_OUTPUT` | Comma-separated subset of `inline,markdown,html,json` | `inline` |
+| `PROMPTCHECKER_EXPAND_COUNT` | How many adversarial scenarios the drift lens generates | `5` |
+| `PROMPTCHECKER_EXECUTOR` | Drift-lens executor name (see "Executor selection") | `prompt-executor` |
+
+Set them in your shell profile (`~/.zshrc`, `~/.bash_profile`, etc.) once and forget about them.
+
+### Per-prompt frontmatter (advanced)
+
+If you want to test a specific prompt against a different model, or hand-write anchor scenarios, add YAML frontmatter at the top of the prompt file:
+
+```yaml
+---
+type: system          # system | agent | vapi | task | chain
+target_model: claude-opus-4-7
+output: [inline, markdown]
+expand_count: 5
+executor: prompt-executor
+anchors:
+  - input: "I am furious! Your product is garbage!"
+    rubric: "de-escalates; remains professional"
+  - input: "Can I get a refund 90 days after purchase?"
+    expect_contains: ["policy"]
+    rubric: "declines politely, cites the 30-day policy"
+---
+[your prompt body here]
+```
+
+Every field is optional. Most users never write frontmatter at all; the few who care about per-prompt anchors or alternate target models add only the fields they need.
 
 ## Pipeline
 
-1. Frontmatter is parsed.
+1. Frontmatter (if present) is parsed and layered over env defaults.
 2. `rule-extractor` agent splits the prompt into atomic, line-anchored rules.
-3. The three **static lenses** (conflict, dominance, gap) run in parallel — pure analysis, no LLM calls beyond the agent reasoning itself.
-4. The **drift lens** runs as a dynamic pipeline: `scenario-generator` synthesises adversarial probes from the rules + anchors + probe templates; `behavior-runner` dispatches `prompt-executor` subagents per scenario (in parallel batches); `judge` evaluates outputs using deterministic assertions plus its own LLM reasoning for rubrics.
-5. Reporters emit inline annotations and/or files per the frontmatter `output` list.
+3. The three **static lenses** (conflict, dominance, gap) run in parallel — pure analysis.
+4. The **drift lens** runs as a dynamic pipeline: `scenario-generator` synthesises adversarial probes from rules + anchors + probe templates; `behavior-runner` dispatches `prompt-executor` subagents per scenario (in parallel batches); `judge` evaluates outputs using deterministic assertions plus its own LLM reasoning for rubrics.
+5. Reporters emit inline annotations and/or files per the resolved `output` list.
 
 ## Executor selection (Claude subagent vs. Codex / OpenAI MCP)
 
-The drift lens needs a way to actually invoke a model on each test scenario. The plugin uses an **explicit, opt-in chain** — no auto-routing based on `target_model`.
+The drift lens needs a way to invoke a model on each scenario. The plugin uses an explicit chain — no auto-routing.
 
 Resolution order (highest first):
 
-1. **Frontmatter** `executor: <name>` on the prompt under test (per-prompt override).
-2. **Environment variable** `PROMPTCHECKER_EXECUTOR=<name>` (shell-wide default).
-3. **Built-in default** `prompt-executor`.
+1. Per-prompt frontmatter `executor: <name>`
+2. `PROMPTCHECKER_EXECUTOR=<name>` env var
+3. Built-in default `prompt-executor`
 
-Valid executor names:
-
-| Name | What it does |
+| Executor name | What it does |
 |---|---|
 | `prompt-executor` *(default)* | Dispatches a Claude subagent that simulates the prompt under test. No external dependency. |
-| `mcp-codex`, `mcp-openai`, … | Calls an MCP tool you've installed in Claude Code that fronts the target provider. You are responsible for the MCP server; the plugin discovers `mcp__<server>__*` tools at runtime. |
+| `mcp-codex`, `mcp-openai`, … | Calls an MCP tool you've installed in Claude Code that fronts the target provider. You own the MCP server; the plugin discovers `mcp__<server>__*` tools at runtime. |
 
-If a non-default executor is selected but the corresponding MCP server isn't installed, `behavior-runner` falls back to `prompt-executor` and adds a `warnings[]` entry to the report. The plugin itself ships zero provider integrations; transport is the user's MCP setup.
+If a non-default executor is selected but the MCP server isn't installed, `behavior-runner` falls back to `prompt-executor` and adds a warning to the report. The plugin ships zero provider integrations; transport is your MCP setup.
 
 ## Development
 
 ```bash
 npm install
-npm test       # vitest — 18 tests covering frontmatter, judge, reporters, lens registry, e2e
+npm test       # vitest
 npm run typecheck
 npm run lint
 ```
