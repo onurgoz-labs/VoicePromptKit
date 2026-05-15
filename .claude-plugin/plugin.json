@@ -2,7 +2,10 @@
   "name": "promptchecker",
   "version": "0.1.0",
   "description": "Audit prompts through four lenses: conflict, dominance, drift, gap.",
-  "author": "onur@redrose.io",
+  "author": {
+    "name": "Onur GOZ",
+    "email": "onur@redrose.io"
+  },
   "homepage": "https://github.com/onurgoz/PromptChecker",
   "commands": ["commands/prompt-check.md"],
   "agents": [
@@ -15,6 +18,5 @@
     "agents/behavior-runner.md",
     "agents/prompt-executor.md",
     "agents/judge.md"
-  ],
-  "skills": ["skills/prompt-check/SKILL.md"]
+  ]
 }

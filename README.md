@@ -11,6 +11,24 @@ Claude Code plugin that audits prompts through **four lenses**:
 
 The lens registry lives in `lib/lenses.ts`. Extending the toolkit with a 5th lens means adding an entry there and wiring an implementer agent.
 
+## Install
+
+One-time setup from this repo directory:
+
+```
+/plugin marketplace add /Users/onur/repos/onurgoz/PromptChecker
+/plugin install promptchecker@promptchecker-local
+```
+
+After install the plugin auto-loads in every Claude Code session.
+
+For per-session ephemeral install (development):
+```
+claude --plugin-dir /Users/onur/repos/onurgoz/PromptChecker
+```
+
+After local edits during development, run `/plugin marketplace update` + `/reload-plugins` to pick up changes.
+
 ## Usage
 
 In Claude Code:

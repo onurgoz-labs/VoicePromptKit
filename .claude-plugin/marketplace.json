@@ -1,0 +1,9 @@
+{
+  "name": "promptchecker-local",
+  "plugins": [
+    {
+      "name": "promptchecker",
+      "path": "."
+    }
+  ]
+}
