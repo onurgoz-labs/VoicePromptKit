@@ -68,7 +68,20 @@ The plugin's behaviour is layered, highest priority first:
 | `PROMPTCHECKER_EXPAND_COUNT` | How many adversarial scenarios the drift lens generates | `5` |
 | `PROMPTCHECKER_EXECUTOR` | Drift-lens executor name (see "Executor selection") | `prompt-executor` |
 
-Set them in your shell profile (`~/.zshrc`, `~/.bash_profile`, etc.) once and forget about them.
+**Recommended — set them in Claude Code's `settings.json`** so they apply to every Claude Code session without touching your shell rc. Edit `~/.claude/settings.json` (user-wide) or your project's `.claude/settings.json` (project wins on conflict) and add an `env` block:
+
+```json
+{
+  "env": {
+    "PROMPTCHECKER_TARGET_MODEL": "claude-opus-4-7",
+    "PROMPTCHECKER_OUTPUT": "inline,markdown",
+    "PROMPTCHECKER_EXPAND_COUNT": "8",
+    "PROMPTCHECKER_EXECUTOR": "prompt-executor"
+  }
+}
+```
+
+Claude Code injects these into every subprocess the plugin spawns, so the PromptChecker CLI scripts see them via `process.env`. Alternatively, exporting them in your shell profile (`~/.zshrc`, `~/.bash_profile`) works the same way.
 
 ### Per-prompt frontmatter (advanced)
 
