@@ -15,9 +15,7 @@
   "license": "MIT",
   "type": "module",
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.96.0",
     "js-yaml": "^4.1.1",
-    "openai": "^6.37.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
