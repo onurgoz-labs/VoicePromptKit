@@ -1,8 +1,8 @@
 {
-  "name": "promptchecker-local",
+  "name": "onurgoz",
   "plugins": [
     {
-      "name": "promptchecker",
+      "name": "PromptChecker",
       "path": "."
     }
   ]

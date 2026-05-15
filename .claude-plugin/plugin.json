@@ -1,5 +1,5 @@
 {
-  "name": "promptchecker",
+  "name": "PromptChecker",
   "version": "0.1.0",
   "description": "Audit prompts through four lenses: conflict, dominance, drift, gap.",
   "author": {
