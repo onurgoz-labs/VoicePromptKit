@@ -2,19 +2,18 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runScenarios } from '../lib/runner';
 import { evaluateMechanical } from '../lib/judge';
 import { writeMarkdownReport } from '../lib/reporters/markdown';
 import { writeInlineReport } from '../lib/reporters/inline';
 import { parsePromptFile } from '../lib/frontmatter';
-import type { Scenario, Report } from '../lib/types';
+import type { Scenario, Run, Report } from '../lib/types';
 
-describe('end-to-end (mocked adapter)', () => {
+describe('end-to-end (stubbed executor output)', () => {
   let dir: string;
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'pc-e2e-')); });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
-  it('runs full pipeline against a sample prompt with conflicting rules', async () => {
+  it('runs the post-executor pipeline against a sample prompt with conflicting rules', async () => {
     const promptPath = join(dir, 'sample.md');
     writeFileSync(promptPath, [
       '---',
@@ -29,7 +28,7 @@ describe('end-to-end (mocked adapter)', () => {
       'Be casual and friendly.',
     ].join('\n'), 'utf8');
 
-    const { frontmatter, body } = parsePromptFile(readFileSync(promptPath, 'utf8'));
+    const { frontmatter } = parsePromptFile(readFileSync(promptPath, 'utf8'));
     expect(frontmatter.anchors).toHaveLength(1);
 
     const scenarios: Scenario[] = [
@@ -40,12 +39,19 @@ describe('end-to-end (mocked adapter)', () => {
       },
     ];
 
-    const adapter = {
-      name: 'anthropic' as const,
-      supportsModel: () => true,
-      run: async () => ({ output: 'I understand your frustration.', tokens: { input: 5, output: 5 }, latency_ms: 1, model: 'x', provider: 'anthropic' as const }),
-    };
-    const runs = await runScenarios({ systemPrompt: body, scenarios, model: 'claude-opus-4-7', adapter });
+    // In production, behavior-runner agent dispatches prompt-executor subagents and collects runs.
+    // For this test, we stub the executor's output directly.
+    const runs: Run[] = [
+      {
+        scenario_id: 'S1',
+        output: 'I understand your frustration.',
+        tokens: { input: 0, output: 0 },
+        latency_ms: 0,
+        model: 'claude-opus-4-7',
+        provider: 'subagent',
+      },
+    ];
+
     const verdicts = scenarios.map((sc) => evaluateMechanical(sc, runs.find((r) => r.scenario_id === sc.id)!));
     expect(verdicts[0]!.pass).toBe(true);
 
