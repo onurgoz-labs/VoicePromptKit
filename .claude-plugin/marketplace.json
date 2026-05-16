@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "PromptChecker",
-      "source": ".",
+      "path": ".",
       "description": "Audit prompts through four lenses: conflict, dominance, drift, gap.",
       "version": "0.1.0",
       "author": {
