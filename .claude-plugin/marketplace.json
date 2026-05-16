@@ -8,7 +8,10 @@
   "plugins": [
     {
       "name": "PromptChecker",
-      "path": ".",
+      "source": {
+        "source": "github",
+        "repo": "onurgoz/PromptChecker"
+      },
       "description": "Audit prompts through four lenses: conflict, dominance, drift, gap.",
       "version": "0.1.0",
       "author": {
