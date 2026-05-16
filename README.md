@@ -13,7 +13,7 @@ You run it on any prompt file — a system prompt, a Claude Code subagent defini
 | **Gap** | Undefined edge cases, ambiguous terms ("appropriate", "reasonable"), missing failure modes |
 | **Drift** | Behavioural mismatch between the prompt's stated rules and the model's actual output, surfaced by adversarial scenarios run against a real LLM |
 
-The lens registry is `lib/lenses.ts`. Adding a 5th lens means an entry there plus one implementer agent.
+The four lenses are documented in `agents/prompt-check-orchestrator.md` (top of file). Adding a 5th lens means a new agent definition plus one row in the orchestrator's lens table.
 
 ## Install
 
@@ -131,16 +131,32 @@ Resolution order (highest first):
 
 If a non-default executor is selected but the MCP server isn't installed, `behavior-runner` falls back to `prompt-executor` and adds a warning to the report. The plugin ships zero provider integrations; transport is your MCP setup.
 
-## Development
+## Architecture
 
-```bash
-npm install
-npm test       # vitest
-npm run typecheck
-npm run lint
+The plugin is **pure Claude Code agent orchestration**. There is no Node, no TypeScript, no `npm install`, no `node_modules`, no `package.json` — just markdown agent definitions, slash-command files, and probe templates.
+
+```
+.claude-plugin/
+├── plugin.json           # plugin manifest
+└── marketplace.json      # local-marketplace descriptor
+commands/
+└── prompt-check.md       # slash command → orchestrator
+agents/
+├── prompt-check-orchestrator.md   # top-level coordinator
+├── rule-extractor.md
+├── conflict-lens.md      # static lens
+├── dominance-lens.md     # static lens
+├── gap-lens.md           # static lens (strict, prompt-internal only)
+├── scenario-generator.md # drift lens — step 1
+├── behavior-runner.md    # drift lens — step 2 (dispatches prompt-executor)
+├── prompt-executor.md    # faithful simulator
+├── judge.md              # drift lens — step 3 (mechanical + rubric)
+└── reporter.md           # renders inline/markdown/html/json
+templates/probes/         # adversarial probe templates
+examples/                 # sample prompts demonstrating each lens
 ```
 
-Runtime dependencies: `js-yaml`, `zod`. Plugin requires no network access at runtime.
+All cross-phase state is exchanged via JSON files under `.promptcheck/.tmp/`. Agents read/write those with the Read/Write tools; nothing leaves the Claude Code runtime.
 
 ## License
 

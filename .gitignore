@@ -1,20 +1,3 @@
-# Dependencies
-node_modules/
-.pnp
-.pnp.js
-package-lock.json
-
-# Build outputs
-dist/
-build/
-*.tsbuildinfo
-
-# Logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
 # Env / secrets
 .env
 .env.local
@@ -29,10 +12,6 @@ Thumbs.db
 .vscode/*
 !.vscode/settings.json
 !.vscode/extensions.json
-
-# Test / coverage
-coverage/
-.nyc_output/
 
 # Plugin output
 .promptcheck/
