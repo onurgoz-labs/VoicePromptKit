@@ -1,9 +1,23 @@
 {
   "name": "onurgoz",
+  "owner": {
+    "name": "Onur GOZ",
+    "email": "gozonur@icloud.com",
+    "url": "https://github.com/onurgoz"
+  },
   "plugins": [
     {
       "name": "PromptChecker",
-      "path": "."
+      "source": ".",
+      "description": "Audit prompts through four lenses: conflict, dominance, drift, gap.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Onur GOZ",
+        "email": "gozonur@icloud.com"
+      },
+      "homepage": "https://github.com/onurgoz/PromptChecker",
+      "category": "review",
+      "keywords": ["prompt", "audit", "review", "lens", "quality"]
     }
   ]
 }

@@ -4,7 +4,7 @@
   "description": "Audit prompts through four lenses: conflict, dominance, drift, gap.",
   "author": {
     "name": "Onur GOZ",
-    "email": "onur@redrose.io"
+    "email": "gozonur@icloud.com"
   },
   "homepage": "https://github.com/onurgoz/PromptChecker",
   "commands": ["commands/prompt-check.md"],
