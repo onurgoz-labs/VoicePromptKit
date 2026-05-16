@@ -6,18 +6,5 @@
     "name": "Onur GOZ",
     "email": "gozonur@icloud.com"
   },
-  "homepage": "https://github.com/onurgoz/PromptChecker",
-  "commands": ["commands/prompt-check.md"],
-  "agents": [
-    "agents/prompt-check-orchestrator.md",
-    "agents/rule-extractor.md",
-    "agents/conflict-lens.md",
-    "agents/dominance-lens.md",
-    "agents/gap-lens.md",
-    "agents/scenario-generator.md",
-    "agents/behavior-runner.md",
-    "agents/prompt-executor.md",
-    "agents/judge.md",
-    "agents/reporter.md"
-  ]
+  "homepage": "https://github.com/onurgoz/PromptChecker"
 }
