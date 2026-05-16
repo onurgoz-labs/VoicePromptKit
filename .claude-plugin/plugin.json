@@ -17,6 +17,7 @@
     "agents/scenario-generator.md",
     "agents/behavior-runner.md",
     "agents/prompt-executor.md",
-    "agents/judge.md"
+    "agents/judge.md",
+    "agents/reporter.md"
   ]
 }
