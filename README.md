@@ -1,62 +1,126 @@
 # PromptChecker
 
-A Claude Code plugin that audits your prompts the way a strict reviewer would: it finds rules that **contradict each other**, rules that **silently override others**, **gaps** the prompt never defines, and **behavioural drift** between what the prompt asks and what the model actually does.
+A Claude Code plugin that audits your prompts the way a strict reviewer would: it finds rules that **contradict each other**, rules that **silently override others**, **gaps** the prompt itself raises but never resolves, **behavioural drift** between what the prompt asks and what the model actually does, and — for Turkish voice agents — **phonetic problems** that break text-to-speech.
 
-You run it on any prompt file — a system prompt, a Claude Code subagent definition, a Vapi voice script, a chained workflow — and get back inline annotations on the offending lines plus a Markdown / HTML / JSON report.
+You run it on any prompt file (system prompt, Claude Code subagent definition, Vapi voice script, chained workflow) and get back two artefacts per audit run: a human-readable `report.md` and a structured `findings.json` that Claude can apply back as edits when you say "fix these".
 
-## What it looks for — the four lenses
-
-| Lens | Looks for |
-|---|---|
-| **Conflict** | Rules that logically contradict each other (e.g. "always formal" + "be casual and friendly") |
-| **Dominance** | Rules that silently override others through position, length, specificity, recency, or role-override patterns ("ignore previous instructions…") |
-| **Gap** | Undefined edge cases, ambiguous terms ("appropriate", "reasonable"), missing failure modes |
-| **Drift** | Behavioural mismatch between the prompt's stated rules and the model's actual output, surfaced by adversarial scenarios run against a real LLM |
-
-The four lenses are documented in `agents/prompt-check-orchestrator.md` (top of file). Adding a 5th lens means a new agent definition plus one row in the orchestrator's lens table.
+The original prompt file is **never modified**. Every run lives in its own numbered directory so you can compare audits across edits.
 
 ## Install
-
-In Claude Code, one-time setup:
 
 ```
 /plugin marketplace add onurgoz/PromptChecker
 /plugin install PromptChecker@onurgoz
 ```
 
-The plugin auto-loads in every Claude Code session after that. **No API keys, no SDK installs** — the drift lens dispatches a subagent per scenario and Claude Code's own runtime executes it.
+The plugin auto-loads in every Claude Code session after that. No API keys, no SDK installs — the optional drift lens runs inside a single Claude Code subagent.
 
 ## Usage
-
-Just point it at any prompt file:
 
 ```
 /prompt-check path/to/your/prompt.md
 ```
 
-That's it. No frontmatter required, no flags. The plugin uses sensible defaults: tests against `claude-opus-4-7`, generates 5 adversarial scenarios, writes inline annotations to the prompt file. See [`examples/`](examples/) for sample prompts demonstrating each detection lens.
+That's it. No frontmatter required, no flags. The plugin uses sensible defaults: tests against `claude-opus-4-7`, generates up to 3 adversarial scenarios, writes a markdown report and a findings JSON to `.promptcheck/<basename>/run-NNN/`.
 
-## What the output looks like
+After the run, say **"fix these"** (or **"düzelt bunları"**) in the same Claude session and Claude will read the findings, match each line + excerpt in the prompt file, and apply the suggested fixes. No copy-paste, no second session.
 
-**Inline annotations** are injected directly above the offending lines:
+## What it looks for — the five lenses
+
+| Lens | Looks for | Always on? |
+|---|---|---|
+| **Conflict** | Rules that logically contradict each other ("always formal" + "be casual and friendly") | yes |
+| **Dominance** | Rules that silently override others through position, length, specificity, recency, or role-override patterns ("ignore previous instructions…") | yes |
+| **Gap** | Undefined edge cases (incomplete conditionals) and ambiguous terms ("appropriate", "reasonable") that the prompt's own rules raise | yes |
+| **Drift** | Behavioural mismatch between the prompt's stated rules and the model's actual output, surfaced by adversarial scenarios | only when anchors / conflicts / role-overrides exist (skipped otherwise) |
+| **TR phonetic** | Numbers, abbreviations, foreign words, and pacing problems that break Turkish text-to-speech | opt-in via `tr_phonetic: true` frontmatter |
+
+All five lenses live in `skills/prompt-check/SKILL.md` and its `references/`.
+
+## Output layout
+
+Every run gets its own directory. Older runs are preserved so you can diff audits across prompt edits.
 
 ```
-<!-- PROMPTCHECK [CONFLICT severity=high] L3↔L4: tone contradiction -->
-Always be formal and use professional language at all times.
-Be casual and friendly to make customers feel at home.
-
-<!-- PROMPTCHECK [GAP severity=medium] L6: no instruction for partial refunds -->
-Never offer refunds outside the 30-day window.
+.promptcheck/
+└── <prompt-basename>/
+    ├── run-001/
+    │   ├── frontmatter.json
+    │   ├── body.txt
+    │   ├── rules.json
+    │   ├── conflicts.json
+    │   ├── dominances.json
+    │   ├── gaps.json
+    │   ├── drift.json          (or {"skipped_reason": ...})
+    │   ├── tr_phonetic.json    (only when tr_phonetic enabled)
+    │   ├── findings.json       ← merged, line-anchored, used by "fix these"
+    │   └── report.md           ← human-readable summary
+    ├── run-002/
+    ├── run-003/
+    └── latest -> run-003/
 ```
 
-**Reports** land under `.promptcheck/<prompt-name>-<date>.{md,html,json}` (whichever formats you configured) and include a summary table, a mermaid conflict graph, a dominance list, and the full drift-test matrix.
+### `report.md` — what humans read
+
+```markdown
+# PromptChecker Report — mainprompt
+
+- **Prompt:** `/Users/onur/repos/.../mainprompt.md`
+- **Run:** `run-003`
+- **Generated:** 2026-05-17T19:42:00Z
+- **Target model:** claude-opus-4-7
+
+## Summary
+
+| Lens | Total | High | Medium | Low |
+|---|---|---|---|---|
+| Conflict | 10 | 4 | 4 | 2 |
+| Dominance | 7 | 3 | 3 | 1 |
+| Gap | 13 | 5 | 6 | 2 |
+| Drift | 10 scenarios: 5✓ / 5✗ | — | — | — |
+| TR phonetic | 8 | 2 | 5 | 1 |
+
+## Findings
+
+### Conflicts
+- **L15** [C1 severity=high, R1↔R2] — Tone contradiction: "always formal" vs "be casual and friendly".
+  - **Current:** `Always be formal and use professional language at all times.`
+  - **Fix:** `Maintain a professional but warm register.`
+…
+```
+
+### `findings.json` — what Claude applies
+
+```json
+{
+  "prompt_path": "/abs/path/mainprompt.md",
+  "run_id": "run-003",
+  "generated_at": "2026-05-17T19:42:00Z",
+  "summary": { "rules": 50, "conflicts": {"total": 10, "high": 4}, ... },
+  "findings": [
+    {
+      "id": "C1",
+      "lens": "conflict",
+      "severity": "high",
+      "line": 15,
+      "related_lines": [15, 16],
+      "current_excerpt": "Always be formal and use professional language at all times.",
+      "suggested_fix": "Maintain a professional but warm register.",
+      "rationale": "Tone contradiction with R2 on line 16.",
+      "rule_ids": ["R1","R2"]
+    }
+  ]
+}
+```
+
+When you say "fix these", Claude reads this file, locates each finding by `line` + `current_excerpt` (both must agree), applies the `suggested_fix`, and shows you a diff. Findings with empty `suggested_fix` are advisory and never auto-applied.
 
 ## Customizing defaults
 
 The plugin's behaviour is layered, highest priority first:
 
-1. **Per-prompt frontmatter** (optional, see below) — overrides everything for one prompt.
-2. **Environment variables** (shell-wide) — change the defaults for every prompt in your session.
+1. **Per-prompt frontmatter** (optional) — overrides everything for one prompt.
+2. **Environment variables** (shell-wide) — change defaults for every prompt in your session.
 3. **Built-in defaults** — applied when neither of the above is set.
 
 ### Environment variables
@@ -64,36 +128,31 @@ The plugin's behaviour is layered, highest priority first:
 | Variable | Effect | Default |
 |---|---|---|
 | `PROMPTCHECKER_TARGET_MODEL` | Model name written into reports | `claude-opus-4-7` |
-| `PROMPTCHECKER_OUTPUT` | Comma-separated subset of `inline,markdown,html,json` | `inline` |
-| `PROMPTCHECKER_EXPAND_COUNT` | How many adversarial scenarios the drift lens generates | `5` |
-| `PROMPTCHECKER_EXECUTOR` | Drift-lens executor name (see "Executor selection") | `prompt-executor` |
+| `PROMPTCHECKER_OUTPUT` | Comma-separated subset of `markdown,findings_json,json,html` | `markdown,findings_json` |
+| `PROMPTCHECKER_EXPAND_COUNT` | How many adversarial scenarios the drift lens generates beyond the anchor/conflict budget | `3` |
+| `PROMPTCHECKER_EXECUTOR` | Reserved for future executor variants; current value is `inline` (the `drift-runner` subagent simulates the prompt itself) | `inline` |
 
-**Recommended — set them in Claude Code's `settings.json`** so they apply to every Claude Code session without touching your shell rc. Edit `~/.claude/settings.json` (user-wide) or your project's `.claude/settings.json` (project wins on conflict) and add an `env` block:
+Set them in Claude Code's `settings.json` so they apply session-wide without touching your shell rc:
 
 ```json
 {
   "env": {
     "PROMPTCHECKER_TARGET_MODEL": "claude-opus-4-7",
-    "PROMPTCHECKER_OUTPUT": "inline,markdown",
-    "PROMPTCHECKER_EXPAND_COUNT": "8",
-    "PROMPTCHECKER_EXECUTOR": "prompt-executor"
+    "PROMPTCHECKER_OUTPUT": "markdown,findings_json",
+    "PROMPTCHECKER_EXPAND_COUNT": "5"
   }
 }
 ```
 
-Claude Code injects these into every subprocess the plugin spawns, so the PromptChecker CLI scripts see them via `process.env`. Alternatively, exporting them in your shell profile (`~/.zshrc`, `~/.bash_profile`) works the same way.
-
-### Per-prompt frontmatter (advanced)
-
-If you want to test a specific prompt against a different model, or hand-write anchor scenarios, add YAML frontmatter at the top of the prompt file:
+### Per-prompt frontmatter
 
 ```yaml
 ---
-type: system          # system | agent | vapi | task | chain
+type: vapi                       # system | agent | vapi | task | chain (informational only)
 target_model: claude-opus-4-7
-output: [inline, markdown]
-expand_count: 5
-executor: prompt-executor
+output: [markdown, findings_json]
+expand_count: 4
+tr_phonetic: true                # enable Turkish phonetic lens (opt-in)
 anchors:
   - input: "I am furious! Your product is garbage!"
     rubric: "de-escalates; remains professional"
@@ -104,59 +163,47 @@ anchors:
 [your prompt body here]
 ```
 
-Every field is optional. Most users never write frontmatter at all; the few who care about per-prompt anchors or alternate target models add only the fields they need.
+Every field is optional. Most users never write frontmatter at all; the few who care about Turkish voice agents add `tr_phonetic: true`, the few who care about specific regressions add `anchors`.
 
 ## Pipeline
 
-1. Frontmatter (if present) is parsed and layered over env defaults.
-2. `rule-extractor` agent splits the prompt into atomic, line-anchored rules.
-3. The three **static lenses** (conflict, dominance, gap) run in parallel — pure analysis.
-4. The **drift lens** runs as a dynamic pipeline: `scenario-generator` synthesises adversarial probes from rules + anchors + probe templates; `behavior-runner` dispatches `prompt-executor` subagents per scenario (in parallel batches); `judge` evaluates outputs using deterministic assertions plus its own LLM reasoning for rubrics.
-5. Reporters emit inline annotations and/or files per the resolved `output` list.
+The plugin runs one skill end-to-end inside a single Claude context — no chain of round-tripping subagents. Only the drift lens dispatches a subagent (`drift-runner`), and only when there are anchors, conflicts, or role-override dominances; otherwise drift is skipped entirely.
 
-## Executor selection (Claude subagent vs. Codex / OpenAI MCP)
-
-The drift lens needs a way to invoke a model on each scenario. The plugin uses an explicit chain — no auto-routing.
-
-Resolution order (highest first):
-
-1. Per-prompt frontmatter `executor: <name>`
-2. `PROMPTCHECKER_EXECUTOR=<name>` env var
-3. Built-in default `prompt-executor`
-
-| Executor name | What it does |
-|---|---|
-| `prompt-executor` *(default)* | Dispatches a Claude subagent that simulates the prompt under test. No external dependency. |
-| `mcp-codex`, `mcp-openai`, … | Calls an MCP tool you've installed in Claude Code that fronts the target provider. You own the MCP server; the plugin discovers `mcp__<server>__*` tools at runtime. |
-
-If a non-default executor is selected but the MCP server isn't installed, `behavior-runner` falls back to `prompt-executor` and adds a warning to the report. The plugin ships zero provider integrations; transport is your MCP setup.
+1. **Phase 0** — Compute `run-NNN` directory and update `latest` symlink.
+2. **Phase 1** — Parse frontmatter deterministically (Python one-liner, with a no-PyYAML fallback) and split body.
+3. **Phase 2** — Extract atomic, line-anchored rules.
+4. **Phase 3** — Apply conflict, dominance, gap lenses inline.
+5. **Phase 4** — If warranted, dispatch `drift-runner` to generate scenarios, simulate the prompt, judge outputs.
+6. **Phase 5** — If `tr_phonetic: true`, apply Turkish phonetic lens inline.
+7. **Phase 6** — Render `report.md` + `findings.json` (plus optional `report.json` / `report.html`).
+8. **Phase 7** — Print a terminal summary with paths and the apply-mode hint.
 
 ## Architecture
 
-The plugin is **pure Claude Code agent orchestration**. There is no Node, no TypeScript, no `npm install`, no `node_modules`, no `package.json` — just markdown agent definitions, slash-command files, and probe templates.
+The plugin is pure Claude Code skill orchestration. No Node, no TypeScript, no `npm install`, no `node_modules`, no `package.json` — just one skill file, three references, and one optional subagent definition.
 
 ```
 .claude-plugin/
-├── plugin.json           # plugin manifest
-└── marketplace.json      # local-marketplace descriptor
+├── plugin.json
+└── marketplace.json
 commands/
-└── prompt-check.md       # slash command → orchestrator
+└── prompt-check.md
+skills/
+└── prompt-check/
+    ├── SKILL.md
+    └── references/
+        ├── lens-rules.md       (conflict/dominance/gap/drift criteria)
+        ├── tr-phonetic.md      (Turkish TTS rules)
+        └── probes.md           (drift probe templates)
 agents/
-├── prompt-check-orchestrator.md   # top-level coordinator
-├── rule-extractor.md
-├── conflict-lens.md      # static lens
-├── dominance-lens.md     # static lens
-├── gap-lens.md           # static lens (strict, prompt-internal only)
-├── scenario-generator.md # drift lens — step 1
-├── behavior-runner.md    # drift lens — step 2 (dispatches prompt-executor)
-├── prompt-executor.md    # faithful simulator
-├── judge.md              # drift lens — step 3 (mechanical + rubric)
-└── reporter.md           # renders inline/markdown/html/json
-templates/probes/         # adversarial probe templates
-examples/                 # sample prompts demonstrating each lens
+└── drift-runner.md             (only subagent; only dispatched when needed)
+examples/
+├── sample-system.md
+├── sample-agent.md
+└── sample-vapi.md              (dogfeeds tr_phonetic: true)
 ```
 
-All cross-phase state is exchanged via JSON files under `.promptcheck/.tmp/`. Agents read/write those with the Read/Write tools; nothing leaves the Claude Code runtime.
+All cross-phase state is exchanged via JSON files under `.promptcheck/<basename>/run-NNN/`. The skill reads its own writes; the `drift-runner` subagent reads paths it is given and writes exactly one file.
 
 ## License
 
