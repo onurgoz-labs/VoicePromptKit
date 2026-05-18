@@ -13,7 +13,7 @@
         "url": "https://github.com/onurgoz/PromptChecker.git"
       },
       "description": "Audit prompts through four lenses (conflict, dominance, gap, drift) plus optional Turkish phonetic lens. Line-anchored findings, never modifies the original prompt.",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "author": {
         "name": "Onur GOZ",
         "email": "gozonur@icloud.com"

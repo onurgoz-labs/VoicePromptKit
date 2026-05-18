@@ -1,6 +1,6 @@
 {
   "name": "PromptChecker",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Audit prompts through four lenses (conflict, dominance, gap, drift) plus optional Turkish phonetic lens for voice agents. Line-anchored findings, never modifies the original prompt.",
   "author": {
     "name": "Onur GOZ",
