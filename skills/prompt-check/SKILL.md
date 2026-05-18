@@ -1,6 +1,6 @@
 ---
 name: prompt-check
-description: Audit a prompt file (system prompt, agent definition, voice script, chained workflow) across four lenses — conflict, dominance, gap, drift — plus an optional Turkish phonetic lens for voice agents. Use when the user invokes /prompt-check, asks to "audit a prompt", "check this prompt for contradictions / silent overrides / gaps / drift / voice readability", or passes a path to a prompt file for review. Produces line-anchored findings as `report.md` + `findings.json` in an isolated run directory. Never modifies the original prompt file.
+description: Audit a prompt file (system prompt, agent definition, voice script, chained workflow) across four lenses — conflict, dominance, gap, drift — plus an optional Turkish phonetic lens for voice agents. Use when the user invokes /prompt-check, asks to "audit a prompt", "check this prompt for contradictions / silent overrides / gaps / drift / voice readability", or passes a path to a prompt file for review. On first run in a repo, walks the user through a 5-question wizard and saves repo defaults to `.promptchecker.json`. Produces line-anchored findings as `report.md` + `findings.json` in an isolated run directory. Never modifies the original prompt file.
 ---
 
 # prompt-check
@@ -14,7 +14,54 @@ You audit a prompt file at the path supplied as `$1`. Work in a single context. 
 - `references/tr-phonetic.md` — Turkish phonetic rules (read only if `tr_phonetic: true`).
 - `references/probes.md` — adversarial probe templates (read only if drift phase runs).
 
-## Phase 0 — Working directory + versioning
+## Phase 0 — Project config (wizard on first run)
+
+Project config lives at `<repo-root>/.promptchecker.json`. It captures repo-level defaults so the user does not write the same frontmatter on every prompt.
+
+Locate the config path:
+
+```bash
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+CONFIG_PATH="$REPO_ROOT/.promptchecker.json"
+echo "REPO_ROOT=$REPO_ROOT"
+echo "CONFIG_PATH=$CONFIG_PATH"
+```
+
+**If `$CONFIG_PATH` exists, skip the wizard and continue to Phase 1.** Read it later in Phase 2 during frontmatter merge.
+
+**If `$CONFIG_PATH` does not exist**, run the first-run wizard before continuing. Ask the user the five questions below (prefer `AskUserQuestion` if available, otherwise plain conversational prompts; either way wait for all five answers before writing the file).
+
+1. **Default prompt type** for this repo (frontmatter `type:` overrides per-prompt):
+   - Options: `system`, `agent`, `vapi`, `task`, `chain`, or *unspecified*.
+2. **Turkish phonetic lens** active by default?
+   - If answer #1 was `vapi`, recommend `true`; otherwise recommend `false`. User chooses either way.
+3. **Target model** (reports + drift simulation):
+   - Suggested presets `claude-opus-4-7` (default), `claude-sonnet-4-6`. Free text accepted.
+4. **Output formats** (multi-select, ≥ 1):
+   - `markdown` (default ✓), `findings_json` (default ✓), `json`, `html`.
+5. **Drift `expand_count`** (extra scenarios beyond anchors + conflict budget):
+   - Integer 0–20. Default `3`. Zero disables drift entirely.
+
+After collecting answers, write `$CONFIG_PATH` as pretty JSON (2-space indent):
+
+```json
+{
+  "$schema": "https://github.com/onurgoz/PromptChecker/blob/master/schema/config.schema.json",
+  "default_type": "<choice or null if unspecified>",
+  "target_model": "<answer>",
+  "output": ["..."],
+  "expand_count": <int>,
+  "tr_phonetic": <bool>
+}
+```
+
+Confirm to the user: `Saved repo defaults to <relative path>. Edit it any time or override per-prompt via frontmatter.`
+
+**Invariants:**
+- Never run the wizard if `$CONFIG_PATH` already exists. The user owns that file.
+- If `git rev-parse` fails (not a git repo), use the current working directory as the repo root and warn the user that the config lives in cwd, not a tracked repo.
+
+## Phase 1 — Working directory + versioning
 
 Run this Bash block once. It computes `$RUN_DIR` and updates the `latest` symlink. Echo `$RUN_DIR` so later steps reference the same path.
 
@@ -36,14 +83,20 @@ echo "ABS_PROMPT=$ABS_PROMPT"
 - Original prompt file is read-only. No inline annotation, no edits, no `.bak`.
 - Previous run directories are left intact (versioning).
 
-## Phase 1 — Frontmatter (deterministic, not LLM)
+## Phase 2 — Frontmatter (deterministic, not LLM)
 
-Extract YAML frontmatter with a single Bash call so the result is deterministic and cheap. Write `$RUN_DIR/frontmatter.json` and `$RUN_DIR/body.txt`.
+Extract YAML frontmatter and merge it against env vars + project config + built-in defaults with a single Bash call so the result is deterministic and cheap. Pass `$CONFIG_PATH` from Phase 0 as the third argument.
+
+**Override hierarchy (most specific wins):**
+1. Per-prompt frontmatter (in the prompt file itself)
+2. Env var (`PROMPTCHECKER_*`)
+3. Project config (`.promptchecker.json`)
+4. Built-in defaults
 
 ```bash
-python3 - "$ABS_PROMPT" "$RUN_DIR" <<'PY'
+python3 - "$ABS_PROMPT" "$RUN_DIR" "$CONFIG_PATH" <<'PY'
 import sys, re, json, os
-prompt_path, run_dir = sys.argv[1], sys.argv[2]
+prompt_path, run_dir, config_path = sys.argv[1], sys.argv[2], sys.argv[3]
 text = open(prompt_path, encoding='utf-8').read()
 m = re.match(r'^---\r?\n(.*?)\r?\n---\r?\n?(.*)$', text, re.DOTALL)
 raw_fm, body = (m.group(1), m.group(2)) if m else ('', text)
@@ -52,31 +105,81 @@ try:
     import yaml
     fm = yaml.safe_load(raw_fm) or {} if raw_fm else {}
 except Exception:
-    for line in raw_fm.splitlines():
+    for line in (raw_fm or '').splitlines():
         if ':' in line and not line.lstrip().startswith('-'):
             k, v = line.split(':', 1)
             fm[k.strip()] = v.strip()
+
+project = {}
+if config_path and os.path.exists(config_path):
+    try:
+        project = json.load(open(config_path, encoding='utf-8'))
+    except Exception:
+        project = {}
+
 env = os.environ.get
-fm.setdefault('type', None)
-fm.setdefault('target_model', env('PROMPTCHECKER_TARGET_MODEL') or 'claude-opus-4-7')
+
+def truthy(v):
+    return str(v).strip().lower() in ('1','true','yes','on') if v is not None else False
+
+# type: frontmatter > project.default_type > None
+resolved = {}
+resolved['type'] = fm.get('type') or project.get('default_type') or None
+
+# target_model
+resolved['target_model'] = (
+    fm.get('target_model')
+    or env('PROMPTCHECKER_TARGET_MODEL')
+    or project.get('target_model')
+    or 'claude-opus-4-7'
+)
+
+# output (list)
 out = fm.get('output')
-if not out:
-    out = (env('PROMPTCHECKER_OUTPUT') or 'markdown,findings_json').split(',')
-fm['output'] = [str(o).strip() for o in (out if isinstance(out, list) else [out])]
-fm['expand_count'] = int(fm.get('expand_count') or env('PROMPTCHECKER_EXPAND_COUNT') or 3)
-fm.setdefault('executor', env('PROMPTCHECKER_EXECUTOR') or 'inline')
-fm.setdefault('anchors', [])
-fm['tr_phonetic'] = bool(fm.get('tr_phonetic', False))
+if out is None:
+    env_out = env('PROMPTCHECKER_OUTPUT')
+    if env_out:
+        out = [s.strip() for s in env_out.split(',')]
+    elif project.get('output'):
+        out = project['output']
+    else:
+        out = ['markdown', 'findings_json']
+resolved['output'] = [str(o).strip() for o in (out if isinstance(out, list) else [out])]
+
+# expand_count (int)
+ec = fm.get('expand_count')
+if ec is None:
+    ec = env('PROMPTCHECKER_EXPAND_COUNT') or project.get('expand_count') or 3
+resolved['expand_count'] = int(ec)
+
+# executor
+resolved['executor'] = fm.get('executor') or env('PROMPTCHECKER_EXECUTOR') or 'inline'
+
+# anchors (always from frontmatter; never overridden)
+resolved['anchors'] = fm.get('anchors') or []
+
+# tr_phonetic (bool)
+tr = fm.get('tr_phonetic')
+if tr is None:
+    env_tr = env('PROMPTCHECKER_TR_PHONETIC')
+    if env_tr is not None and env_tr != '':
+        tr = truthy(env_tr)
+    elif 'tr_phonetic' in project:
+        tr = bool(project['tr_phonetic'])
+    else:
+        tr = False
+resolved['tr_phonetic'] = bool(tr)
+
 with open(os.path.join(run_dir, 'frontmatter.json'), 'w', encoding='utf-8') as f:
-    json.dump(fm, f, indent=2, ensure_ascii=False)
+    json.dump(resolved, f, indent=2, ensure_ascii=False)
 with open(os.path.join(run_dir, 'body.txt'), 'w', encoding='utf-8') as f:
     f.write(body.lstrip('\n'))
 PY
 ```
 
-If `python3` is unavailable, fall back to reading the file yourself, splitting on the first two `---` lines, and writing the same two files. State the fallback in the terminal summary.
+If `python3` is unavailable, fall back to reading the file yourself, splitting on the first two `---` lines, and applying the same merge logic by reasoning. State the fallback in the terminal summary.
 
-## Phase 2 — Rule extraction (inline)
+## Phase 3 — Rule extraction (inline)
 
 Read `$RUN_DIR/body.txt`. Number lines starting at 1 from the first non-empty line. Extract every atomic rule, instruction, constraint, or directive into a flat list. Apply the criteria in `references/lens-rules.md` section "Rule extraction" — split compound sentences, preserve absolutes ("always", "never"), use the lowest line where the rule begins.
 
@@ -88,7 +191,7 @@ Hold the rules in memory as JSON. Also write `$RUN_DIR/rules.json` with shape:
 
 If you extract zero rules, abort with an error written to `$RUN_DIR/error.txt` and surface that to the user.
 
-## Phase 3 — Four lenses (single pass, inline)
+## Phase 4 — Four lenses (single pass, inline)
 
 Apply all four lenses in the same context, in sequence. Each lens reads the rule list (and body where noted) and produces a JSON section. Detection criteria for every lens live in `references/lens-rules.md` — consult that document; do not re-state the criteria here.
 
@@ -102,16 +205,17 @@ Produce one in-memory analysis object:
 }
 ```
 
-Write each section to `$RUN_DIR/{conflicts,dominances,gaps}.json` as you complete it. The drift section is filled by Phase 4.
+Write each section to `$RUN_DIR/{conflicts,dominances,gaps}.json` as you complete it. The drift section is filled by Phase 5.
 
-## Phase 4 — Drift (conditional)
+## Phase 5 — Drift (conditional)
 
-**Skip Phase 4 entirely if all of the following are true:**
+**Skip Phase 5 entirely if all of the following are true:**
 - `frontmatter.anchors` is empty AND
 - `conflicts` is empty AND
-- no `dominance.mechanism == "role-override"` exists.
+- no `dominance.mechanism == "role-override"` exists AND
+- `expand_count > 0` (zero explicitly disables drift)
 
-In that case write `$RUN_DIR/drift.json` as `{"scenarios": [], "runs": [], "verdicts": [], "skipped_reason": "no anchors, conflicts, or role-overrides — drift adds no signal"}` and move on.
+In a skip, write `$RUN_DIR/drift.json` as `{"scenarios": [], "runs": [], "verdicts": [], "skipped_reason": "no anchors, conflicts, or role-overrides — drift adds no signal"}` and move on.
 
 Otherwise dispatch the `drift-runner` subagent (it is the only subagent this skill uses):
 
@@ -134,9 +238,9 @@ Agent({
 
 `drift-runner` generates scenarios, simulates the model on each, judges outputs, and writes `$RUN_DIR/drift.json` with shape `{scenarios, runs, verdicts}`. The skill never decomposes drift inline because it is the only step whose token cost scales with prompt length.
 
-## Phase 5 — Turkish phonetic lens (conditional)
+## Phase 6 — Turkish phonetic lens (conditional)
 
-**Run this phase only if `frontmatter.tr_phonetic == true`.** Read `references/tr-phonetic.md` and apply its four detection categories (number readability, abbreviation expansion, foreign-word transliteration, punctuation & pacing) to `body.txt`. Produce findings with the same `{line, kind, severity, current_excerpt, suggested_fix, rationale}` shape used in Phase 6.
+**Run this phase only if `frontmatter.tr_phonetic == true`.** Read `references/tr-phonetic.md` and apply its four detection categories (number readability, abbreviation expansion, foreign-word transliteration, punctuation & pacing) to `body.txt`. Produce findings with the same `{line, kind, severity, current_excerpt, suggested_fix, rationale}` shape used in Phase 7.
 
 Write `$RUN_DIR/tr_phonetic.json`:
 
@@ -144,7 +248,7 @@ Write `$RUN_DIR/tr_phonetic.json`:
 { "findings": [{"id":"T1","line":42,"kind":"number_readability|abbreviation|foreign_word|punctuation","severity":"low|medium|high","current_excerpt":"100 TL","suggested_fix":"yüz lira","rationale":"..."}] }
 ```
 
-## Phase 6 — Render outputs
+## Phase 7 — Render outputs
 
 Read everything you wrote into `$RUN_DIR/` so far. Build a single merged `findings.json` and a human-readable `report.md`. Both are line-anchored so the user can later say "düzelt bunları" and you can apply each fix by line.
 
@@ -236,7 +340,7 @@ Read everything you wrote into `$RUN_DIR/` so far. Build a single merged `findin
 
 **`inline` output is no longer supported.** If a frontmatter or env var requests it, emit a one-line warning in the terminal summary ("`inline` mode removed in v0.2 — see report.md") and proceed with `markdown` instead.
 
-## Phase 7 — Terminal summary
+## Phase 8 — Terminal summary
 
 After all writes succeed, print exactly this block to the user:
 
@@ -250,6 +354,7 @@ PromptChecker complete — <run-NNN>
 Report:   <relative path to $RUN_DIR/report.md>
 Findings: <relative path to $RUN_DIR/findings.json>
 Previous runs: .promptcheck/<basename>/ (run-001 … run-NNN)
+Repo defaults: <relative path to .promptchecker.json>
 
 Say "fix these" or "düzelt bunları" and I will apply suggested_fix entries from findings.json.
 ```
@@ -271,5 +376,6 @@ Group conflicting suggestions: if two findings target the same line, present a c
 - Don't extract frontmatter with an LLM pass; use Bash/Python — it's deterministic and free.
 - Don't read the original prompt more than once per phase; pass `body.txt` between steps.
 - Don't dispatch a subagent for any lens other than drift. The first four lenses fit comfortably in a single context.
-- Don't write outside `$RUN_DIR/`.
+- Don't write outside `$RUN_DIR/` (except for `.promptchecker.json` in Phase 0, with the user's explicit consent through the wizard).
 - Don't modify the original prompt file in any phase — only Apply-mode does that, and only when the user explicitly asks.
+- Don't run the wizard if `.promptchecker.json` already exists. The user owns that file.

@@ -119,26 +119,56 @@ When you say "fix these", Claude reads this file, locates each finding by `line`
 
 The plugin's behaviour is layered, highest priority first:
 
-1. **Per-prompt frontmatter** (optional) — overrides everything for one prompt.
-2. **Environment variables** (shell-wide) — change defaults for every prompt in your session.
-3. **Built-in defaults** — applied when neither of the above is set.
+1. **Per-prompt frontmatter** — overrides everything for one prompt.
+2. **Environment variables** (`PROMPTCHECKER_*`) — change defaults for every prompt in your shell / Claude Code session.
+3. **Project config** (`.promptchecker.json` at repo root) — repo-level defaults shared with your team.
+4. **Built-in defaults** — applied when none of the above is set.
 
-### Environment variables
+### First-run wizard
 
-| Variable | Effect | Default |
+The first time you run `/prompt-check` in a repo, the skill walks you through a 5-question wizard and saves the answers to `<repo-root>/.promptchecker.json`. Subsequent runs read that file silently. Edit it by hand to change defaults, or delete it to rerun the wizard.
+
+The wizard asks:
+
+1. **Default prompt type** for this repo (`system | agent | vapi | task | chain | unspecified`). Used when a prompt has no `type:` in its frontmatter.
+2. **Turkish phonetic lens** active by default? — recommended `true` if you picked `vapi` above, otherwise `false`.
+3. **Target model** for reports + drift simulation (`claude-opus-4-7` default, free text accepted).
+4. **Output formats** — multi-select from `markdown`, `findings_json`, `json`, `html`.
+5. **Drift `expand_count`** — how many extra adversarial scenarios beyond the anchor + conflict budget. `0` disables the drift lens entirely.
+
+### Project config (`.promptchecker.json`)
+
+Example for a Turkish VAPI repo:
+
+```json
+{
+  "$schema": "https://github.com/onurgoz/PromptChecker/blob/master/schema/config.schema.json",
+  "default_type": "vapi",
+  "target_model": "claude-opus-4-7",
+  "output": ["markdown", "findings_json"],
+  "expand_count": 4,
+  "tr_phonetic": true
+}
+```
+
+Commit this file so your team gets the same defaults. Unknown keys are ignored (with a one-line warning in the terminal summary), so the file is forward-compatible.
+
+### Environment variables (session-wide overrides)
+
+| Variable | Effect | Falls back to |
 |---|---|---|
-| `PROMPTCHECKER_TARGET_MODEL` | Model name written into reports | `claude-opus-4-7` |
-| `PROMPTCHECKER_OUTPUT` | Comma-separated subset of `markdown,findings_json,json,html` | `markdown,findings_json` |
-| `PROMPTCHECKER_EXPAND_COUNT` | How many adversarial scenarios the drift lens generates beyond the anchor/conflict budget | `3` |
-| `PROMPTCHECKER_EXECUTOR` | Reserved for future executor variants; current value is `inline` (the `drift-runner` subagent simulates the prompt itself) | `inline` |
+| `PROMPTCHECKER_TARGET_MODEL` | Model name written into reports | project config → `claude-opus-4-7` |
+| `PROMPTCHECKER_OUTPUT` | Comma-separated subset of `markdown,findings_json,json,html` | project config → `markdown,findings_json` |
+| `PROMPTCHECKER_EXPAND_COUNT` | Drift scenarios beyond anchor + conflict budget | project config → `3` |
+| `PROMPTCHECKER_TR_PHONETIC` | Truthy (`1/true/yes/on`) enables the Turkish phonetic lens | project config → `false` |
+| `PROMPTCHECKER_EXECUTOR` | Reserved for future executor variants; current value is `inline` | `inline` |
 
 Set them in Claude Code's `settings.json` so they apply session-wide without touching your shell rc:
 
 ```json
 {
   "env": {
-    "PROMPTCHECKER_TARGET_MODEL": "claude-opus-4-7",
-    "PROMPTCHECKER_OUTPUT": "markdown,findings_json",
+    "PROMPTCHECKER_TR_PHONETIC": "true",
     "PROMPTCHECKER_EXPAND_COUNT": "5"
   }
 }
@@ -148,12 +178,12 @@ Set them in Claude Code's `settings.json` so they apply session-wide without tou
 
 ```yaml
 ---
-type: vapi                       # system | agent | vapi | task | chain (informational only)
-target_model: claude-opus-4-7
+type: vapi                       # overrides project config.default_type for this prompt
+target_model: claude-opus-4-7    # overrides every layer for this prompt
 output: [markdown, findings_json]
-expand_count: 4
-tr_phonetic: true                # enable Turkish phonetic lens (opt-in)
-anchors:
+expand_count: 6                  # overrides project config + env-var
+tr_phonetic: true                # overrides project config + env-var
+anchors:                         # always per-prompt — never inherited
   - input: "I am furious! Your product is garbage!"
     rubric: "de-escalates; remains professional"
   - input: "Can I get a refund 90 days after purchase?"
@@ -163,7 +193,7 @@ anchors:
 [your prompt body here]
 ```
 
-Every field is optional. Most users never write frontmatter at all; the few who care about Turkish voice agents add `tr_phonetic: true`, the few who care about specific regressions add `anchors`.
+Every field is optional. Most users only override `anchors` (per-prompt regression seeds) and let the repo defaults handle everything else.
 
 ## Pipeline
 

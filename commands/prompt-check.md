@@ -1,7 +1,7 @@
 ---
-description: Audit a prompt file across four lenses (conflict, dominance, gap, drift) plus optional Turkish phonetic lens. Writes line-anchored findings — never modifies the original file.
+description: Audit a prompt file across four lenses (conflict, dominance, gap, drift) plus optional Turkish phonetic lens. On first run in a repo, asks for repo defaults and saves them to .promptchecker.json. Writes line-anchored findings — never modifies the original file.
 argument-hint: <prompt-path>
-allowed-tools: Skill, Read, Write, Bash, Agent
+allowed-tools: Skill, Read, Write, Bash, Agent, AskUserQuestion
 ---
 
 # /prompt-check
