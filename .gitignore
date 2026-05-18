@@ -27,3 +27,6 @@ Thumbs.db
 /.notes
 /notes/
 # <<< sync-notes managed entries <<<
+
+# obsidian-memory worktree symlink
+.memory
