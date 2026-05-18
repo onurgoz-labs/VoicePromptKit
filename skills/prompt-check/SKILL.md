@@ -240,13 +240,42 @@ Agent({
 
 ## Phase 6 — Turkish phonetic lens (conditional)
 
-**Run this phase only if `frontmatter.tr_phonetic == true`.** Read `references/tr-phonetic.md` and apply its four detection categories (number readability, abbreviation expansion, foreign-word transliteration, punctuation & pacing) to `body.txt`. Produce findings with the same `{line, kind, severity, current_excerpt, suggested_fix, rationale}` shape used in Phase 7.
+**Run this phase only if `frontmatter.tr_phonetic == true`.** Read `references/tr-phonetic.md` end-to-end before generating any findings — its skip rules, whitelist, and "no semantic translation" hard rule are mandatory and not repeated here.
+
+Each TR finding declares **one of three `fix_kind` values**:
+
+- `replace` — real textual error (typo, double-space, missing/extra punctuation). `suggested_fix` populated.
+- `pronunciation_hint` — foreign word / risky abbreviation / brand whose written text must STAY. `suggested_fix` empty; `pronunciation_entry` populated.
+- `advisory` — borderline / judgement call. Reported only; no automatic apply.
 
 Write `$RUN_DIR/tr_phonetic.json`:
 
 ```json
-{ "findings": [{"id":"T1","line":42,"kind":"number_readability|abbreviation|foreign_word|punctuation","severity":"low|medium|high","current_excerpt":"100 TL","suggested_fix":"yüz lira","rationale":"..."}] }
+{
+  "findings": [
+    {
+      "id": "T1",
+      "kind": "number_readability | abbreviation | foreign_word | punctuation",
+      "fix_kind": "replace | pronunciation_hint | advisory",
+      "severity": "low | medium | high",
+      "line": 42,
+      "current_excerpt": "...",
+      "suggested_fix": "...",
+      "pronunciation_entry": {
+        "term": "DHL",
+        "phonetic": "de-ha-el",
+        "alt_translation": null,
+        "note": null
+      },
+      "rationale": "..."
+    }
+  ]
+}
 ```
+
+Only one of `suggested_fix` / `pronunciation_entry` is populated per finding (the other is `""` or `null`).
+
+**Never** propose semantic translations (e.g. `pound → İngiliz lirası`). Phonetic hints (`pound → paund`) and optional `alt_translation` metadata are allowed; outright vocabulary substitution is not.
 
 ## Phase 7 — Render outputs
 
@@ -271,19 +300,37 @@ Read everything you wrote into `$RUN_DIR/` so far. Build a single merged `findin
     {
       "id": "C1",
       "lens": "conflict|dominance|gap|drift|tr_phonetic",
+      "fix_kind": "replace|pronunciation_hint|advisory",
       "severity": "low|medium|high",
       "line": 42,
       "related_lines": [42, 47],
       "current_excerpt": "<verbatim from body.txt>",
-      "suggested_fix": "<concrete edit — may be empty if lens cannot suggest>",
+      "suggested_fix": "<concrete edit — populated only for fix_kind: replace>",
+      "pronunciation_entry": null,
       "rationale": "<one paragraph, ≤ 240 chars>",
       "rule_ids": ["R3","R8"]
+    }
+  ],
+  "pronunciation_map": [
+    {
+      "term": "DHL",
+      "phonetic": "de-ha-el",
+      "alt_translation": null,
+      "note": null,
+      "source_finding_ids": ["T3"]
     }
   ]
 }
 ```
 
-`findings[]` is sorted by `line` ascending, then by severity descending. `suggested_fix` is the canonical apply target — when the user later asks to fix the prompt, edit the line at `line` so it produces `suggested_fix` instead of `current_excerpt`.
+`findings[]` is sorted by `line` ascending, then by severity descending. For each finding:
+- `fix_kind: "replace"` → apply-mode edits the line so it produces `suggested_fix` instead of `current_excerpt`.
+- `fix_kind: "pronunciation_hint"` → apply-mode inserts the entry into a pronunciation guide block in the prompt; the original line stays untouched.
+- `fix_kind: "advisory"` → no automatic apply.
+
+For non-TR lenses (`conflict`, `dominance`, `gap`, `drift`), `fix_kind` is always `"replace"` (when `suggested_fix` is non-empty) or `"advisory"` (when empty). Only the TR lens uses `pronunciation_hint`.
+
+`pronunciation_map` is the deduplicated merge of every `pronunciation_entry` across TR findings, ready for apply-mode to inject.
 
 ### `$RUN_DIR/report.md`
 
@@ -361,15 +408,50 @@ Say "fix these" or "düzelt bunları" and I will apply suggested_fix entries fro
 
 ## Apply-mode (when the user asks to fix)
 
-If the user, in the same or a later session, says "fix these" / "düzelt bunları" / equivalent and points at a run directory (or none — then assume `latest`), read `<run-dir>/findings.json`, then for each finding with a non-empty `suggested_fix`:
+If the user, in the same or a later session, says "fix these" / "düzelt bunları" / equivalent and points at a run directory (or none — then assume `latest`), read `<run-dir>/findings.json`, then do two passes in order:
+
+### Pass 1 — `replace` findings (line-level substitutions)
+
+For each finding with `fix_kind == "replace"` and non-empty `suggested_fix`:
 
 1. Read the prompt file fresh.
-2. Locate the line via `line` number AND `current_excerpt` substring match (both must agree — if not, skip that finding and report it).
-3. Apply the replacement.
+2. Locate the line via `line` number AND `current_excerpt` substring match (both must agree — if not, skip and report).
+3. Apply the substring replacement.
 4. Write the file back.
-5. Surface a short diff in the terminal.
 
 Group conflicting suggestions: if two findings target the same line, present a choice rather than silently applying one. Never apply a finding whose `suggested_fix` is empty — those are advisory only.
+
+### Pass 2 — `pronunciation_map` injection (idempotent block)
+
+If `findings.json.pronunciation_map` is non-empty, write or update a single pronunciation guide block in the prompt:
+
+Block format:
+
+```
+<!-- promptchecker:pronunciation-guide:start -->
+## Okunuş rehberi (TTS)
+- `DHL` → "de-ha-el"
+- `D&R` → "de ve er"
+- `Hebrew` → "hebru" (alternatif: İbrani)
+- `iPhone` → "ay-fon"
+<!-- promptchecker:pronunciation-guide:end -->
+```
+
+Insertion priority (first match wins):
+
+1. **Existing marker block** — if the prompt already contains `<!-- promptchecker:pronunciation-guide:start --> … <!-- end -->`, replace its body with the current map. This is the idempotent re-run path.
+2. **Existing section heading** — if the prompt has a section titled `Pronunciation guide`, `Okunuş rehberi`, `Telaffuz`, or `TTS PRONUNCIATION NOTES` (heading or all-caps line), append the map under it (with markers) and report which section was extended.
+3. **Fallback** — insert the block immediately after the frontmatter (or at the top of the body if no frontmatter).
+
+Never inject the block inside YAML frontmatter, fenced code blocks, quoted transcripts, or markdown tables. After writing, surface to the user: "Pronunciation guide updated: N entries (added M, kept K)."
+
+### Diff surface
+
+After both passes, show a short summary in the terminal:
+- Replace pass: `N findings applied, M skipped (line/excerpt mismatch), 0 conflicts`.
+- Pronunciation pass: `N entries in guide (M new this run)`.
+
+If both passes are empty, say so explicitly — do not pretend to have done work.
 
 ## Don'ts
 

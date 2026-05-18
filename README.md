@@ -33,7 +33,13 @@ After the run, say **"fix these"** (or **"düzelt bunları"**) in the same Claud
 | **Dominance** | Rules that silently override others through position, length, specificity, recency, or role-override patterns ("ignore previous instructions…") | yes |
 | **Gap** | Undefined edge cases (incomplete conditionals) and ambiguous terms ("appropriate", "reasonable") that the prompt's own rules raise | yes |
 | **Drift** | Behavioural mismatch between the prompt's stated rules and the model's actual output, surfaced by adversarial scenarios | only when anchors / conflicts / role-overrides exist (skipped otherwise) |
-| **TR phonetic** | Numbers, abbreviations, foreign words, and pacing problems that break Turkish text-to-speech | opt-in via `tr_phonetic: true` frontmatter |
+| **TR phonetic** | Numbers, abbreviations, foreign words, and pacing problems that break Turkish text-to-speech | opt-in via `tr_phonetic: true` frontmatter or project config |
+
+### TR phonetic — how fixes are applied
+
+The TR lens produces **three kinds of finding**: `replace` (real typos / punctuation errors that get substituted in place), `pronunciation_hint` (foreign words and risky abbreviations whose **written text stays** — the entry goes into a pronunciation guide block instead), and `advisory` (judgement calls; reported only). The lens never translates: `pound → paund` is a phonetic hint; `pound → İngiliz lirası` is forbidden semantic substitution.
+
+When you say "fix these", apply-mode runs two passes: replace pass for line-level substitutions, then a pronunciation-guide injection that updates an idempotent block in your prompt (between `<!-- promptchecker:pronunciation-guide:start -->` and `<!-- end -->`). Re-runs update the same block instead of duplicating it. If your prompt already has a `TTS PRONUNCIATION NOTES` / `Okunuş rehberi` / `Telaffuz` section, the block extends that section rather than creating a new one.
 
 All five lenses live in `skills/prompt-check/SKILL.md` and its `references/`.
 
