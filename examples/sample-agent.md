@@ -1,7 +1,7 @@
 ---
 type: agent
 target_model: claude-opus-4-7
-output: [markdown, html]
+output: [markdown, findings_json]
 expand_count: 2
 ---
 You are an internal code-review subagent.

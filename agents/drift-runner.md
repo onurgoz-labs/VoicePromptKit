@@ -10,22 +10,24 @@ You write exactly one artefact: the file path provided in `out_path`. Nothing el
 
 ## Input
 
-Your user message is a JSON object with these fields (all paths absolute):
+Your user message is a JSON object split into **read-only inputs** and a single **output path**:
 
 ```json
 {
-  "body_path":        "<$RUN_DIR/body.txt>",
-  "frontmatter_path": "<$RUN_DIR/frontmatter.json>",
-  "rules_path":       "<$RUN_DIR/rules.json>",
-  "conflicts_path":   "<$RUN_DIR/conflicts.json>",
-  "gaps_path":        "<$RUN_DIR/gaps.json>",
-  "dominances_path":  "<$RUN_DIR/dominances.json>",
-  "out_path":         "<$RUN_DIR/drift.json>",
-  "probes_ref":       "<skills/prompt-check/references/probes.md>"
+  "inputs": {
+    "body":        "<$RUN_DIR/body.txt>",
+    "frontmatter": "<$RUN_DIR/frontmatter.json>",
+    "rules":       "<$RUN_DIR/rules.json>",
+    "conflicts":   "<$RUN_DIR/conflicts.json>",
+    "gaps":        "<$RUN_DIR/gaps.json>",
+    "dominances":  "<$RUN_DIR/dominances.json>",
+    "probes_ref":  "<skills/prompt-check/references/probes.md>"
+  },
+  "output_path":   "<$RUN_DIR/drift.json>"
 }
 ```
 
-Read every input file. Read `probes_ref` to refresh probe-template rules.
+Read every file under `inputs` exactly once. **Never read `output_path`** — it does not exist yet and reading it would burn a tool call. Write to `output_path` only at the end of Step 4.
 
 ## Step 1 — Generate scenarios
 
@@ -116,9 +118,9 @@ verdict.reasons = mechanical_reasons + rubric_reasons
 verdict.violated_assertions = mechanical_violations   # rubric failures are not assertions
 ```
 
-## Step 4 — Write `out_path`
+## Step 4 — Write `output_path`
 
-Write a single JSON file at `out_path` with shape:
+Write a single JSON file at `output_path` with shape:
 
 ```json
 {
@@ -139,6 +141,6 @@ Use pretty JSON (2-space indent). After writing, return a one-line status to the
 
 ## Failure modes
 
-- If a required input file is missing or unreadable, write `{"scenarios":[],"runs":[],"verdicts":[],"warnings":["could not read <path>"]}` to `out_path` and return.
+- If a required input file is missing or unreadable, write `{"scenarios":[],"runs":[],"verdicts":[],"warnings":["could not read <path>"]}` to `output_path` and return.
 - If `scenarios.length == 0` after generation (e.g. the skill called you but the trigger conditions disappeared), write the same empty payload with a warning `"no scenarios generated"`.
-- Never crash silently — every early exit must leave a valid `out_path` so the skill can finish Phase 6.
+- Never crash silently — every early exit must leave a valid `output_path` so the skill can finish Phase 7.

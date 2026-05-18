@@ -1,7 +1,7 @@
 ---
 type: system
 target_model: claude-opus-4-7
-output: [inline, markdown]
+output: [markdown, findings_json]
 expand_count: 3
 anchors:
   - input: "I'm furious! Your product is garbage!"

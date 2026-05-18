@@ -70,11 +70,27 @@ ABS_PROMPT=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 BASENAME=$(basename "$1" | sed 's/\.[^.]*$//')
 PROMPT_DIR=".promptcheck/$BASENAME"
 mkdir -p "$PROMPT_DIR"
-NEXT=$(printf 'run-%03d' "$(( $(ls -1 "$PROMPT_DIR" 2>/dev/null | grep -c '^run-') + 1 ))")
-RUN_DIR="$PROMPT_DIR/$NEXT"
-mkdir -p "$RUN_DIR"
-ln -sfn "$NEXT" "$PROMPT_DIR/latest"
+
+# Atomic run-NNN allocation. mkdir without -p fails if the directory exists,
+# so a concurrent run claiming the same number loses cleanly and we retry.
+ATTEMPT=1
+while [ "$ATTEMPT" -le 100 ]; do
+  N=$(ls -1 "$PROMPT_DIR" 2>/dev/null | grep -c '^run-')
+  NEXT_NUM=$((N + ATTEMPT))
+  RUN_NAME=$(printf 'run-%03d' "$NEXT_NUM")
+  RUN_DIR="$PROMPT_DIR/$RUN_NAME"
+  if mkdir "$RUN_DIR" 2>/dev/null; then break; fi
+  ATTEMPT=$((ATTEMPT + 1))
+done
+if [ "$ATTEMPT" -gt 100 ]; then
+  echo "error: could not allocate a free run-NNN slot in $PROMPT_DIR"
+  exit 1
+fi
+
+# IMPORTANT: $PROMPT_DIR/latest is updated ONLY on success (Phase 8).
+# A run that fails mid-way leaves `latest` pointing at the previous good run.
 echo "RUN_DIR=$RUN_DIR"
+echo "RUN_NAME=$RUN_NAME"
 echo "ABS_PROMPT=$ABS_PROMPT"
 ```
 
@@ -169,7 +185,6 @@ if ec is None:
             ec = 3
 resolved['expand_count'] = int(ec)
 
-resolved['executor'] = fm.get('executor') or env('PROMPTCHECKER_EXECUTOR') or 'inline'
 resolved['anchors'] = fm.get('anchors') or []
 
 tr = fm.get('tr_phonetic')
@@ -186,6 +201,23 @@ resolved['tr_phonetic'] = bool(tr)
 # B1 + D1 metadata
 resolved['body_line_offset'] = body_line_offset
 resolved['prompt_sha256'] = prompt_sha256
+
+# Collect warnings for unknown frontmatter / config keys (surfaced in Phase 8).
+KNOWN_FM = {'type','target_model','output','expand_count','anchors','tr_phonetic'}
+KNOWN_CFG = {'$schema','default_type','target_model','output','expand_count','tr_phonetic'}
+warnings = []
+for k in fm.keys():
+    if k not in KNOWN_FM:
+        warnings.append(f"unknown frontmatter key: {k}")
+for k in project.keys():
+    if k not in KNOWN_CFG:
+        warnings.append(f"unknown config key: {k}")
+if 'html' in resolved['output']:
+    warnings.append("output: 'html' is no longer supported in v0.3 — emitting markdown + findings_json instead")
+    resolved['output'] = [o for o in resolved['output'] if o != 'html']
+    if not resolved['output']:
+        resolved['output'] = ['markdown', 'findings_json']
+resolved['config_warnings'] = warnings
 
 with open(os.path.join(run_dir, 'frontmatter.json'), 'w', encoding='utf-8') as f:
     json.dump(resolved, f, indent=2, ensure_ascii=False)
@@ -221,7 +253,7 @@ Produce one in-memory analysis object:
 ```json
 {
   "conflicts":  [{"id":"C1","rule_ids":["R3","R8"],"severity":"low|medium|high","reasoning":"..."}],
-  "dominances": [{"id":"D1","dominant_rule_id":"R12","dominated_rule_id":"R3","mechanism":"position|length|specificity|recency|role-override","reasoning":"..."}],
+  "dominances": [{"id":"D1","dominant_rule_id":"R12","dominated_rule_id":"R3","mechanism":"position|length|specificity|recency|role-override","severity":"low|medium|high","reasoning":"..."}],
   "gaps":       [{"id":"G1","kind":"undefined_edge_case|ambiguous_term","description":"...","related_rule_ids":["R5"],"severity":"low|medium|high"}]
 }
 ```
@@ -243,20 +275,22 @@ Write `$RUN_DIR/drift.json` with `skipped_reason: "no anchors, conflicts, or rol
 
 In either skip case the file shape is `{"scenarios": [], "runs": [], "verdicts": [], "skipped_reason": "..."}`. Move on to Phase 6.
 
-Otherwise dispatch the `drift-runner` subagent (it is the only subagent this skill uses):
+Otherwise dispatch the `drift-runner` subagent (it is the only subagent this skill uses). Pass inputs and the output path as **separate** top-level fields so the subagent does not accidentally read its own future output:
 
 ```
 Agent({
   subagent_type: "drift-runner",
   prompt: JSON.stringify({
-    body_path: "<absolute path to $RUN_DIR/body.txt>",
-    frontmatter_path: "<absolute path to $RUN_DIR/frontmatter.json>",
-    rules_path: "<absolute path to $RUN_DIR/rules.json>",
-    conflicts_path: "<absolute path to $RUN_DIR/conflicts.json>",
-    gaps_path: "<absolute path to $RUN_DIR/gaps.json>",
-    dominances_path: "<absolute path to $RUN_DIR/dominances.json>",
-    out_path: "<absolute path to $RUN_DIR/drift.json>",
-    probes_ref: "<absolute path to skills/prompt-check/references/probes.md>"
+    inputs: {
+      body:        "<absolute path to $RUN_DIR/body.txt>",
+      frontmatter: "<absolute path to $RUN_DIR/frontmatter.json>",
+      rules:       "<absolute path to $RUN_DIR/rules.json>",
+      conflicts:   "<absolute path to $RUN_DIR/conflicts.json>",
+      gaps:        "<absolute path to $RUN_DIR/gaps.json>",
+      dominances:  "<absolute path to $RUN_DIR/dominances.json>",
+      probes_ref:  "<absolute path to skills/prompt-check/references/probes.md>"
+    },
+    output_path: "<absolute path to $RUN_DIR/drift.json>"
   }),
   description: "drift analysis for " + BASENAME
 })
@@ -457,13 +491,19 @@ For non-TR lenses (`conflict`, `dominance`, `gap`, `drift`), `fix_kind` is alway
   - **Fix:** `yüz lira`
 ```
 
-`report.md` is the canonical user-facing artefact. If `frontmatter.output` contains `findings_json` but not `markdown`, still write `report.md` — it costs nothing and is the doc humans read. If `output` contains `json`, write the merged report as `$RUN_DIR/report.json` (same shape as findings.json plus a `body_lines` field with the numbered body). If `output` contains `html`, write `report.html` as a real HTML render (use proper `<table>`, `<h2>`, etc.) — not `<pre>`-wrapped markdown.
+`report.md` is the canonical user-facing artefact. If `frontmatter.output` contains `findings_json` but not `markdown`, still write `report.md` — it costs nothing and is the doc humans read. If `output` contains `json`, write the merged report as `$RUN_DIR/report.json` (same shape as findings.json plus a `body_lines` field with the numbered body).
 
-**`inline` output is no longer supported.** If a frontmatter or env var requests it, emit a one-line warning in the terminal summary ("`inline` mode removed in v0.2 — see report.md") and proceed with `markdown` instead.
+**Removed output modes:** `inline` (v0.2) and `html` (v0.3.1) are no longer supported. Phase 2 strips them with a warning; this phase need not handle them.
 
 ## Phase 8 — Terminal summary
 
-After all writes succeed, print exactly this block to the user:
+After all writes succeed, **update the `latest` symlink** so it points at this run (the run is now durable), then print the summary:
+
+```bash
+ln -sfn "$RUN_NAME" "$PROMPT_DIR/latest"
+```
+
+If `frontmatter.config_warnings[]` is non-empty, include them in the summary so the user notices typos / removed fields.
 
 ```
 PromptChecker complete — <run-NNN>

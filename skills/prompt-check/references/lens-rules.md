@@ -67,8 +67,13 @@ Rules that **contradict** but where neither dominates are a *conflict*, not a do
 Schema:
 
 ```json
-{ "dominances": [{ "id": "D1", "dominant_rule_id": "R12", "dominated_rule_id": "R3", "mechanism": "position|length|specificity|recency|role-override", "reasoning": "<≤ 300 chars>" }] }
+{ "dominances": [{ "id": "D1", "dominant_rule_id": "R12", "dominated_rule_id": "R3", "mechanism": "position|length|specificity|recency|role-override", "severity": "low|medium|high", "reasoning": "<≤ 300 chars>" }] }
 ```
+
+Severity heuristic for dominance:
+- **high** — `role-override` mechanism (the dominant rule is an explicit override pattern), or `recency` on a safety-critical rule.
+- **medium** — `position` / `length` where the dominated rule is consequential, or `specificity` where the specific rule is too narrow.
+- **low** — `specificity` where the dominant rule is a benign intentional exception.
 
 For `suggested_fix`: name the action the prompt author should take (e.g. "Move R3 below R12, or merge them"). Empty if the dominance is intentional and benign.
 

@@ -21,9 +21,9 @@ The plugin auto-loads in every Claude Code session after that. No API keys, no S
 /prompt-check path/to/your/prompt.md
 ```
 
-That's it. No frontmatter required, no flags. The plugin uses sensible defaults: tests against `claude-opus-4-7`, generates up to 3 adversarial scenarios, writes a markdown report and a findings JSON to `.promptcheck/<basename>/run-NNN/`.
+That's it. No frontmatter required, no flags. The plugin uses sensible defaults: tests against `claude-opus-4-7`, writes a markdown report and a findings JSON to `.promptcheck/<basename>/run-NNN/`. The drift lens generates as many adversarial scenarios as `expand_count + anchor_count + min(2, conflicts + gaps)` (default `expand_count` is 3, so a prompt with no anchors and a handful of conflicts ends up with ~5).
 
-After the run, say **"fix these"** (or **"düzelt bunları"**) in the same Claude session and Claude will read the findings, match each line + excerpt in the prompt file, and apply the suggested fixes. No copy-paste, no second session.
+After the run, either say **"fix these"** / **"düzelt bunları"** in the same Claude session, or run **`/prompt-check-apply [run-id]`** explicitly. Claude reads the findings, verifies the prompt's SHA256 still matches the snapshot taken at audit time, then applies the fixes line-by-line. If the prompt has been edited since the audit, apply-mode refuses and asks you to re-run `/prompt-check`.
 
 ## What it looks for — the five lenses
 
@@ -100,6 +100,7 @@ Every run gets its own directory. Older runs are preserved so you can diff audit
 ```json
 {
   "prompt_path": "/abs/path/mainprompt.md",
+  "prompt_sha256": "a3f1...c7",
   "run_id": "run-003",
   "generated_at": "2026-05-17T19:42:00Z",
   "summary": { "rules": 50, "conflicts": {"total": 10, "high": 4}, ... },
@@ -107,19 +108,48 @@ Every run gets its own directory. Older runs are preserved so you can diff audit
     {
       "id": "C1",
       "lens": "conflict",
+      "fix_kind": "replace",
       "severity": "high",
       "line": 15,
       "related_lines": [15, 16],
       "current_excerpt": "Always be formal and use professional language at all times.",
       "suggested_fix": "Maintain a professional but warm register.",
+      "pronunciation_entry": null,
       "rationale": "Tone contradiction with R2 on line 16.",
       "rule_ids": ["R1","R2"]
+    },
+    {
+      "id": "T3",
+      "lens": "tr_phonetic",
+      "fix_kind": "pronunciation_hint",
+      "severity": "high",
+      "line": 858,
+      "current_excerpt": "şehir dışı gönderilerde ise DHL kullanıyoruz.",
+      "suggested_fix": "",
+      "pronunciation_entry": {
+        "term": "DHL",
+        "strategy": "pronounce",
+        "phonetic": "de-ha-el",
+        "alt_translation": null,
+        "note": null
+      },
+      "rationale": "TTS reads DHL as English D-H-L.",
+      "rule_ids": []
     }
+  ],
+  "pronunciation_map": [
+    { "term": "DHL", "strategy": "pronounce", "phonetic": "de-ha-el", "alt_translation": null, "note": null, "source": "finding", "source_finding_ids": ["T3"] }
   ]
 }
 ```
 
-When you say "fix these", Claude reads this file, locates each finding by `line` + `current_excerpt` (both must agree), applies the `suggested_fix`, and shows you a diff. Findings with empty `suggested_fix` are advisory and never auto-applied.
+Each finding declares one of three `fix_kind` values:
+
+- `replace` — substring replacement (`current_excerpt` → `suggested_fix`).
+- `pronunciation_hint` — written text untouched; `pronunciation_entry` (with `strategy: pronounce | rephrase | follow_with_translation`) is added to the managed pronunciation guide block in the prompt.
+- `advisory` — judgement call; reported only, never auto-applied.
+
+When you say "fix these", Claude runs **two passes**: Pass 1 applies every `replace` finding (line + excerpt must agree; ambiguous occurrences are skipped); Pass 2 writes or updates a single marker-delimited pronunciation block at the top of the prompt (or migrates an existing legacy `TTS PRONUNCIATION NOTES` / `Okunuş rehberi` block into managed format, preserving every entry). Findings with empty `suggested_fix` and `fix_kind: advisory` are never auto-applied.
 
 ## Customizing defaults
 
@@ -139,7 +169,7 @@ The wizard asks:
 1. **Default prompt type** for this repo (`system | agent | vapi | task | chain | unspecified`). Used when a prompt has no `type:` in its frontmatter.
 2. **Turkish phonetic lens** active by default? — recommended `true` if you picked `vapi` above, otherwise `false`.
 3. **Target model** for reports + drift simulation (`claude-opus-4-7` default, free text accepted).
-4. **Output formats** — multi-select from `markdown`, `findings_json`, `json`, `html`.
+4. **Output formats** — multi-select from `markdown`, `findings_json`, `json`.
 5. **Drift `expand_count`** — how many extra adversarial scenarios beyond the anchor + conflict budget. `0` disables the drift lens entirely.
 
 ### Project config (`.promptchecker.json`)
@@ -164,10 +194,9 @@ Commit this file so your team gets the same defaults. Unknown keys are ignored (
 | Variable | Effect | Falls back to |
 |---|---|---|
 | `PROMPTCHECKER_TARGET_MODEL` | Model name written into reports | project config → `claude-opus-4-7` |
-| `PROMPTCHECKER_OUTPUT` | Comma-separated subset of `markdown,findings_json,json,html` | project config → `markdown,findings_json` |
-| `PROMPTCHECKER_EXPAND_COUNT` | Drift scenarios beyond anchor + conflict budget | project config → `3` |
+| `PROMPTCHECKER_OUTPUT` | Comma-separated subset of `markdown,findings_json,json` | project config → `markdown,findings_json` |
+| `PROMPTCHECKER_EXPAND_COUNT` | Drift scenarios beyond anchor + conflict budget; `0` disables drift entirely | project config → `3` |
 | `PROMPTCHECKER_TR_PHONETIC` | Truthy (`1/true/yes/on`) enables the Turkish phonetic lens | project config → `false` |
-| `PROMPTCHECKER_EXECUTOR` | Reserved for future executor variants; current value is `inline` | `inline` |
 
 Set them in Claude Code's `settings.json` so they apply session-wide without touching your shell rc:
 
@@ -205,14 +234,15 @@ Every field is optional. Most users only override `anchors` (per-prompt regressi
 
 The plugin runs one skill end-to-end inside a single Claude context — no chain of round-tripping subagents. Only the drift lens dispatches a subagent (`drift-runner`), and only when there are anchors, conflicts, or role-override dominances; otherwise drift is skipped entirely.
 
-1. **Phase 0** — Compute `run-NNN` directory and update `latest` symlink.
-2. **Phase 1** — Parse frontmatter deterministically (Python one-liner, with a no-PyYAML fallback) and split body.
-3. **Phase 2** — Extract atomic, line-anchored rules.
-4. **Phase 3** — Apply conflict, dominance, gap lenses inline.
-5. **Phase 4** — If warranted, dispatch `drift-runner` to generate scenarios, simulate the prompt, judge outputs.
-6. **Phase 5** — If `tr_phonetic: true`, apply Turkish phonetic lens inline.
-7. **Phase 6** — Render `report.md` + `findings.json` (plus optional `report.json` / `report.html`).
-8. **Phase 7** — Print a terminal summary with paths and the apply-mode hint.
+1. **Phase 0** — First-run wizard or load existing `.promptchecker.json`.
+2. **Phase 1** — Allocate a fresh `run-NNN` directory (atomic; `latest` symlink is updated only on success).
+3. **Phase 2** — Parse frontmatter deterministically and split body. Stores `body_line_offset` and `prompt_sha256` for line-mapping and stale-audit checks.
+4. **Phase 3** — Extract atomic, line-anchored rules from `body.txt`.
+5. **Phase 4** — Apply conflict, dominance, gap lenses inline.
+6. **Phase 5** — If warranted (anchors / conflicts / role-overrides present AND `expand_count > 0`), dispatch `drift-runner` for adversarial scenarios + judging.
+7. **Phase 6** — If `tr_phonetic: true`, seed `pronunciation_map` from existing pronunciation blocks, then scan body for new TR findings.
+8. **Phase 7** — Render `report.md` + `findings.json` (line numbers translated back to the original prompt file; `prompt_sha256` carried through).
+9. **Phase 8** — Update `latest` symlink (commit point), print terminal summary.
 
 ## Architecture
 
