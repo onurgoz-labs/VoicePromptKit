@@ -2,13 +2,15 @@
 
 Active only when `frontmatter.tr_phonetic == true`. Voice agents (Vapi, ElevenLabs, OpenAI Realtime, etc.) read text aloud; constructs that look fine in writing may be mispronounced or sound robotic.
 
-The lens emits **three kinds of finding** so apply-mode can act correctly:
+## Output shape — three fix kinds, one optional strategy field
 
-| `fix_kind` | When to use | Apply-mode behaviour |
+Each TR finding declares one of three `fix_kind` values:
+
+| `fix_kind` | When | Apply-mode behaviour |
 |---|---|---|
-| `replace` | Real textual error (typo, double space, missing/extra punctuation) | Substring replace `current_excerpt` → `suggested_fix` |
-| `pronunciation_hint` | Foreign word, abbreviation, brand name — the **written text must stay**, only the TTS reading needs help | Add a `pronunciation_entry` to a guide block in the prompt; do not touch the original line |
-| `advisory` | Borderline / judgement call (long unparseable sentence, possible mistranslation) | Reported only; no automatic apply |
+| `replace` | Real textual error (typo, double space, malformed Turkish number, missing/extra punctuation) | Substring replace `current_excerpt` → `suggested_fix` |
+| `pronunciation_hint` | Foreign word / risky abbreviation / brand whose **written text must stay** | Add `pronunciation_entry` to the managed guide block; do not touch the original line |
+| `advisory` | Borderline / judgement call (long unparseable sentence, possible mistranslation, unfamiliar proper noun) | Reported only; no automatic apply |
 
 Common finding shape:
 
@@ -20,22 +22,29 @@ Common finding shape:
   "severity": "low | medium | high",
   "line": 42,
   "current_excerpt": "...",
-  "suggested_fix": "...",          // populated only for fix_kind = replace
-  "pronunciation_entry": null,      // populated only for fix_kind = pronunciation_hint
+  "suggested_fix": "...",
+  "pronunciation_entry": {
+    "term": "DHL",
+    "strategy": "pronounce | rephrase | follow_with_translation",
+    "phonetic": "de-ha-el",
+    "alt_translation": null,
+    "note": null
+  },
   "rationale": "..."
 }
 ```
 
-`pronunciation_entry` schema (4 fields, last two nullable):
+Only one of `suggested_fix` / `pronunciation_entry` is populated per finding.
 
-```json
-{
-  "term": "DHL",
-  "phonetic": "de-ha-el",
-  "alt_translation": null,    // a genuine Turkish alternative if one exists (e.g. "İbrani" for "Hebrew"); else null
-  "note": null                // optional usage hint (e.g. "use on first mention only"); else null
-}
-```
+### `strategy` semantics
+
+| strategy | Meaning | `phonetic` | `alt_translation` |
+|---|---|---|---|
+| `pronounce` | TTS should read the term with the given phonetic spelling (`pound → paund`) | **required** | optional |
+| `rephrase` | The author should avoid the term and substitute the alternative when speaking (`Palaeologlar → son Bizans hanedanı`) | optional / null | optional |
+| `follow_with_translation` | Speak the term but always follow with a Turkish gloss (`La Turquie Kemaliste → "yani Kemal'in Türkiye'si dergisi"`) | optional | **required** (the gloss) |
+
+If `phonetic` is null, `strategy` must be `rephrase` or `follow_with_translation`. Default strategy when omitted is `pronounce`.
 
 Severity guide:
 - **high** — TTS will mispronounce or skip; meaning lost.
@@ -46,105 +55,134 @@ Severity guide:
 
 This lens is about **how Turkish TTS reads text**, not about Turkish vocabulary substitution. `pound → paund` is a phonetic hint (allowed). `pound → İngiliz lirası` is a semantic translation (forbidden — the brand / domain meaning is the author's call, not the lens's).
 
-The only exception is `alt_translation` inside a `pronunciation_entry`, which **suggests** a Turkish alternative without forcing it. The original term still stays in the prompt; the alternative is metadata.
+The only exceptions are `alt_translation` (a Turkish alternative offered as metadata) and the `follow_with_translation` strategy (which keeps the original term and adds a gloss). Neither replaces the original text by default; the prompt author decides.
+
+## Phase 6.0 — Seed `pronunciation_map` from existing blocks
+
+Run this **before** body-scan detection in Phase 6. Look for any of these patterns in the body and parse them into seed entries:
+
+1. **Managed marker block:**
+   ```
+   <!-- promptchecker:pronunciation-guide:start -->
+   ... bullet entries ...
+   <!-- promptchecker:pronunciation-guide:end -->
+   ```
+2. **Legacy heading prose blocks** (ALL-CAPS or markdown heading variants):
+   - `TTS PRONUNCIATION NOTES`
+   - `Pronunciation guide`
+   - `Okunuş rehberi`
+   - `Telaffuz` / `Telaffuz notları`
+   followed by a bullet list (`- term → ...`) within the next ~20 lines.
+
+For each parsed entry, infer the `strategy`:
+- Contains "rephrase" / "rephrase as" / "yerine" → `rephrase`
+- Contains "follow with" / "always follow" / "ardından söyle" → `follow_with_translation`
+- Contains a phonetic-style hint (`"foo nokta kom"`, dashes, parenthesised reading) → `pronounce`
+
+Add every parsed entry to the seed `pronunciation_map`. **Do not generate findings for terms already in the seed** — they are already curated; the body scan dedupes against the seed.
+
+If a legacy heading block is found, remember its line range — apply-mode Pass 2 needs it to migrate the block.
 
 ## 1. Number readability (`kind: "number_readability"`)
 
-Numerals get read digit-by-digit or with wrong place values by many Turkish TTS engines. For monetary amounts and percentages spoken in real conversation, replacing `100 TL` with `yüz lira` is a textual correction (use `fix_kind: "replace"`). For phone numbers, IBANs, postal codes, etc., the model needs an *instruction* to read them digit-by-digit (use `fix_kind: "advisory"` — there is no clean automatic fix).
+Numerals get read digit-by-digit or with wrong place values. For monetary amounts and percentages spoken aloud, replacing `100 TL` with `yüz lira` is a textual correction (use `fix_kind: "replace"`). For phone numbers, IBANs, postal codes, the model needs a separate instruction (use `advisory`).
 
-| Pattern | fix_kind | Suggested rewrite |
+| Pattern | fix_kind | Example fix |
 |---|---|---|
-| Currency: `100 TL`, `8.100 TL`, `₺1.250,50` | `replace` | `yüz lira`, `sekiz bin yüz lira`, `bin iki yüz elli lira elli kuruş` |
-| Percentage: `%25`, `%40 avantaj` | `replace` | `yüzde yirmi beş`, `yüzde kırk avantaj` |
-| Date: `17/05/2026`, `17.05.2026`, `2026-05-17` | `replace` | `on yedi Mayıs iki bin yirmi altı` |
-| Time: `14:30`, `09:00` | `replace` | `on dört otuz`, `dokuzda` |
-| Phone, IBAN, posta kodu | `advisory` | Add an instruction near the line: "telefon numarasını rakam rakam, ikişerli oku" |
-| Large numbers with units | `replace` | `bin yedi yüz elli sekiz satır`, `elli bin kullanıcı` |
+| Currency: `100 TL`, `8.100 TL`, `₺1.250,50` | `replace` | `yüz lira`, `sekiz bin yüz lira` |
+| Percentage: `%25` | `replace` | `yüzde yirmi beş` |
+| Date: `17/05/2026` | `replace` | `on yedi Mayıs iki bin yirmi altı` |
+| Time: `14:30` | `replace` | `on dört otuz` |
+| Phone, IBAN, posta kodu | `advisory` | Add an instruction near the line |
 | Ordinals: `5.`, `21.` | `replace` | `beşinci`, `yirmi birinci` |
 
-**Detection heuristic:** scan body for `\d+[.,]?\d*\s*(TL|₺|lira|%|saat|dakika|gün|ay|yıl|adet|kişi)` and date/time/phone/IBAN regexes. Flag any numeric span longer than two digits that is followed by a unit or precedes a noun.
+### Malformed Turkish numbers (`replace`, severity `medium` or `high`)
+
+These slip past spell-checkers but TTS reads them literally — flag them when the prompt is in Turkish and the body is meant to be spoken.
+
+| Pattern | Why it's wrong | Suggested fix |
+|---|---|---|
+| `bir bin` followed by `yüz`/`...` | "bin" already means 1000; "bir bin" reads as ~1001. The author meant just `bin`. | Replace `bir bin` with `bin` |
+| `bir milyon`, `bir milyar` | Same root issue: redundant `bir`. | Replace with `milyon` / `milyar` (context-dependent) |
+| `içinz`, `içiniz` mid-sentence where `için` was meant | Typo; TTS reads "ee-cheen-z" / similar. | Replace with `için` |
+| Number-word with no space before unit (`onbin`, `yüzlira`) | TTS may concatenate or hesitate. | Insert space: `on bin`, `yüz lira` |
 
 ## 2. Abbreviations & technical terms (`kind: "abbreviation"`)
 
-Default behaviour: **do not flag**. Turkish TTS handles most acronyms acceptably letter-by-letter, and false positives here are the lens's biggest source of noise.
+Default behaviour: **do not flag**. Most Turkish acronyms are read acceptably letter-by-letter. Flag only when the abbreviation is in the **curated risky list**.
 
-Flag only when the abbreviation is in the **curated risky list**, or when the prompt explicitly requires layperson expansion.
+**Curated risky (flag as `pronunciation_hint`):**
 
-**Curated risky abbreviations (flag as `pronunciation_hint`):**
-
-| Term | Phonetic | Notes |
-|---|---|---|
-| `DHL` | `de-ha-el` | English-trained TTS often reads "D-H-L" |
-| `SMS` | `se-me-se` | Often read as English "es-em-es" |
-| `OTP` | `o-te-pe` | Often anglicised |
-| `URL` | `u-er-le` | Anglicisation common |
-| `WhatsApp` | `votsap` | Common brand |
-| `iPhone` | `ay-fon` | Common brand |
-| `D&R`, `S&P`, `H&M` (`X&Y` brands) | `de ve er`, etc. | `&` symbol read literally as "and" |
-| `pound`, `euro`, `dollar` | `paund`, `oyro`, `dolar` | Foreign currency words |
-| `A.Ş.` | (`alt_translation: "anonim şirketi"`) | Letter-by-letter read is OK but cluttered; optional expansion |
-| `T.C.` | (`alt_translation: "Türkiye Cumhuriyeti"`) | Same — optional expansion |
+| Term | Phonetic | Strategy | Notes |
+|---|---|---|---|
+| `DHL` | `de-ha-el` | `pronounce` | English-trained TTS reads "D-H-L" |
+| `SMS` | `se-me-se` | `pronounce` | Often anglicised |
+| `OTP` | `o-te-pe` | `pronounce` | Often anglicised |
+| `URL` | `u-er-le` | `pronounce` | — |
+| `WhatsApp` | `votsap` | `pronounce` | Common brand |
+| `iPhone` | `ay-fon` | `pronounce` | Common brand |
+| `D&R`, `S&P`, `H&M` (any `X&Y` brand) | `de ve er`, etc. | `pronounce` | `&` symbol read literally |
+| `pound`, `euro`, `dollar` | `paund`, `oyro`, `dolar` | `pronounce` | Foreign currency words |
+| `Boyut Store` (or any `<TR-word> Store`) | `boyut store` | `pronounce` | "Store" English read |
+| `CD`, `DVD`, `CD/DVD` | `se-de`, `de-ve-de` | `pronounce` | English letter read |
+| `A.Ş.` | — | `rephrase` | `alt_translation: "anonim şirketi"` (optional) |
+| `T.C.` | — | `rephrase` | `alt_translation: "Türkiye Cumhuriyeti"` (optional) |
 
 **Whitelist — explicitly DO NOT flag:**
 
 - `PTT`, `KDV`, `ÖTV`, `SGK`, `MEB`, `TBMM`, `TRT` — TR TTS reads these fine.
-- Single-letter qualifiers: `A Blok`, `B kapısı`, `C segmenti`, `D vitamini` — TTS reads single letters acceptably in context.
-- Latin technical acronyms inside `<code>` or markdown code fences (CRM, ERP, API) — those are config / documentation, not speech.
-- Any line that is itself **about pronunciation**: see the next section.
+- Single-letter qualifiers: `A Blok`, `B kapısı`, `C segmenti`, `D vitamini`.
+- Latin technical acronyms inside code fences (CRM, ERP, API) — those are config, not speech.
+- Any line that is itself a pronunciation instruction (see Skip rules).
 
 ## 3. Foreign words & transliteration (`kind: "foreign_word"`)
 
-Brand and loanword pronunciation drifts wildly across TTS engines. The lens flags these as `pronunciation_hint` — the written text stays, the entry goes into the pronunciation guide block.
+Flag as `pronunciation_hint` with `strategy: "pronounce"` (default) or `"follow_with_translation"` when a Turkish gloss is conventional.
 
-| Word | phonetic | alt_translation |
-|---|---|---|
-| `iPhone` | `ay-fon` | null |
-| `WhatsApp` | `votsap` | null |
-| `Wi-Fi` | `vay-fay` | null |
-| `email` | `i-meyl` | `e-posta` |
-| `check-in` | `çek-in` | `giriş işlemi` |
-| `YouTube` | `yu-tüb` | null |
-| `Google` | `gugıl` | null |
-| `Microsoft` | `mayk-ro-soft` | null |
-| `Hebrew` | `hebru` | `İbrani` |
-| `pound`, `euro`, `dollar` | (see abbreviations table) | null |
+| Word | phonetic | strategy | alt_translation |
+|---|---|---|---|
+| `iPhone` | `ay-fon` | pronounce | null |
+| `WhatsApp` | `votsap` | pronounce | null |
+| `Wi-Fi` | `vay-fay` | pronounce | null |
+| `email` | `i-meyl` | follow_with_translation | `e-posta` |
+| `check-in` | `çek-in` | follow_with_translation | `giriş işlemi` |
+| `YouTube` | `yu-tüb` | pronounce | null |
+| `Google` | `gugıl` | pronounce | null |
+| `Hebrew` | `hebru` | follow_with_translation | `İbrani` |
 
-**Detection heuristic:** flag tokens that contain ASCII Latin letters and at least one of `{w, q, x}` or end in `-ing`, `-tion`, `-ment`, `-ly`. Exclude common Turkish-friendly tokens (URLs, code snippets, model names like `claude-opus-4-7`).
+**Latin/Greek/French proper nouns near historical/cultural context** (e.g. `Nea Roma`, `Palaeologlar`, `Iustinianus`, `La Turquie Kemaliste`):
 
-Severity: usually `medium`; `high` only when the brand is central to the dialogue and mispronunciation breaks user trust; `low` for incidental references.
+These are hard to phonetic-guess confidently. Emit `advisory` rather than auto-generating phonetic spellings — the author knows the intended reading. Optionally suggest the `rephrase` strategy with no phonetic, letting the author add details. Heuristic for detection: repeated proper noun across multiple lines, non-Turkish morphology (consonant clusters like `Pala-`, `Ius-`, `Nea`, or prefixes like `La `), in historical / cultural text.
 
 ## 4. Punctuation & pacing (`kind: "punctuation"`)
-
-Voice agents must breathe. Long unpunctuated sentences sound robotic.
 
 | Pattern | fix_kind | Notes |
 |---|---|---|
 | Double space before comma, double commas, stray punctuation | `replace` | Obvious typo |
 | Sentence > 120 chars with no comma / period | `replace` if break point is obvious; else `advisory` | Suggest specific comma position |
-| Sentence > 80 chars with one or zero commas | `advisory` | Severity `low` unless voice context is critical |
+| Sentence > 80 chars with one or zero commas | `advisory` | `low` unless voice context is critical |
 | Imperative ending in `.` where `?` or `…` would match prosody | `advisory` | Author's judgement |
-| Long enumeration without "birincisi / ikincisi / üçüncüsü" cues | `advisory` | Pacing nuance |
+| Long enumeration without "birincisi / ikincisi" cues | `advisory` | Pacing nuance |
 
-**Detection heuristic:** sentence-tokenise on `.!?` (carefully — `A.Ş.`, `T.C.` are not terminators); compute char-length, comma-count, sentence-initial verb form.
+## Skip rules — apply BEFORE detection
 
-## Skip rules (apply BEFORE detection — false positive guard)
+Do not generate findings for any line that matches any of these:
 
-Do not flag any line that matches any of these:
+- **Pronunciation-context line** — contains `okunuş`, `telaffuz`, `oku:`, `şöyle oku`, `diye okunur`, `harf harf`, `→`, `->`, `phonetic`, `pronunciation`.
+- **Internal-notes block** — line is under a heading containing `INTERNAL`, `INTERNAL NOTES`, `do not speak`, `okunmaz`, `söylenmez`.
+- **Code / config** — line is inside a markdown code fence, inline `<code>`, YAML frontmatter, or a JSON / JS block.
+- **Quoted transcript** — line is inside a multi-line quoted block.
+- **Tabular content** — markdown table rows (`| ... |`).
+- **Inside any pronunciation block** (managed marker block OR legacy heading block detected in Phase 6.0) — the block content is the canonical source, not a target for new findings.
 
-- **Pronunciation-context line** — contains any of: `okunuş`, `telaffuz`, `oku:`, `şöyle oku`, `diye okunur`, `harf harf`, `→`, `->`, `phonetic`, `pronunciation`.
-- **Internal-notes block** — line is under a heading containing `INTERNAL`, `INTERNAL NOTES`, `TTS NOTES`, `do not speak`, `okunmaz`, `söylenmez`.
-- **Code / config** — line is inside a markdown code fence (` ``` `), inline `<code>`, YAML frontmatter, or a JSON / JS code block.
-- **Quoted transcript** — line is inside a multi-line quoted block (lines beginning with `>` or wrapped in fenced quote markers) where pacing decisions are deliberate.
-- **Tabular content** — markdown table rows (`| ... |`) — too constrained to rewrite line-anchored.
-- **Already-curated pronunciation guide** — the existing block this lens manages (between the markers `<!-- promptchecker:pronunciation-guide:start -->` and `<!-- end -->`).
-
-If a line satisfies any skip rule, no finding is emitted regardless of which detection heuristic matched.
+If a line satisfies any skip rule, no finding is emitted regardless of detection match.
 
 ## What this lens does NOT do
 
 - Does not check ünlü uyumu (vowel harmony) — grammar, not TTS.
-- Does not flag colloquialisms or dialect — those are intentional in voice agents.
-- Does not translate. Foreign words stay verbatim. `pronunciation_entry.alt_translation` is a suggestion, not a forced replacement.
-- Does not run regex on Latin technical terms inside code blocks or model identifiers (`claude-opus-4-7`).
-- Does not flag abbreviations Turkish TTS reads correctly (`PTT`, `KDV`, `SGK`, `MEB`) unless the prompt explicitly requires layperson expansion.
-- Does not generate findings for lines that are themselves pronunciation instructions (the lens reads them as already-handled).
+- Does not flag colloquialisms or dialect.
+- Does not translate. Foreign words stay verbatim by default.
+- Does not run regex on Latin technical terms inside code blocks or model identifiers.
+- Does not flag Turkish-friendly abbreviations (`PTT`, `KDV`, `SGK`, `MEB`).
+- Does not generate findings for lines that are themselves pronunciation instructions.
+- Does not invent phonetic spellings for obscure proper nouns — flags them as `advisory` for the author to resolve.

@@ -95,11 +95,26 @@ Extract YAML frontmatter and merge it against env vars + project config + built-
 
 ```bash
 python3 - "$ABS_PROMPT" "$RUN_DIR" "$CONFIG_PATH" <<'PY'
-import sys, re, json, os
+import sys, re, json, os, hashlib
 prompt_path, run_dir, config_path = sys.argv[1], sys.argv[2], sys.argv[3]
 text = open(prompt_path, encoding='utf-8').read()
+
+# D1: snapshot the prompt content hash for stale-audit detection in apply-mode
+prompt_sha256 = hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+# B1: compute body_line_offset so downstream phases can map body.txt lines
+# back to the original prompt file's line numbers (apply-mode depends on this).
 m = re.match(r'^---\r?\n(.*?)\r?\n---\r?\n?(.*)$', text, re.DOTALL)
-raw_fm, body = (m.group(1), m.group(2)) if m else ('', text)
+if m:
+    raw_fm = m.group(1)
+    body = m.group(2)
+    pre_body = text[:m.start(2)]
+    body_line_offset = pre_body.count('\n') + 1  # 1-indexed line in original
+else:
+    raw_fm = ''
+    body = text
+    body_line_offset = 1
+
 fm = {}
 try:
     import yaml
@@ -126,7 +141,6 @@ def truthy(v):
 resolved = {}
 resolved['type'] = fm.get('type') or project.get('default_type') or None
 
-# target_model
 resolved['target_model'] = (
     fm.get('target_model')
     or env('PROMPTCHECKER_TARGET_MODEL')
@@ -134,7 +148,6 @@ resolved['target_model'] = (
     or 'claude-opus-4-7'
 )
 
-# output (list)
 out = fm.get('output')
 if out is None:
     env_out = env('PROMPTCHECKER_OUTPUT')
@@ -146,19 +159,19 @@ if out is None:
         out = ['markdown', 'findings_json']
 resolved['output'] = [str(o).strip() for o in (out if isinstance(out, list) else [out])]
 
-# expand_count (int)
+# F2: expand_count must preserve 0 (zero explicitly disables drift); avoid `or 3` truthy trap
 ec = fm.get('expand_count')
 if ec is None:
-    ec = env('PROMPTCHECKER_EXPAND_COUNT') or project.get('expand_count') or 3
+    ec = env('PROMPTCHECKER_EXPAND_COUNT')
+    if ec is None or str(ec).strip() == '':
+        ec = project.get('expand_count')
+        if ec is None:
+            ec = 3
 resolved['expand_count'] = int(ec)
 
-# executor
 resolved['executor'] = fm.get('executor') or env('PROMPTCHECKER_EXECUTOR') or 'inline'
-
-# anchors (always from frontmatter; never overridden)
 resolved['anchors'] = fm.get('anchors') or []
 
-# tr_phonetic (bool)
 tr = fm.get('tr_phonetic')
 if tr is None:
     env_tr = env('PROMPTCHECKER_TR_PHONETIC')
@@ -170,10 +183,16 @@ if tr is None:
         tr = False
 resolved['tr_phonetic'] = bool(tr)
 
+# B1 + D1 metadata
+resolved['body_line_offset'] = body_line_offset
+resolved['prompt_sha256'] = prompt_sha256
+
 with open(os.path.join(run_dir, 'frontmatter.json'), 'w', encoding='utf-8') as f:
     json.dump(resolved, f, indent=2, ensure_ascii=False)
+# IMPORTANT: write body verbatim — no lstrip — so body.txt line N corresponds
+# exactly to original-file line (N + body_line_offset - 1).
 with open(os.path.join(run_dir, 'body.txt'), 'w', encoding='utf-8') as f:
-    f.write(body.lstrip('\n'))
+    f.write(body)
 PY
 ```
 
@@ -181,7 +200,9 @@ If `python3` is unavailable, fall back to reading the file yourself, splitting o
 
 ## Phase 3 — Rule extraction (inline)
 
-Read `$RUN_DIR/body.txt`. Number lines starting at 1 from the first non-empty line. Extract every atomic rule, instruction, constraint, or directive into a flat list. Apply the criteria in `references/lens-rules.md` section "Rule extraction" — split compound sentences, preserve absolutes ("always", "never"), use the lowest line where the rule begins.
+Read `$RUN_DIR/body.txt`. Number lines starting at 1, **including blank lines**, so that `body.txt` line N maps to original-file line `N + frontmatter.body_line_offset - 1`. Extract every atomic rule, instruction, constraint, or directive into a flat list. Apply the criteria in `references/lens-rules.md` section "Rule extraction" — split compound sentences, preserve absolutes ("always", "never"), use the lowest line where the rule begins.
+
+**Line-number contract for every phase that follows (rule-extractor, conflict, dominance, gap, drift, TR phonetic):** all `line` fields you produce are body.txt line numbers (1-indexed, blank lines included). Phase 7 (render) is the single place that translates these to original-file line numbers before writing `findings.json`. **Never** write original-file line numbers from inside a lens — that breaks the contract.
 
 Hold the rules in memory as JSON. Also write `$RUN_DIR/rules.json` with shape:
 
@@ -209,13 +230,18 @@ Write each section to `$RUN_DIR/{conflicts,dominances,gaps}.json` as you complet
 
 ## Phase 5 — Drift (conditional)
 
-**Skip Phase 5 entirely if all of the following are true:**
+**Skip Phase 5 if EITHER condition holds:**
+
+A) `expand_count == 0` — the user / project config / env var explicitly disabled drift. This is the hard kill switch. Write `$RUN_DIR/drift.json` with `skipped_reason: "expand_count is 0 — drift disabled"`.
+
+B) ALL of the following are true:
 - `frontmatter.anchors` is empty AND
 - `conflicts` is empty AND
-- no `dominance.mechanism == "role-override"` exists AND
-- `expand_count > 0` (zero explicitly disables drift)
+- no `dominance.mechanism == "role-override"` exists
 
-In a skip, write `$RUN_DIR/drift.json` as `{"scenarios": [], "runs": [], "verdicts": [], "skipped_reason": "no anchors, conflicts, or role-overrides — drift adds no signal"}` and move on.
+Write `$RUN_DIR/drift.json` with `skipped_reason: "no anchors, conflicts, or role-overrides — drift adds no signal"`.
+
+In either skip case the file shape is `{"scenarios": [], "runs": [], "verdicts": [], "skipped_reason": "..."}`. Move on to Phase 6.
 
 Otherwise dispatch the `drift-runner` subagent (it is the only subagent this skill uses):
 
@@ -240,18 +266,30 @@ Agent({
 
 ## Phase 6 — Turkish phonetic lens (conditional)
 
-**Run this phase only if `frontmatter.tr_phonetic == true`.** Read `references/tr-phonetic.md` end-to-end before generating any findings — its skip rules, whitelist, and "no semantic translation" hard rule are mandatory and not repeated here.
+**Run this phase only if `frontmatter.tr_phonetic == true`.** Read `references/tr-phonetic.md` end-to-end before generating any findings — its skip rules, whitelist, strategy semantics, and "no semantic translation" hard rule are mandatory and not repeated here.
 
-Each TR finding declares **one of three `fix_kind` values**:
+### Phase 6.0 — Seed `pronunciation_map` from existing blocks
 
-- `replace` — real textual error (typo, double-space, missing/extra punctuation). `suggested_fix` populated.
-- `pronunciation_hint` — foreign word / risky abbreviation / brand whose written text must STAY. `suggested_fix` empty; `pronunciation_entry` populated.
-- `advisory` — borderline / judgement call. Reported only; no automatic apply.
+Before scanning the body for new findings, parse any existing pronunciation guide blocks in `body.txt` and seed `pronunciation_map`. Recognised block formats:
+
+- **Managed marker block:** `<!-- promptchecker:pronunciation-guide:start --> ... <!-- promptchecker:pronunciation-guide:end -->`
+- **Legacy heading block:** a line containing `TTS PRONUNCIATION NOTES`, `Pronunciation guide`, `Okunuş rehberi`, `Telaffuz`, or `Telaffuz notları` followed by a bullet list within the next ~20 lines.
+
+For each parsed entry, infer `strategy` (see `references/tr-phonetic.md` for the rules) and record the term. Tag each seed entry with `source: "seed"`. **Remember the line range of any legacy block** — apply-mode Pass 2 needs it to migrate the block to managed format.
+
+**Body scan in 6.1 dedupes against the seed:** if a term already exists in the seed `pronunciation_map`, do not emit a new finding for it. The skip rules in `references/tr-phonetic.md` already prevent the block's own lines from being re-flagged.
+
+If no existing block is found, `pronunciation_map` starts empty and proceeds to 6.1 with body-scan findings only.
+
+### Phase 6.1 — Body scan
+
+Each TR finding declares one of three `fix_kind` values (see `references/tr-phonetic.md` for full definitions): `replace`, `pronunciation_hint`, or `advisory`.
 
 Write `$RUN_DIR/tr_phonetic.json`:
 
 ```json
 {
+  "seed_block_range": { "start_line": 435, "end_line": 441, "format": "legacy_heading" },
   "findings": [
     {
       "id": "T1",
@@ -263,29 +301,51 @@ Write `$RUN_DIR/tr_phonetic.json`:
       "suggested_fix": "...",
       "pronunciation_entry": {
         "term": "DHL",
+        "strategy": "pronounce | rephrase | follow_with_translation",
         "phonetic": "de-ha-el",
         "alt_translation": null,
         "note": null
       },
       "rationale": "..."
     }
+  ],
+  "seed_entries": [
+    {
+      "term": "Konstantinopolis",
+      "strategy": "pronounce",
+      "phonetic": null,
+      "alt_translation": "Bizans başkenti",
+      "note": "Author marked this as high risk; rephrase when possible.",
+      "source": "seed"
+    }
   ]
 }
 ```
 
-Only one of `suggested_fix` / `pronunciation_entry` is populated per finding (the other is `""` or `null`).
+`seed_block_range` is null when no existing block was found. `seed_entries[]` is the parsed seed; `findings[]` contains only NEW (non-duplicate) issues from the body scan.
 
-**Never** propose semantic translations (e.g. `pound → İngiliz lirası`). Phonetic hints (`pound → paund`) and optional `alt_translation` metadata are allowed; outright vocabulary substitution is not.
+Only one of `suggested_fix` / `pronunciation_entry` is populated per finding. **Never** propose semantic translations (`pound → İngiliz lirası` is forbidden). Phonetic hints and `alt_translation` metadata are allowed.
 
 ## Phase 7 — Render outputs
 
-Read everything you wrote into `$RUN_DIR/` so far. Build a single merged `findings.json` and a human-readable `report.md`. Both are line-anchored so the user can later say "düzelt bunları" and you can apply each fix by line.
+Read everything you wrote into `$RUN_DIR/` so far. Build a single merged `findings.json` and a human-readable `report.md`. Both are line-anchored.
+
+**Line translation (mandatory):** Every lens wrote `line` numbers as body.txt indices. Before writing findings.json, translate each `line` to an original-file line:
+
+```
+original_line = body_line + frontmatter.body_line_offset - 1
+```
+
+Apply this to every `findings[].line`, every `findings[].related_lines[]`, and (if present) the line inside `pronunciation_entry.source_lines[]`. After translation, body.txt indices must no longer appear in any rendered output. Apply-mode and report.md both depend on this.
+
+**Carry the prompt hash:** copy `frontmatter.prompt_sha256` into the top of findings.json so apply-mode can detect a stale audit.
 
 ### `$RUN_DIR/findings.json`
 
 ```json
 {
   "prompt_path": "<absolute path>",
+  "prompt_sha256": "<hex from frontmatter.prompt_sha256>",
   "run_id": "run-NNN",
   "generated_at": "<ISO 8601 UTC>",
   "summary": {
@@ -314,14 +374,28 @@ Read everything you wrote into `$RUN_DIR/` so far. Build a single merged `findin
   "pronunciation_map": [
     {
       "term": "DHL",
+      "strategy": "pronounce",
       "phonetic": "de-ha-el",
       "alt_translation": null,
       "note": null,
+      "source": "finding",
       "source_finding_ids": ["T3"]
+    },
+    {
+      "term": "Konstantinopolis",
+      "strategy": "pronounce",
+      "phonetic": null,
+      "alt_translation": "Bizans başkenti",
+      "note": "...",
+      "source": "seed",
+      "source_finding_ids": []
     }
-  ]
+  ],
+  "seed_block_range": { "start_line": 442, "end_line": 448, "format": "legacy_heading" }
 }
 ```
+
+`pronunciation_map` is the union of `tr_phonetic.json.seed_entries` (entries the prompt already had — `source: "seed"`) and the entries extracted from new `pronunciation_hint` findings (`source: "finding"`). Dedupe by `term` (case-insensitive); if a seed entry and a finding entry collide, **seed wins** (the author's curated text is the source of truth). Translate `seed_block_range` line numbers to original-file lines using `body_line_offset`, same as findings.
 
 `findings[]` is sorted by `line` ascending, then by severity descending. For each finding:
 - `fix_kind: "replace"` → apply-mode edits the line so it produces `suggested_fix` instead of `current_excerpt`.
@@ -408,50 +482,89 @@ Say "fix these" or "düzelt bunları" and I will apply suggested_fix entries fro
 
 ## Apply-mode (when the user asks to fix)
 
-If the user, in the same or a later session, says "fix these" / "düzelt bunları" / equivalent and points at a run directory (or none — then assume `latest`), read `<run-dir>/findings.json`, then do two passes in order:
+Apply-mode is entered in either of two ways:
+
+- The user runs the explicit slash command **`/prompt-check-apply [run-id]`** — preferred path.
+- The user types "fix these" / "düzelt bunları" / "apply the fixes" / similar trigger phrase in the same or a later session.
+
+In both paths, resolve the run directory: explicit `run-id` argument > `latest` symlink. Read `<run-dir>/findings.json`.
+
+### Pre-flight — stale-audit guard (mandatory)
+
+Before touching anything, verify the prompt file has not changed since the audit:
+
+```bash
+ACTUAL_SHA=$(shasum -a 256 "$PROMPT_PATH" | awk '{print $1}')
+```
+
+Compare against `findings.json.prompt_sha256`. If they differ, **abort** — do not apply anything. Surface:
+
+```
+Prompt has changed since this audit (run-NNN). Re-run /prompt-check first, then /prompt-check-apply.
+Expected SHA: <findings.prompt_sha256>
+Actual SHA:   <ACTUAL_SHA>
+```
+
+If they match, proceed.
 
 ### Pass 1 — `replace` findings (line-level substitutions)
 
 For each finding with `fix_kind == "replace"` and non-empty `suggested_fix`:
 
 1. Read the prompt file fresh.
-2. Locate the line via `line` number AND `current_excerpt` substring match (both must agree — if not, skip and report).
-3. Apply the substring replacement.
-4. Write the file back.
+2. Locate the line via `line` number (already translated to original-file line by Phase 7) AND `current_excerpt` substring match (both must agree — if not, skip and report).
+3. If `current_excerpt` appears more than once on that line, refuse to apply that finding and report it (no occurrence index → ambiguous).
+4. Apply the substring replacement.
+5. Write the file back.
 
 Group conflicting suggestions: if two findings target the same line, present a choice rather than silently applying one. Never apply a finding whose `suggested_fix` is empty — those are advisory only.
 
-### Pass 2 — `pronunciation_map` injection (idempotent block)
+### Pass 2 — `pronunciation_map` injection / migration (idempotent)
 
-If `findings.json.pronunciation_map` is non-empty, write or update a single pronunciation guide block in the prompt:
+If `findings.json.pronunciation_map` is non-empty, write or update a single pronunciation guide block in the prompt.
 
-Block format:
+**Block format (canonical, what apply-mode always writes):**
 
 ```
 <!-- promptchecker:pronunciation-guide:start -->
-## Okunuş rehberi (TTS)
+## Okunuş rehberi (TTS — internal, never speak aloud)
 - `DHL` → "de-ha-el"
 - `D&R` → "de ve er"
-- `Hebrew` → "hebru" (alternatif: İbrani)
-- `iPhone` → "ay-fon"
+- `Hebrew` → "hebru" (alternatif: "İbrani")
+- `Konstantinopolis` — rephrase as "Bizans başkenti" when possible
+- `La Turquie Kemaliste` → follow with: "yani Kemal'in Türkiye'si dergisi"
 <!-- promptchecker:pronunciation-guide:end -->
 ```
 
-Insertion priority (first match wins):
+Render rules per entry:
+- `strategy: pronounce` → `` `term` → "phonetic"`` (plus `(alternatif: "alt_translation")` if present).
+- `strategy: rephrase` → `` `term` — rephrase as "alt_translation" when possible`` (or note text when no alt_translation).
+- `strategy: follow_with_translation` → `` `term` → follow with: "alt_translation"``.
+- `note` field appended in parentheses when non-empty.
 
-1. **Existing marker block** — if the prompt already contains `<!-- promptchecker:pronunciation-guide:start --> … <!-- end -->`, replace its body with the current map. This is the idempotent re-run path.
-2. **Existing section heading** — if the prompt has a section titled `Pronunciation guide`, `Okunuş rehberi`, `Telaffuz`, or `TTS PRONUNCIATION NOTES` (heading or all-caps line), append the map under it (with markers) and report which section was extended.
-3. **Fallback** — insert the block immediately after the frontmatter (or at the top of the body if no frontmatter).
+**Insertion / migration priority (first match wins):**
 
-Never inject the block inside YAML frontmatter, fenced code blocks, quoted transcripts, or markdown tables. After writing, surface to the user: "Pronunciation guide updated: N entries (added M, kept K)."
+1. **Managed marker block already exists.** Replace the block's body with the current map. Pure idempotent re-run.
+2. **Legacy block exists** (per `findings.json.seed_block_range`). **Migrate it in place:** delete the legacy heading + bullet lines, insert the canonical marker block at the same line. Surface: `Migrated existing <format> block at lines L1–L2 to managed format (N entries preserved).`
+3. **Section heading exists but no parseable bullets** (rare — heading present, no entries). Insert the canonical marker block immediately under the heading.
+4. **Fallback.** Insert the marker block immediately after the frontmatter (or at the top of the body if no frontmatter).
+
+**Never** inject inside YAML frontmatter, fenced code blocks, quoted transcripts, or markdown tables.
+
+### Pass 2.5 — Orphan prune (after Pass 1 + Pass 2)
+
+Pass 1 may have deleted text that contained terms in `pronunciation_map`. For each entry with `source: "finding"`, check whether the term still appears in the body **outside the guide block**. If it does not appear anywhere else, drop the entry from the rendered block — it's orphaned. **Seed entries (`source: "seed"`) are never pruned** (the author put them there for a reason; keep them).
+
+Report: `Pruned N orphan entries (terms no longer in body): foo, bar`.
 
 ### Diff surface
 
-After both passes, show a short summary in the terminal:
-- Replace pass: `N findings applied, M skipped (line/excerpt mismatch), 0 conflicts`.
-- Pronunciation pass: `N entries in guide (M new this run)`.
+After all passes, show a short summary in the terminal:
+- Pre-flight: `Prompt SHA match — ok` or `Prompt SHA mismatch — aborted`.
+- Replace pass: `N findings applied, M skipped (mismatch / ambiguous occurrence), K conflicts on same line`.
+- Pronunciation pass: `Wrote/migrated/extended block. N entries total (M new, K seed, P orphans pruned)`.
 
-If both passes are empty, say so explicitly — do not pretend to have done work.
+If all passes are empty, say so explicitly — do not pretend to have done work.
 
 ## Don'ts
 
