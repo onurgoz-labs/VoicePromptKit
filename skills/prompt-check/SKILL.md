@@ -742,6 +742,7 @@ PromptChecker complete — <run-NNN>
 
 Report:   <relative path to $RUN_DIR/report.md>
 Findings: <relative path to $RUN_DIR/findings.json>
+Pronunciations master: .promptcheck/<basename>/pronunciations.md (<M> unique terms across <N> runs)
 Previous runs: .promptcheck/<basename>/ (run-001 … run-NNN)
 Repo defaults: <relative path to .promptchecker.json>
 
@@ -752,6 +753,8 @@ pending and resume later with /prompt-check-resume.
 ```
 
 The auto-filed line is shown ONLY when the count is non-zero. It sits alongside the existing rules / conflicts / dominances / gaps / drift / TR phonetic counts. **The TR phonetic count line still shows the TOTAL TR findings (advisory + replace) — the auto-filed line is an additional drill-down, not a replacement.** Compute `K` as the number of TR findings with `lens == "tr_phonetic" AND fix_kind == "advisory"`; `a` = count where `kind == "foreign_word"`; `b` = count where `kind == "abbreviation"`. These are the same findings that Phase 9.2's partition will assign to AUTO_FILED_SET.
+
+The `Pronunciations master:` line surfaces `.promptcheck/<basename>/pronunciations.md` — the cross-version aggregate file rebuilt by Phase 10.2.1. `<M>` is the number of unique terms in that file, `<N>` is the count of `run-NNN/` directories under the prompt that have ever contributed at least one `pronunciation_map` entry. **Omit this line entirely** when `pronunciations.md` has zero entries (i.e. no run under this prompt has produced a non-empty `pronunciation_map` yet). The line is informational and only appears when there is something for the user to read.
 
 When `PROMPTCHECKER_TIMING=true`, append one extra line to the summary block above (between `Repo defaults:` and the blank line before "Entering interactive review"):
 
@@ -1212,6 +1215,82 @@ The bottom "Pronunciation map" section still picks up every TR advisory finding 
 
 Do not append per-finding entries to `decisions.jsonl` for this step — the `overlay` / `auto_filed` decision was already logged in Phase 9.6's commit (or 10.3 if auto-converted from `applied`).
 
+### 10.2.1 — Cross-version pronunciations.md rebuild
+
+After writing this run's `inline-suggestions.md`, rebuild the prompt-scoped
+master file `.promptcheck/<basename>/pronunciations.md` so it reflects every
+audit run that has ever produced a `pronunciation_map` under this prompt.
+The file sits ONE level above the per-run `run-NNN/` directories and is the
+single source of truth for the TTS provider config (Vapi / ElevenLabs /
+OpenAI Realtime). Full format spec lives in `references/overlay-format.md`
+Section 5.
+
+Procedure:
+
+1. Scan `.promptcheck/<basename>/` for every `run-NNN/` directory that
+   contains a `findings.json` with a non-empty `pronunciation_map` array.
+   Order them by run number ascending (run-001, run-002, …).
+
+2. Build an in-memory aggregate dictionary keyed by term (case-insensitive
+   match, but preserve the original casing from the first occurrence):
+
+   ```python
+   agg = {}
+   for run_dir in sorted(run_dirs):
+       findings = json.load(open(run_dir / "findings.json"))
+       run_id = run_dir.name
+       run_date = findings.get("generated_at", "")[:10]  # YYYY-MM-DD
+       for entry in findings.get("pronunciation_map", []):
+           key = entry["term"].lower()
+           if key not in agg:
+               agg[key] = {
+                   "term": entry["term"],  # preserve first-seen casing
+                   "strategy": entry.get("strategy"),
+                   "phonetic": entry.get("phonetic"),
+                   "alt_translation": entry.get("alt_translation"),
+                   "note": entry.get("note"),
+                   "first_seen": (run_id, run_date),
+                   "last_seen": (run_id, run_date),
+                   "finding_refs": [],
+                   "source": entry.get("source"),
+               }
+           else:
+               # update last_seen + collect contributing findings;
+               # later runs may also refine strategy/phonetic/note — last wins
+               agg[key]["last_seen"] = (run_id, run_date)
+               if entry.get("phonetic"):
+                   agg[key]["phonetic"] = entry["phonetic"]
+               if entry.get("note"):
+                   agg[key]["note"] = entry["note"]
+               if entry.get("alt_translation"):
+                   agg[key]["alt_translation"] = entry["alt_translation"]
+           for fid in entry.get("source_finding_ids", []):
+               agg[key]["finding_refs"].append(f"{fid}@{run_id}")
+   ```
+
+3. Preserve any `## Custom additions` block from an existing
+   `pronunciations.md` (between the `<!-- promptchecker:custom-additions:start -->`
+   and `<!-- promptchecker:custom-additions:end -->` markers). Read the file
+   if it exists, extract everything between those markers, and re-emit it
+   verbatim in the rewritten file. If the file does not exist or the markers
+   are absent, emit an empty managed block.
+
+4. Render the new `pronunciations.md` per the template in
+   `references/overlay-format.md` Section 5. Sort entries alphabetically by
+   term (case-insensitive). Sort the YAML pronunciations block in the same
+   order.
+
+5. Write the file. Idempotent rewrite — same input produces byte-identical
+   output modulo the `Last updated:` timestamp.
+
+Failure modes:
+- If `findings.json.pronunciation_map` is empty across every run, write a
+  minimal `pronunciations.md` with the header + `_No pronunciation entries
+  recorded yet across <N> runs._` and the empty Custom additions block.
+  Do not omit the file — its existence is part of the user-facing contract.
+- If a run's `findings.json` cannot be parsed, skip that run with a console
+  warning. Don't abort the rebuild.
+
 ### 10.3 — Applied (feasibility-first, single-event logging)
 
 **Core invariant:** `decisions.jsonl` records ONE event per finding outcome in this sub-step. The `applied` action is written **only when the prompt file was genuinely modified**. If a finding cannot be applied for any reason, it produces a single `routed_to_overlay` entry followed by a single `overlay` entry — never a misleading `applied` entry first.
@@ -1379,3 +1458,4 @@ Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. 
 - Don't force-route every TR finding to overlay. Only TR findings with `fix_kind: "advisory"` (categories `foreign_word` and `abbreviation`) bypass the prompt file. TR findings with `fix_kind: "replace"` (categories `number_readability` and `punctuation`) follow the normal apply flow in Phase 10.3.
 - Don't ask the user about TR pronunciation findings (foreign_word + abbreviation) in Phase 9. They auto-file to the overlay's Pronunciation map. Showing them in the summary table or decision prompt is a UX regression — the pronunciation hint is never going to be applied (advisory rule), so surfacing it as a decision wastes the user's attention. They appear ONLY in Phase 8's auto-filed count line and in `inline-suggestions.md`'s bottom Pronunciation map section.
 - Don't apply a TODO/Intentional sentinel as if it were a regular structural fix. The sentinel guard in Phase 10.3 (step 4) intercepts them: `TODO:` routes to overlay (`sentinel_todo`), `Intentional —` is dismissed (`sentinel_intentional`). Neither ever reaches the Edit tool.
+- Don't overwrite the `## Custom additions` block in `pronunciations.md`. The author owns content between the `<!-- promptchecker:custom-additions:start -->` and `<!-- promptchecker:custom-additions:end -->` markers; the rebuild MUST preserve that block verbatim.
