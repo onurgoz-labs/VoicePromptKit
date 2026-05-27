@@ -34,7 +34,12 @@ Phase 10 always writes to the **latest** run's overlay (the run that produced th
 
 ### L<line> [<finding-id> <lens> severity=<low|medium|high>] — status: overlay
 - **Current:** `<current_excerpt>`
-- **Suggested:** `<suggested_fix or "(see rationale)">`
+- **Diff:** (for substring-style suggestions — render as a ```diff block; see "Rendering mode" below)
+  ```diff
+  - <current_excerpt>
+  + <suggested_fix>
+  ```
+- **Action:** `<suggested_fix>` (for structural / TODO suggestions; see "Rendering mode" below)
 - **Rationale:** <rationale>
 - **Decided:** <ISO 8601>
 - **Note:** <user-supplied note or omit>
@@ -42,7 +47,7 @@ Phase 10 always writes to the **latest** run's overlay (the run that produced th
 ### L<line> [<finding-id> <lens>] — status: overlay (revised)
 - **Current:** `<current_excerpt>`
 - **Original suggestion:** `<original suggested_fix from findings.json>`
-- **User-revised:** `<the text the user supplied during konuşalım>`
+- **User-revised:** `<the text the user supplied during konuşalım>` (rendered as a diff block vs. `<current_excerpt>` when substring-style, otherwise as **Action:**)
 - **Rationale:** <original rationale>
 - **Decided:** <ISO 8601>
 
@@ -56,9 +61,37 @@ Phase 10 always writes to the **latest** run's overlay (the run that produced th
   - From: seed (prompt's pre-existing pronunciation guide block)
 ```
 
+### Rendering mode for the Suggested field
+
+The overlay uses the same heuristic as report.md Phase 7:
+- Substring-style suggestion (ratio > 0.6 to current_excerpt AND not starting with a structural keyword) → render as a ```diff block.
+- Structural suggestion ("Add ", "Rewrite ", "Move ", "Replace R", "Remove ", "Reword ", TODO sentinels, "Intentional —") → render as `**Action:** <suggested_fix>`.
+- Empty suggested_fix → render `**Action:** _(see rationale)_`.
+
+The overlay is rewritten in full each Phase 10 pass (idempotent), so the rendering choice is recomputed every time — no stale diff blocks survive a switch from substring to structural.
+
+In Python (mirrors the heredoc in SKILL.md Phase 7):
+
+```python
+import difflib
+
+STRUCTURAL_PREFIXES = ("Add ", "Add: ", "Rewrite ", "Move ", "Replace R", "Remove ",
+                       "Reword ", "TODO:", "Intentional —", "Intentional -")
+
+def render_overlay_body(current, suggested):
+    if not suggested or suggested.strip() == "":
+        return "**Action:** _(see rationale)_"
+    if any(suggested.startswith(p) for p in STRUCTURAL_PREFIXES):
+        return f"**Action:** {suggested}"
+    ratio = difflib.SequenceMatcher(None, current, suggested).ratio()
+    if ratio > 0.6:
+        return f"```diff\n- {current}\n+ {suggested}\n```"
+    return f"**Action:** {suggested}"
+```
+
 ### Rendering rules
 
-- **Sort:** entries are ordered by `line` ascending, then by severity descending (`high` → `medium` → `low`). Within a line + severity tie, order by finding id (`C1 < D1 < G1 < T1`).
+- **Sort:** entries are ordered by **severity descending** (`high` → `medium` → `low`), then by **lens group** in the fixed order (`conflict`, `dominance`, `gap`, `drift`, `tr_phonetic`), then by **line ascending** within each (severity, lens) bucket. Within a (severity, lens, line) tie, order by finding id (`C1 < D1 < G1 < T1`). This matches the sort applied to `findings.json.findings[]` and to `report.md`.
 - **Subset:** only findings where `status == "overlay"` or `status == "overlay (revised)"` appear here. `applied` and `dismissed` findings DO NOT appear in the overlay file — they live only in `decisions.jsonl`.
 - **Pending findings DO NOT appear either.** A `pending` finding (one the user left without a decision at session end) is surfaced via `/prompt-check-resume`, not this file.
 - **Idempotent rewrite, not append.** Phase 10 rebuilds the whole file from the current state of `session.json`. Re-running Phase 10 against the same `session.json` produces byte-identical output (modulo the `Generated:` timestamp). Never `>>` append to this file.
@@ -195,6 +228,8 @@ A single Phase 10 pass processes decisions in this order:
 6. **Return to Phase 9** for any `discussed` findings that have not been resolved yet (`revised` / `applied` / `overlay` / `dismissed` has not yet followed the `discussed` line).
 
 The ordering matters: writing the overlay file before the prompt file means a failure between steps 2 and 3 leaves the user with an honest "here's what I planned" record rather than half-modified state. The feasibility-first rule inside step 3 means `decisions.jsonl` never lies about whether the prompt file was actually touched.
+
+Findings are rendered in severity descending → lens group → line ascending order, matching the sort in findings.json.
 
 ## 5. Stale-audit guard interaction
 
