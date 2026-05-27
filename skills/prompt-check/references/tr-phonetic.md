@@ -2,15 +2,16 @@
 
 Active only when `frontmatter.tr_phonetic == true`. Voice agents (Vapi, ElevenLabs, OpenAI Realtime, etc.) read text aloud; constructs that look fine in writing may be mispronounced or sound robotic.
 
-## Output shape — three fix kinds, one optional strategy field
+## Output shape — advisory-only, one optional strategy field
 
-Each TR finding declares one of three `fix_kind` values:
+**Every TR finding has `fix_kind: "advisory"`.** Apply-mode never modifies the prompt based on TR findings — they appear in `report.md` and `findings.json` for the author to read, weigh, and act on by hand. The `kind` field still distinguishes the detection category, and each finding still surfaces a concrete suggestion (either a `suggested_fix` for textual issues or a `pronunciation_entry` for foreign words / abbreviations) so the report is actionable.
 
-| `fix_kind` | When | Apply-mode behaviour |
+| `kind` | Suggestion shape | What the author should do |
 |---|---|---|
-| `replace` | Real textual error (typo, double space, malformed Turkish number, missing/extra punctuation) | Substring replace `current_excerpt` → `suggested_fix` |
-| `pronunciation_hint` | Foreign word / risky abbreviation / brand whose **written text must stay** | Add `pronunciation_entry` to the managed guide block; do not touch the original line |
-| `advisory` | Borderline / judgement call (long unparseable sentence, possible mistranslation, unfamiliar proper noun) | Reported only; no automatic apply |
+| `number_readability` | `suggested_fix` (verbal form of the number) | Replace by hand if the line is meant to be spoken; skip for written-only sections |
+| `abbreviation` | `pronunciation_entry` (curated risky list) | Decide whether to spell out, add a pronunciation note, or leave alone |
+| `foreign_word` | `pronunciation_entry` (with `strategy: pronounce | rephrase | follow_with_translation`) | Voice-design call — author may add a TTS hint block, rephrase, or accept the default reading |
+| `punctuation` | `suggested_fix` (corrected punctuation / break point) | Almost always safe to apply by hand; advisory because punctuation is style-sensitive |
 
 Common finding shape:
 
@@ -18,7 +19,7 @@ Common finding shape:
 {
   "id": "T1",
   "kind": "number_readability | abbreviation | foreign_word | punctuation",
-  "fix_kind": "replace | pronunciation_hint | advisory",
+  "fix_kind": "advisory",
   "severity": "low | medium | high",
   "line": 42,
   "current_excerpt": "...",
@@ -34,7 +35,7 @@ Common finding shape:
 }
 ```
 
-Only one of `suggested_fix` / `pronunciation_entry` is populated per finding.
+Only one of `suggested_fix` / `pronunciation_entry` is populated per finding. Both are informational — apply-mode reads neither for TR findings.
 
 ### `strategy` semantics
 
@@ -81,37 +82,39 @@ For each parsed entry, infer the `strategy`:
 
 Add every parsed entry to the seed `pronunciation_map`. **Do not generate findings for terms already in the seed** — they are already curated; the body scan dedupes against the seed.
 
-If a legacy heading block is found, remember its line range — apply-mode Pass 2 needs it to migrate the block.
+Seed entries are reported in the final `pronunciation_map` so the author can see at a glance what they have already written; apply-mode does not touch them.
 
 ## 1. Number readability (`kind: "number_readability"`)
 
-Numerals get read digit-by-digit or with wrong place values. For monetary amounts and percentages spoken aloud, replacing `100 TL` with `yüz lira` is a textual correction (use `fix_kind: "replace"`). For phone numbers, IBANs, postal codes, the model needs a separate instruction (use `advisory`).
+Numerals get read digit-by-digit or with wrong place values. For monetary amounts and percentages spoken aloud, the recommended verbal form (`100 TL` → `yüz lira`) goes into `suggested_fix`. For phone numbers, IBANs, postal codes, the suggestion is to add a separate "read digit by digit" instruction near the line (rationale only — no fix string).
 
-| Pattern | fix_kind | Example fix |
+All findings are advisory; the table below records the **shape of the suggestion** the author sees in the report.
+
+| Pattern | Suggestion shape | Example suggested_fix / rationale |
 |---|---|---|
-| Currency: `100 TL`, `8.100 TL`, `₺1.250,50` | `replace` | `yüz lira`, `sekiz bin yüz lira` |
-| Percentage: `%25` | `replace` | `yüzde yirmi beş` |
-| Date: `17/05/2026` | `replace` | `on yedi Mayıs iki bin yirmi altı` |
-| Time: `14:30` | `replace` | `on dört otuz` |
-| Phone, IBAN, posta kodu | `advisory` | Add an instruction near the line |
-| Ordinals: `5.`, `21.` | `replace` | `beşinci`, `yirmi birinci` |
+| Currency: `100 TL`, `8.100 TL`, `₺1.250,50` | `suggested_fix` populated | `yüz lira`, `sekiz bin yüz lira` |
+| Percentage: `%25` | `suggested_fix` populated | `yüzde yirmi beş` |
+| Date: `17/05/2026` | `suggested_fix` populated | `on yedi Mayıs iki bin yirmi altı` |
+| Time: `14:30` | `suggested_fix` populated | `on dört otuz` |
+| Phone, IBAN, posta kodu | `suggested_fix` empty; rationale only | "Add an instruction: 'rakam rakam oku' near this line" |
+| Ordinals: `5.`, `21.` | `suggested_fix` populated | `beşinci`, `yirmi birinci` |
 
-### Malformed Turkish numbers (`replace`, severity `medium` or `high`)
+### Malformed Turkish numbers (severity `medium` or `high`)
 
 These slip past spell-checkers but TTS reads them literally — flag them when the prompt is in Turkish and the body is meant to be spoken.
 
-| Pattern | Why it's wrong | Suggested fix |
+| Pattern | Why it's wrong | Suggested fix (in `suggested_fix`) |
 |---|---|---|
-| `bir bin` followed by `yüz`/`...` | "bin" already means 1000; "bir bin" reads as ~1001. The author meant just `bin`. | Replace `bir bin` with `bin` |
-| `bir milyon`, `bir milyar` | Same root issue: redundant `bir`. | Replace with `milyon` / `milyar` (context-dependent) |
-| `içinz`, `içiniz` mid-sentence where `için` was meant | Typo; TTS reads "ee-cheen-z" / similar. | Replace with `için` |
-| Number-word with no space before unit (`onbin`, `yüzlira`) | TTS may concatenate or hesitate. | Insert space: `on bin`, `yüz lira` |
+| `bir bin` followed by `yüz`/`...` | "bin" already means 1000; "bir bin" reads as ~1001. The author meant just `bin`. | `bin` |
+| `bir milyon`, `bir milyar` | Same root issue: redundant `bir`. | `milyon` / `milyar` (context-dependent) |
+| `içinz`, `içiniz` mid-sentence where `için` was meant | Typo; TTS reads "ee-cheen-z" / similar. | `için` |
+| Number-word with no space before unit (`onbin`, `yüzlira`) | TTS may concatenate or hesitate. | `on bin`, `yüz lira` |
 
 ## 2. Abbreviations & technical terms (`kind: "abbreviation"`)
 
 Default behaviour: **do not flag**. Most Turkish acronyms are read acceptably letter-by-letter. Flag only when the abbreviation is in the **curated risky list**.
 
-**Curated risky (flag as `pronunciation_hint`):**
+**Curated risky (advisory, `pronunciation_entry` populated):**
 
 | Term | Phonetic | Strategy | Notes |
 |---|---|---|---|
@@ -137,7 +140,7 @@ Default behaviour: **do not flag**. Most Turkish acronyms are read acceptably le
 
 ## 3. Foreign words & transliteration (`kind: "foreign_word"`)
 
-Flag as `pronunciation_hint` with `strategy: "pronounce"` (default) or `"follow_with_translation"` when a Turkish gloss is conventional.
+Surface as an advisory finding with `pronunciation_entry` populated. Default `strategy: "pronounce"`; switch to `"follow_with_translation"` when a Turkish gloss is conventional.
 
 | Word | phonetic | strategy | alt_translation |
 |---|---|---|---|
@@ -152,17 +155,19 @@ Flag as `pronunciation_hint` with `strategy: "pronounce"` (default) or `"follow_
 
 **Latin/Greek/French proper nouns near historical/cultural context** (e.g. `Nea Roma`, `Palaeologlar`, `Iustinianus`, `La Turquie Kemaliste`):
 
-These are hard to phonetic-guess confidently. Emit `advisory` rather than auto-generating phonetic spellings — the author knows the intended reading. Optionally suggest the `rephrase` strategy with no phonetic, letting the author add details. Heuristic for detection: repeated proper noun across multiple lines, non-Turkish morphology (consonant clusters like `Pala-`, `Ius-`, `Nea`, or prefixes like `La `), in historical / cultural text.
+These are hard to phonetic-guess confidently. Leave `pronunciation_entry` either empty or populated with `strategy: "rephrase"` and no `phonetic` — the author knows the intended reading. Heuristic for detection: repeated proper noun across multiple lines, non-Turkish morphology (consonant clusters like `Pala-`, `Ius-`, `Nea`, or prefixes like `La `), in historical / cultural text.
 
 ## 4. Punctuation & pacing (`kind: "punctuation"`)
 
-| Pattern | fix_kind | Notes |
+All advisory; the column below records whether `suggested_fix` carries a concrete substitution or the rationale is the only payload.
+
+| Pattern | Suggestion shape | Notes |
 |---|---|---|
-| Double space before comma, double commas, stray punctuation | `replace` | Obvious typo |
-| Sentence > 120 chars with no comma / period | `replace` if break point is obvious; else `advisory` | Suggest specific comma position |
-| Sentence > 80 chars with one or zero commas | `advisory` | `low` unless voice context is critical |
-| Imperative ending in `.` where `?` or `…` would match prosody | `advisory` | Author's judgement |
-| Long enumeration without "birincisi / ikincisi" cues | `advisory` | Pacing nuance |
+| Double space before comma, double commas, stray punctuation | `suggested_fix` populated | Obvious typo |
+| Sentence > 120 chars with no comma / period | `suggested_fix` populated if break point is obvious; else rationale only | Suggest specific comma position |
+| Sentence > 80 chars with one or zero commas | rationale only | `low` severity unless voice context is critical |
+| Imperative ending in `.` where `?` or `…` would match prosody | rationale only | Author's judgement |
+| Long enumeration without "birincisi / ikincisi" cues | rationale only | Pacing nuance |
 
 ## Skip rules — apply BEFORE detection
 

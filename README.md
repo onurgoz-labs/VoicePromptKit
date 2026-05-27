@@ -35,11 +35,13 @@ After the run, either say **"fix these"** / **"düzelt bunları"** in the same C
 | **Drift** | Behavioural mismatch between the prompt's stated rules and the model's actual output, surfaced by adversarial scenarios | only when anchors / conflicts / role-overrides exist (skipped otherwise) |
 | **TR phonetic** | Numbers, abbreviations, foreign words, and pacing problems that break Turkish text-to-speech | opt-in via `tr_phonetic: true` frontmatter or project config |
 
-### TR phonetic — how fixes are applied
+### TR phonetic — advisory only, never auto-applied
 
-The TR lens produces **three kinds of finding**: `replace` (real typos / punctuation errors that get substituted in place), `pronunciation_hint` (foreign words and risky abbreviations whose **written text stays** — the entry goes into a pronunciation guide block instead), and `advisory` (judgement calls; reported only). The lens never translates: `pound → paund` is a phonetic hint; `pound → İngiliz lirası` is forbidden semantic substitution.
+The TR lens is **report-only**. Every TR finding has `fix_kind: "advisory"` and PromptChecker never modifies your prompt because of one — no substring replacement, no pronunciation block injection. Phonetic adjustments and pronunciation hints are voice-design decisions the human author owns; false positives are common (proper nouns, brand voice, dialect choice), and a silently-inserted block can poison a Vapi / ElevenLabs script in subtle ways.
 
-When you say "fix these", apply-mode runs two passes: replace pass for line-level substitutions, then a pronunciation-guide injection that updates an idempotent block in your prompt (between `<!-- promptchecker:pronunciation-guide:start -->` and `<!-- end -->`). Re-runs update the same block instead of duplicating it. If your prompt already has a `TTS PRONUNCIATION NOTES` / `Okunuş rehberi` / `Telaffuz` section, the block extends that section rather than creating a new one.
+What you get instead: a rich `report.md` section listing every flagged line, the four detection categories (`number_readability`, `abbreviation`, `foreign_word`, `punctuation`), a concrete suggestion (`suggested_fix` for textual issues like `100 TL → yüz lira`, or a `pronunciation_entry` for foreign words like `DHL → "de-ha-el"`), and a top-level `pronunciation_map` summary so you can see at a glance every risky term the lens spotted. The lens never translates: `pound → paund` is a phonetic hint; `pound → İngiliz lirası` is forbidden semantic substitution.
+
+You decide whether to act on each one — by editing the prompt by hand, adding a pronunciation guide block yourself, or rephrasing.
 
 All five lenses live in `skills/prompt-check/SKILL.md` and its `references/`.
 
@@ -121,7 +123,7 @@ Every run gets its own directory. Older runs are preserved so you can diff audit
     {
       "id": "T3",
       "lens": "tr_phonetic",
-      "fix_kind": "pronunciation_hint",
+      "fix_kind": "advisory",
       "severity": "high",
       "line": 858,
       "current_excerpt": "şehir dışı gönderilerde ise DHL kullanıyoruz.",
@@ -143,13 +145,12 @@ Every run gets its own directory. Older runs are preserved so you can diff audit
 }
 ```
 
-Each finding declares one of three `fix_kind` values:
+Each finding declares one of two `fix_kind` values:
 
-- `replace` — substring replacement (`current_excerpt` → `suggested_fix`).
-- `pronunciation_hint` — written text untouched; `pronunciation_entry` (with `strategy: pronounce | rephrase | follow_with_translation`) is added to the managed pronunciation guide block in the prompt.
-- `advisory` — judgement call; reported only, never auto-applied.
+- `replace` — substring replacement (`current_excerpt` → `suggested_fix`). Emitted by `conflict`, `dominance`, `gap`, and `drift` lenses only.
+- `advisory` — reported only, never auto-applied. **Every TR phonetic finding uses this**, even when `suggested_fix` or `pronunciation_entry` is populated. The author decides whether and how to act on TR suggestions.
 
-When you say "fix these", Claude runs **two passes**: Pass 1 applies every `replace` finding (line + excerpt must agree; ambiguous occurrences are skipped); Pass 2 writes or updates a single marker-delimited pronunciation block at the top of the prompt (or migrates an existing legacy `TTS PRONUNCIATION NOTES` / `Okunuş rehberi` block into managed format, preserving every entry). Findings with empty `suggested_fix` and `fix_kind: advisory` are never auto-applied.
+When you say "fix these", Claude applies every `replace` finding (line + excerpt must agree; ambiguous occurrences are skipped). TR phonetic findings are surfaced in the diff summary as a count, but the prompt file is never modified because of them.
 
 ## Customizing defaults
 
@@ -178,7 +179,6 @@ Example for a Turkish VAPI repo:
 
 ```json
 {
-  "$schema": "https://github.com/onurgoz/PromptChecker/blob/master/schema/config.schema.json",
   "default_type": "vapi",
   "target_model": "claude-opus-4-7",
   "output": ["markdown", "findings_json"],

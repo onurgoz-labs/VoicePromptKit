@@ -10,4 +10,4 @@ Invoke the `prompt-check` skill against the prompt file at `$1`.
 
 Pass `$1` (relative or absolute) as the prompt path. The skill handles working-directory setup, deterministic frontmatter parsing, rule extraction, all four lenses (and optionally the Turkish phonetic lens when `tr_phonetic: true`), drift via the `drift-runner` subagent (only when warranted), report rendering, and the terminal summary. Surface the skill's terminal summary verbatim.
 
-If the user later says "fix these" or "düzelt bunları", read `.promptcheck/<basename>/latest/findings.json` and apply each `suggested_fix` by matching `line` + `current_excerpt` in the prompt file.
+If the user later says "fix these" or "düzelt bunları", read `.promptcheck/<basename>/latest/findings.json` and apply each non-TR `suggested_fix` by matching `line` + `current_excerpt` in the prompt file. TR phonetic findings are advisory-only — never modify the prompt for them, just confirm their count is visible in the report.

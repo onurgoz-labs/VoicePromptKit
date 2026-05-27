@@ -38,7 +38,7 @@ echo "CONFIG_PATH=$CONFIG_PATH"
 3. **Target model** (reports + drift simulation):
    - Suggested presets `claude-opus-4-7` (default), `claude-sonnet-4-6`. Free text accepted.
 4. **Output formats** (multi-select, ≥ 1):
-   - `markdown` (default ✓), `findings_json` (default ✓), `json`, `html`.
+   - `markdown` (default ✓), `findings_json` (default ✓), `json`.
 5. **Drift `expand_count`** (extra scenarios beyond anchors + conflict budget):
    - Integer 0–20. Default `3`. Zero disables drift entirely.
 
@@ -46,7 +46,6 @@ After collecting answers, write `$CONFIG_PATH` as pretty JSON (2-space indent):
 
 ```json
 {
-  "$schema": "https://github.com/onurgoz/PromptChecker/blob/master/schema/config.schema.json",
   "default_type": "<choice or null if unspecified>",
   "target_model": "<answer>",
   "output": ["..."],
@@ -309,7 +308,7 @@ Before scanning the body for new findings, parse any existing pronunciation guid
 - **Managed marker block:** `<!-- promptchecker:pronunciation-guide:start --> ... <!-- promptchecker:pronunciation-guide:end -->`
 - **Legacy heading block:** a line containing `TTS PRONUNCIATION NOTES`, `Pronunciation guide`, `Okunuş rehberi`, `Telaffuz`, or `Telaffuz notları` followed by a bullet list within the next ~20 lines.
 
-For each parsed entry, infer `strategy` (see `references/tr-phonetic.md` for the rules) and record the term. Tag each seed entry with `source: "seed"`. **Remember the line range of any legacy block** — apply-mode Pass 2 needs it to migrate the block to managed format.
+For each parsed entry, infer `strategy` (see `references/tr-phonetic.md` for the rules) and record the term. Tag each seed entry with `source: "seed"`.
 
 **Body scan in 6.1 dedupes against the seed:** if a term already exists in the seed `pronunciation_map`, do not emit a new finding for it. The skip rules in `references/tr-phonetic.md` already prevent the block's own lines from being re-flagged.
 
@@ -317,18 +316,17 @@ If no existing block is found, `pronunciation_map` starts empty and proceeds to 
 
 ### Phase 6.1 — Body scan
 
-Each TR finding declares one of three `fix_kind` values (see `references/tr-phonetic.md` for full definitions): `replace`, `pronunciation_hint`, or `advisory`.
+**TR findings are advisory-only.** PromptChecker never auto-applies any TR phonetic suggestion — every TR finding is reported and surfaces a concrete suggestion (`suggested_fix` for textual issues, `pronunciation_entry` for foreign words / abbreviations) so the author can decide, but `fix_kind` is always `"advisory"`. The `kind` field still distinguishes the four detection categories (see `references/tr-phonetic.md`): `number_readability`, `abbreviation`, `foreign_word`, `punctuation`.
 
 Write `$RUN_DIR/tr_phonetic.json`:
 
 ```json
 {
-  "seed_block_range": { "start_line": 435, "end_line": 441, "format": "legacy_heading" },
   "findings": [
     {
       "id": "T1",
       "kind": "number_readability | abbreviation | foreign_word | punctuation",
-      "fix_kind": "replace | pronunciation_hint | advisory",
+      "fix_kind": "advisory",
       "severity": "low | medium | high",
       "line": 42,
       "current_excerpt": "...",
@@ -356,9 +354,9 @@ Write `$RUN_DIR/tr_phonetic.json`:
 }
 ```
 
-`seed_block_range` is null when no existing block was found. `seed_entries[]` is the parsed seed; `findings[]` contains only NEW (non-duplicate) issues from the body scan.
+`seed_entries[]` is the parsed seed (for dedupe + report context); `findings[]` contains only NEW (non-duplicate) issues from the body scan.
 
-Only one of `suggested_fix` / `pronunciation_entry` is populated per finding. **Never** propose semantic translations (`pound → İngiliz lirası` is forbidden). Phonetic hints and `alt_translation` metadata are allowed.
+Each finding populates **either** `suggested_fix` (for textual issues — punctuation typos, malformed numbers, monetary spelling) **or** `pronunciation_entry` (for foreign words / abbreviations whose written text should stay). Both are informational — apply-mode never touches them. **Never** propose semantic translations (`pound → İngiliz lirası` is forbidden); phonetic hints and `alt_translation` metadata are allowed because they are advisory.
 
 ## Phase 7 — Render outputs
 
@@ -370,7 +368,7 @@ Read everything you wrote into `$RUN_DIR/` so far. Build a single merged `findin
 original_line = body_line + frontmatter.body_line_offset - 1
 ```
 
-Apply this to every `findings[].line`, every `findings[].related_lines[]`, and (if present) the line inside `pronunciation_entry.source_lines[]`. After translation, body.txt indices must no longer appear in any rendered output. Apply-mode and report.md both depend on this.
+Apply this to every `findings[].line` and `findings[].related_lines[]`. After translation, body.txt indices must no longer appear in any rendered output. Apply-mode and report.md both depend on this.
 
 **Carry the prompt hash:** copy `frontmatter.prompt_sha256` into the top of findings.json so apply-mode can detect a stale audit.
 
@@ -394,7 +392,7 @@ Apply this to every `findings[].line`, every `findings[].related_lines[]`, and (
     {
       "id": "C1",
       "lens": "conflict|dominance|gap|drift|tr_phonetic",
-      "fix_kind": "replace|pronunciation_hint|advisory",
+      "fix_kind": "replace|advisory",
       "severity": "low|medium|high",
       "line": 42,
       "related_lines": [42, 47],
@@ -424,21 +422,17 @@ Apply this to every `findings[].line`, every `findings[].related_lines[]`, and (
       "source": "seed",
       "source_finding_ids": []
     }
-  ],
-  "seed_block_range": { "start_line": 442, "end_line": 448, "format": "legacy_heading" }
+  ]
 }
 ```
 
-`pronunciation_map` is the union of `tr_phonetic.json.seed_entries` (entries the prompt already had — `source: "seed"`) and the entries extracted from new `pronunciation_hint` findings (`source: "finding"`). Dedupe by `term` (case-insensitive); if a seed entry and a finding entry collide, **seed wins** (the author's curated text is the source of truth). Translate `seed_block_range` line numbers to original-file lines using `body_line_offset`, same as findings.
+`pronunciation_map` is the union of `tr_phonetic.json.seed_entries` (entries the prompt already had — `source: "seed"`) and the `pronunciation_entry` payload of TR findings (`source: "finding"`). Dedupe by `term` (case-insensitive); if a seed entry and a finding entry collide, **seed wins** (the author's curated text is the source of truth). It is a flat reference list rendered in `report.md` and surfaced in `findings.json` for downstream tooling — apply-mode never injects it back into the prompt.
 
 `findings[]` is sorted by `line` ascending, then by severity descending. For each finding:
-- `fix_kind: "replace"` → apply-mode edits the line so it produces `suggested_fix` instead of `current_excerpt`.
-- `fix_kind: "pronunciation_hint"` → apply-mode inserts the entry into a pronunciation guide block in the prompt; the original line stays untouched.
-- `fix_kind: "advisory"` → no automatic apply.
+- `fix_kind: "replace"` → apply-mode edits the line so it produces `suggested_fix` instead of `current_excerpt`. Only emitted by `conflict`, `dominance`, `gap`, `drift` lenses (never TR phonetic).
+- `fix_kind: "advisory"` → no automatic apply. **Every TR phonetic finding uses this**, regardless of whether `suggested_fix` or `pronunciation_entry` is populated.
 
-For non-TR lenses (`conflict`, `dominance`, `gap`, `drift`), `fix_kind` is always `"replace"` (when `suggested_fix` is non-empty) or `"advisory"` (when empty). Only the TR lens uses `pronunciation_hint`.
-
-`pronunciation_map` is the deduplicated merge of every `pronunciation_entry` across TR findings, ready for apply-mode to inject.
+The TR lens never produces `replace` findings — TR suggestions are always reported, never written.
 
 ### `$RUN_DIR/report.md`
 
@@ -547,9 +541,14 @@ Actual SHA:   <ACTUAL_SHA>
 
 If they match, proceed.
 
-### Pass 1 — `replace` findings (line-level substitutions)
+### Replace pass — line-level substitutions (non-TR lenses only)
 
-For each finding with `fix_kind == "replace"` and non-empty `suggested_fix`:
+For each finding where ALL of these hold:
+- `fix_kind == "replace"`
+- `suggested_fix` is non-empty
+- `lens != "tr_phonetic"` (TR findings are **never** auto-applied — see "TR phonetic exclusion" below)
+
+Do:
 
 1. Read the prompt file fresh.
 2. Locate the line via `line` number (already translated to original-file line by Phase 7) AND `current_excerpt` substring match (both must agree — if not, skip and report).
@@ -559,52 +558,20 @@ For each finding with `fix_kind == "replace"` and non-empty `suggested_fix`:
 
 Group conflicting suggestions: if two findings target the same line, present a choice rather than silently applying one. Never apply a finding whose `suggested_fix` is empty — those are advisory only.
 
-### Pass 2 — `pronunciation_map` injection / migration (idempotent)
+### TR phonetic exclusion (hard rule)
 
-If `findings.json.pronunciation_map` is non-empty, write or update a single pronunciation guide block in the prompt.
+Apply-mode **never** modifies the prompt based on TR phonetic findings — no substring replacement, no pronunciation guide injection, no auto-inserted blocks. TR findings live in `report.md` / `findings.json` for the author to read and act on by hand. If `findings.json` contains TR findings, surface their count in the diff summary so the author knows they exist; do not touch the file because of them.
 
-**Block format (canonical, what apply-mode always writes):**
-
-```
-<!-- promptchecker:pronunciation-guide:start -->
-## Okunuş rehberi (TTS — internal, never speak aloud)
-- `DHL` → "de-ha-el"
-- `D&R` → "de ve er"
-- `Hebrew` → "hebru" (alternatif: "İbrani")
-- `Konstantinopolis` — rephrase as "Bizans başkenti" when possible
-- `La Turquie Kemaliste` → follow with: "yani Kemal'in Türkiye'si dergisi"
-<!-- promptchecker:pronunciation-guide:end -->
-```
-
-Render rules per entry:
-- `strategy: pronounce` → `` `term` → "phonetic"`` (plus `(alternatif: "alt_translation")` if present).
-- `strategy: rephrase` → `` `term` — rephrase as "alt_translation" when possible`` (or note text when no alt_translation).
-- `strategy: follow_with_translation` → `` `term` → follow with: "alt_translation"``.
-- `note` field appended in parentheses when non-empty.
-
-**Insertion / migration priority (first match wins):**
-
-1. **Managed marker block already exists.** Replace the block's body with the current map. Pure idempotent re-run.
-2. **Legacy block exists** (per `findings.json.seed_block_range`). **Migrate it in place:** delete the legacy heading + bullet lines, insert the canonical marker block at the same line. Surface: `Migrated existing <format> block at lines L1–L2 to managed format (N entries preserved).`
-3. **Section heading exists but no parseable bullets** (rare — heading present, no entries). Insert the canonical marker block immediately under the heading.
-4. **Fallback.** Insert the marker block immediately after the frontmatter (or at the top of the body if no frontmatter).
-
-**Never** inject inside YAML frontmatter, fenced code blocks, quoted transcripts, or markdown tables.
-
-### Pass 2.5 — Orphan prune (after Pass 1 + Pass 2)
-
-Pass 1 may have deleted text that contained terms in `pronunciation_map`. For each entry with `source: "finding"`, check whether the term still appears in the body **outside the guide block**. If it does not appear anywhere else, drop the entry from the rendered block — it's orphaned. **Seed entries (`source: "seed"`) are never pruned** (the author put them there for a reason; keep them).
-
-Report: `Pruned N orphan entries (terms no longer in body): foo, bar`.
+Rationale: phonetic adjustments and pronunciation hints are voice-design decisions the human author owns. False positives are common (proper nouns, brand voice, dialect choice), and a silently-injected block can poison a Vapi/ElevenLabs script in subtle ways. PromptChecker reports — the author decides.
 
 ### Diff surface
 
-After all passes, show a short summary in the terminal:
+After the replace pass, show a short summary in the terminal:
 - Pre-flight: `Prompt SHA match — ok` or `Prompt SHA mismatch — aborted`.
 - Replace pass: `N findings applied, M skipped (mismatch / ambiguous occurrence), K conflicts on same line`.
-- Pronunciation pass: `Wrote/migrated/extended block. N entries total (M new, K seed, P orphans pruned)`.
+- TR phonetic: `<N> advisory findings — reported only, no auto-apply (see report.md)` (omit if no TR findings).
 
-If all passes are empty, say so explicitly — do not pretend to have done work.
+If the replace pass is empty, say so explicitly — do not pretend to have done work.
 
 ## Don'ts
 
