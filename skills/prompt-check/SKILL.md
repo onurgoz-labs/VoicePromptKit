@@ -300,7 +300,23 @@ This wizard runs **once per `/prompt-check` invocation**, after rule extraction 
 
 Ask the user via `AskUserQuestion`:
 
-1. **"Bu prompt için hangi mercekleri çalıştırayım?"** — multi-select. Options: `conflict`, `dominance`, `gap`, `drift`, `tr_phonetic`. Default: all five pre-selected. The frontmatter `tr_phonetic` value (from Phase 2) pre-selects/deselects `tr_phonetic` accordingly; the user can still override.
+1. **"Bu prompt için hangi mercekleri çalıştırayım?"** — multi-select. Options:
+
+   ```
+   options: [
+     { label: "conflict",     description: "logical contradictions" },
+     { label: "dominance",    description: "silent overrides" },
+     { label: "gap",          description: "undefined cases / ambiguous terms" },
+     { label: "drift",        description: "adversarial scenario simulation" },
+     { label: "tr_phonetic",  description: "Turkish TTS readability" },
+     { label: "schema",       description: "section numbering / ordering / heading consistency" }
+   ]
+   ```
+
+   Default: all six pre-selected (`conflict`, `dominance`, `gap`, `drift`, `tr_phonetic`, `schema`). The frontmatter `tr_phonetic` value (from Phase 2) pre-selects/deselects `tr_phonetic` accordingly; the user can still override. `schema` is pre-checked by default like the other static / TR lenses; for `drift`, the existing pre-check logic stays (depends on anchors/conflicts).
+
+   **Wizard follow-up clarification (surface this to the user alongside the schema option):** "schema is auto-skipped on prompts with no numbered section headings — if your prompt is a flat instruction set, you'll see `schema lens: not applicable` in the Phase 8 summary."
+
 2. **If `drift` is included in the selection:** ask an integer follow-up for `expand_count`. Default = `frontmatter.expand_count` (which already merges per-prompt → env → project → 3). Range 0–20. If the user picks 0, drift is effectively disabled even though the lens was selected — Phase 5's existing `expand_count == 0` kill switch handles this.
 3. **If `tr_phonetic` is included AND `frontmatter.tr_phonetic` was `false`:** ask a yes/no confirmation "Türkçe sesli ajan için TTS denetimi yapılsın mı?". If the user says no, drop `tr_phonetic` from the selection.
 
@@ -310,7 +326,7 @@ Persist the answer in memory as `user_intent`:
 
 ```json
 {
-  "selected_lenses": ["conflict","dominance","gap","drift","tr_phonetic"],
+  "selected_lenses": ["conflict","dominance","gap","drift","tr_phonetic","schema"],
   "expand_count": 3,
   "anchors": [],
   "tr_phonetic_enabled": true,
@@ -325,9 +341,10 @@ Persist the answer in memory as `user_intent`:
 Phase 9 writes this `user_intent` block into `session.json` at interactive entry. Until then it is held in memory by the skill.
 
 **Dispatch impact:**
-- Phase 4 (static lenses): if `conflict`, `dominance`, or `gap` is unselected, instruct `static-lens-runner` to skip those sub-lenses by passing `selected_lenses` in the dispatch inputs (see Phase 4). If all three are unselected, skip the dispatch entirely and write empty placeholder files.
+- Phase 4 (static lenses): if `conflict`, `dominance`, `gap`, or `schema` is unselected, instruct `static-lens-runner` to skip those sub-lenses by passing `selected_lenses` in the dispatch inputs (see Phase 4). If all four are unselected, skip the dispatch entirely and write empty placeholder files.
 - Phase 5 (drift): the existing skip gate (`expand_count == 0` OR no anchors/conflicts/role-overrides) already handles drift opt-out. Additionally, if `drift` is unselected here, skip Phase 5 entirely and write `drift.json` with `skipped_reason: "drift lens deselected by user"`.
 - Phase 6 (TR phonetic): gate on `user_intent.tr_phonetic_enabled == true` — NOT on `frontmatter.tr_phonetic`. The user's runtime selection is authoritative. If false, skip Phase 6 entirely — no `tr_phonetic.json` is written, and Phase 7 treats missing files as "lens disabled".
+- **Schema is integrated into `static-lens-runner`** — there is no new subagent. If `schema` is unselected, the runner writes a skipped placeholder (`{"findings": [], "applicable": null, "skipped": true, "reason": "lens not selected in per-run wizard"}`) to `$RUN_DIR/schema.json`. If the prompt has no numbered section headings, the runner writes `{"findings": [], "applicable": false, "reason": "no numbered section headings detected"}` — auto-skip is the runner's decision, not the skill's.
 
 Phase 7 already handles missing per-lens JSON files as "lens disabled" — no change there.
 
@@ -357,7 +374,7 @@ Concretely: in one assistant turn, emit both Phase 4 and Phase 6 `Agent` tool ca
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_6_dispatch_start" >> "$TIMING_LOG"
 ```
 
-Dispatch the `static-lens-runner` subagent to apply the three static lenses in one pass. Detection criteria live in `references/lens-rules.md` — the subagent reads that document. The skill itself does no lens analysis.
+Dispatch the `static-lens-runner` subagent to apply the four static lenses (conflict, dominance, gap, schema) in one pass. Detection criteria live in `references/lens-rules.md` — the subagent reads that document. The skill itself does no lens analysis.
 
 **Line-number contract:** every `line` field the subagent writes is a body.txt index (1-indexed, blank lines included). Phase 7 is the single place that translates these to original-file line numbers.
 
@@ -372,31 +389,33 @@ Agent({
       frontmatter:     "<absolute path to $RUN_DIR/frontmatter.json>",
       rules:           "<absolute path to $RUN_DIR/rules.json>",
       lens_rules_ref:  "<absolute path to skills/prompt-check/references/lens-rules.md>",
-      selected_lenses: ["conflict", "dominance", "gap"]  // ← subset of these three; runner skips unselected
+      selected_lenses: <subset of ["conflict", "dominance", "gap", "schema"] from user_intent>
     },
     output_paths: {
       conflicts:  "<absolute path to $RUN_DIR/conflicts.json>",
       dominances: "<absolute path to $RUN_DIR/dominances.json>",
-      gaps:       "<absolute path to $RUN_DIR/gaps.json>"
+      gaps:       "<absolute path to $RUN_DIR/gaps.json>",
+      schema:     "<absolute path to $RUN_DIR/schema.json>"
     }
   }),
   description: "static lenses for " + BASENAME
 })
 ```
 
-Populate `selected_lenses` from `user_intent.selected_lenses` (computed in Phase 3.5), intersected with `["conflict", "dominance", "gap"]` — i.e. drop `drift` and `tr_phonetic` since those belong to other runners. The static-lens-runner reads this field and writes empty `{"conflicts": []}` / `{"dominances": []}` / `{"gaps": []}` for any sub-lens not in the list.
+Populate `selected_lenses` from `user_intent.selected_lenses` (computed in Phase 3.5), intersected with `["conflict", "dominance", "gap", "schema"]` — i.e. drop `drift` and `tr_phonetic` since those belong to other runners. The static-lens-runner reads this field and writes empty `{"conflicts": []}` / `{"dominances": []}` / `{"gaps": []}` / `{"findings": [], "skipped": true, "reason": "lens not selected in per-run wizard"}` for any sub-lens not in the list. Schema additionally auto-skips on flat prompts (no numbered section headings) — the runner emits `{"findings": [], "applicable": false, "reason": "no numbered section headings detected"}` to `schema.json` in that case.
 
-**Skip the Phase 4 dispatch entirely** if all three static lenses are deselected (the intersection is empty). In that case write empty placeholders directly:
+**Skip the Phase 4 dispatch entirely** if all four static lenses are deselected (the intersection is empty). In that case write empty placeholders directly:
 
 ```bash
-printf '{"conflicts": []}' > "$RUN_DIR/conflicts.json"
-printf '{"dominances": []}' > "$RUN_DIR/dominances.json"
-printf '{"gaps": []}' > "$RUN_DIR/gaps.json"
+printf '{"conflicts": [], "skipped": true, "reason": "all static lenses deselected"}' > "$RUN_DIR/conflicts.json"
+printf '{"dominances": [], "skipped": true, "reason": "all static lenses deselected"}' > "$RUN_DIR/dominances.json"
+printf '{"gaps": [], "skipped": true, "reason": "all static lenses deselected"}' > "$RUN_DIR/gaps.json"
+printf '{"findings": [], "skipped": true, "reason": "all static lenses deselected"}' > "$RUN_DIR/schema.json"
 ```
 
 …and proceed to Phase 5 / 7 without spawning the runner.
 
-`static-lens-runner` writes `$RUN_DIR/conflicts.json`, `$RUN_DIR/dominances.json`, and `$RUN_DIR/gaps.json`. The skill reads them in Phase 7.
+`static-lens-runner` writes `$RUN_DIR/conflicts.json`, `$RUN_DIR/dominances.json`, `$RUN_DIR/gaps.json`, and `$RUN_DIR/schema.json`. The skill reads them in Phase 7.
 
 ```bash
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_4_dispatch_end" >> "$TIMING_LOG"
@@ -508,7 +527,23 @@ Populate `user_intent_tr_phonetic` with `user_intent.tr_phonetic_enabled`. The r
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_7_start" >> "$TIMING_LOG"
 ```
 
-Read every artefact that landed in `$RUN_DIR/` so far: `frontmatter.json`, `rules.json`, `conflicts.json`, `dominances.json`, `gaps.json`, `drift.json`, and (if the TR gate ran) `tr_phonetic.json`. Build a single merged `findings.json` and a human-readable `report.md`. Both are line-anchored.
+Read every artefact that landed in `$RUN_DIR/` so far: `frontmatter.json`, `rules.json`, `conflicts.json`, `dominances.json`, `gaps.json`, `schema.json`, `drift.json`, and (if the TR gate ran) `tr_phonetic.json`. Build a single merged `findings.json` and a human-readable `report.md`. Both are line-anchored.
+
+**Schema findings merging.** After loading `conflicts.json`, `dominances.json`, `gaps.json`, `drift.json`, and `tr_phonetic.json`, ALSO load `schema.json` and merge with the following rules:
+
+- **If `schema.json.applicable == false`** (auto-skipped on flat prompt):
+  - Do not add any schema findings to `findings[]`.
+  - Set `summary.schema = { "total": 0, "applicable": false, "reason": "no numbered section headings detected" }`.
+- **If `schema.json.skipped == true`** (user deselected the lens in Phase 3.5):
+  - Do not add any schema findings to `findings[]`.
+  - Set `summary.schema = { "total": 0, "applicable": null, "skipped": true, "reason": "lens not selected in per-run wizard" }`.
+- **If `schema.json.applicable == true`:**
+  - For each finding in `schema.json.findings`, promote to `findings[]` with:
+    - `lens: "schema"`
+    - `fix_kind: "replace"` (the runner sets `fix_strategy` per category — `section_gap`, `subsection_gap`, `out_of_order`, `subsection_orphan`, `heading_style_inconsistent`, `missing_parent`, `step_gap`, etc.)
+    - All other fields verbatim from the schema finding (`severity`, `line`, `related_lines`, `current_excerpt`, `suggested_fix`, `rationale`, `rule_ids`, `fix_strategy`).
+  - Translate the `line` field via `body_line_offset`, exactly as for every other lens.
+  - Set `summary.schema = { "total": N, "applicable": true, "by_kind": { "section_gap": ..., "subsection_gap": ..., "out_of_order": ..., ... }, "high": ..., "medium": ..., "low": ... }`.
 
 **Line translation (mandatory):** Every lens wrote `line` numbers as body.txt indices. Before writing findings.json, translate each `line` to an original-file line:
 
@@ -533,13 +568,19 @@ Apply this to every `findings[].line` and `findings[].related_lines[]`. After tr
     "conflicts": { "total": N, "high": N, "medium": N, "low": N },
     "dominances": { "total": N, "by_mechanism": { "role-override": N, ... } },
     "gaps": { "total": N, "high": N, "medium": N, "low": N },
+    "schema": {
+      "total": N,
+      "applicable": true,
+      "by_kind": { "section_gap": N, "subsection_gap": N, "out_of_order": N, "subsection_orphan": N, "heading_style_inconsistent": N, "missing_parent": N, "step_gap": N },
+      "high": N, "medium": N, "low": N
+    },
     "drift": { "scenarios": N, "passed": N, "failed": N, "skipped": false },
     "tr_phonetic": { "total": N, "by_kind": { ... } }
   },
   "findings": [
     {
       "id": "C1",
-      "lens": "conflict|dominance|gap|drift|tr_phonetic",
+      "lens": "conflict|dominance|gap|schema|drift|tr_phonetic",
       "fix_kind": "replace|advisory",
       "severity": "low|medium|high",
       "line": 42,
@@ -576,15 +617,28 @@ Apply this to every `findings[].line` and `findings[].related_lines[]`. After tr
 
 `pronunciation_map` is the union of `tr_phonetic.json.seed_entries` (entries the prompt already had — `source: "seed"`) and the `pronunciation_entry` payload of TR findings (`source: "finding"`). Dedupe by `term` (case-insensitive); if a seed entry and a finding entry collide, **seed wins** (the author's curated text is the source of truth). It is a flat reference list rendered in `report.md` and surfaced in `findings.json` for downstream tooling — Phase 10 never injects it back into the prompt.
 
+**`summary.schema` shape variants** depend on the lens state and follow the Schema findings merging rules above:
+
+```json
+// Applicable run (numbered sections detected, lens enabled):
+"schema": { "total": N, "applicable": true, "by_kind": { ... }, "high": N, "medium": N, "low": N }
+
+// Auto-skipped (flat prompt, no numbered headings):
+"schema": { "total": 0, "applicable": false, "reason": "no numbered section headings detected" }
+
+// User-deselected in Phase 3.5 wizard:
+"schema": { "total": 0, "applicable": null, "skipped": true, "reason": "lens not selected in per-run wizard" }
+```
+
 **Sort order for findings[] and rendered output:**
 
 1. **Severity descending** — high (h) → medium (m) → low (l). High-severity findings appear first regardless of where they are in the file.
-2. **Lens group within severity bucket** — within each severity bucket, group by lens in this fixed order: conflict, dominance, gap, drift, tr_phonetic.
+2. **Lens group within severity bucket** — within each severity bucket, group by lens in this fixed order: conflict, dominance, gap, schema, drift, tr_phonetic. (Schema sits between gap and drift — it's another static structural lens; drift is the only behavioural lens.)
 3. **Line ascending within (severity, lens) group** — within the same severity AND lens, sort by line number ascending.
 
 In Python:
 ```python
-LENS_ORDER = {"conflict": 0, "dominance": 1, "gap": 2, "drift": 3, "tr_phonetic": 4}
+LENS_ORDER = {"conflict": 0, "dominance": 1, "gap": 2, "schema": 3, "drift": 4, "tr_phonetic": 5}
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
 findings.sort(key=lambda f: (
     SEVERITY_ORDER.get(f.get("severity", "low"), 2),
@@ -596,7 +650,7 @@ findings.sort(key=lambda f: (
 Apply this sort BOTH to `findings.json.findings[]` AND to the visual rendering in report.md.
 
 For each finding:
-- `fix_kind: "replace"` → Phase 10's applied step rewrites the line so it produces `suggested_fix` instead of `current_excerpt`. Emitted by `conflict`, `dominance`, `gap`, `drift` lenses, and by TR `number_readability` / `punctuation` findings.
+- `fix_kind: "replace"` → Phase 10's applied step rewrites the line so it produces `suggested_fix` instead of `current_excerpt`. Emitted by `conflict`, `dominance`, `gap`, `schema`, `drift` lenses, and by TR `number_readability` / `punctuation` findings.
 - `fix_kind: "advisory"` → no automatic apply. Emitted by TR `foreign_word` / `abbreviation` findings — Phase 9.6's commit and Phase 10.3's TR advisory guard force-route these to overlay.
 
 ### `$RUN_DIR/report.md`
@@ -616,6 +670,7 @@ For each finding:
 | Conflict | … | … | … | … |
 | Dominance | … | … | … | … |
 | Gap | … | … | … | … |
+| Schema | … | … | … | … | (render `Schema | 0 (not applicable — no numbered section headings)` when `applicable: false`; render `Schema | 0 (skipped — lens deselected)` when `applicable: null && skipped: true`)
 | Drift | <scenarios>: <passed>✓ / <failed>✗ | — | — | — |
 | TR phonetic | … | … | … | … | (omit row if tr_phonetic disabled)
 
@@ -635,6 +690,11 @@ For each finding:
 
 #### Gaps
 - ...
+
+#### Schema
+- ...
+- (or "_Not applicable — no numbered section headings detected._" when `summary.schema.applicable == false`)
+- (or "_Skipped — lens deselected in wizard._" when `summary.schema.applicable == null && summary.schema.skipped == true`)
 
 #### Drift
 - ...
@@ -711,7 +771,7 @@ def render_finding_body(current, suggested):
     return f"**Action:** {suggested}"
 ```
 
-Drift findings still render with `Input:` and `Reasons:` per the per-scenario template above — the diff rule applies to conflict / dominance / gap / tr_phonetic findings.
+Drift findings still render with `Input:` and `Reasons:` per the per-scenario template above — the diff rule applies to conflict / dominance / gap / schema / tr_phonetic findings.
 
 `report.md` is the canonical user-facing artefact. If `frontmatter.output` contains `findings_json` but not `markdown`, still write `report.md` — it costs nothing and is the doc humans read. If `output` contains `json`, write the merged report as `$RUN_DIR/report.json` (same shape as findings.json plus a `body_lines` field with the numbered body).
 
@@ -735,7 +795,7 @@ If `frontmatter.config_warnings[]` is non-empty, include them in the summary so 
 ```
 PromptChecker complete — <run-NNN>
 
-- Rules: <N> | Conflicts: <N> (<H> high) | Dominances: <N> | Gaps: <N>
+- Rules: <N> | Conflicts: <N> (<H> high) | Dominances: <N> | Gaps: <N> | Schema: <N> (<M> high) [applicability: <APPLICABLE | NOT APPLICABLE | SKIPPED>]
 - Drift: <skipped|<N> scenarios, <P> passed, <F> failed>
 - TR phonetic: <disabled|<N> findings>
 - <K> TR pronunciation findings auto-filed to overlay's pronunciation_map (foreign_word: <a>, abbreviation: <b>)
@@ -752,7 +812,15 @@ to choose what to do with each finding. Type "iptal" to leave the session as
 pending and resume later with /prompt-check-resume.
 ```
 
-The auto-filed line is shown ONLY when the count is non-zero. It sits alongside the existing rules / conflicts / dominances / gaps / drift / TR phonetic counts. **The TR phonetic count line still shows the TOTAL TR findings (advisory + replace) — the auto-filed line is an additional drill-down, not a replacement.** Compute `K` as the number of TR findings with `lens == "tr_phonetic" AND fix_kind == "advisory"`; `a` = count where `kind == "foreign_word"`; `b` = count where `kind == "abbreviation"`. These are the same findings that Phase 9.2's partition will assign to AUTO_FILED_SET.
+The auto-filed line is shown ONLY when the count is non-zero. It sits alongside the existing rules / conflicts / dominances / gaps / schema / drift / TR phonetic counts. **The TR phonetic count line still shows the TOTAL TR findings (advisory + replace) — the auto-filed line is an additional drill-down, not a replacement.** Compute `K` as the number of TR findings with `lens == "tr_phonetic" AND fix_kind == "advisory"`; `a` = count where `kind == "foreign_word"`; `b` = count where `kind == "abbreviation"`. These are the same findings that Phase 9.2's partition will assign to AUTO_FILED_SET.
+
+**Schema applicability tag (mirrors `summary.schema` shape from Phase 7):**
+
+- `summary.schema.applicable == true` → render `Schema: <N> (<M> high) [applicability: APPLICABLE]`.
+- `summary.schema.applicable == false` → render `Schema: 0 (no numbered section headings detected)` (auto-skipped on a flat prompt). Surface the reason inline; do NOT emit a phantom `[applicability: NOT APPLICABLE]` tag without the reason.
+- `summary.schema.applicable == null && summary.schema.skipped == true` → render `Schema: 0 (deselected in wizard)`. Surface the reason inline.
+
+`<M>` is `summary.schema.high` when applicable, otherwise omit the `(<M> high)` parenthetical. The applicability marker mirrors what `static-lens-runner` reported in `schema.json` — the skill does not recompute it.
 
 The `Pronunciations master:` line surfaces `.promptcheck/<basename>/pronunciations.md` — the cross-version aggregate file rebuilt by Phase 10.2.1. `<M>` is the number of unique terms in that file, `<N>` is the count of `run-NNN/` directories under the prompt that have ever contributed at least one `pronunciation_map` entry. **Omit this line entirely** when `pronunciations.md` has zero entries (i.e. no run under this prompt has produced a non-empty `pronunciation_map` yet). The line is informational and only appears when there is something for the user to read.
 
@@ -790,9 +858,11 @@ Write `$RUN_DIR/session.json` (overwriting the placeholder from Phase 1) with th
   "prompt_path": "<absolute path>",
   "prompt_sha256_at_audit": "<from findings.json.prompt_sha256>",
   "user_intent": {
-    "selected_lenses": ["conflict","dominance","gap","drift","tr_phonetic"],
+    "selected_lenses": ["conflict","dominance","gap","drift","tr_phonetic","schema"],
     "expand_count": 3,
     "anchors": [],
+    "tr_phonetic_enabled": true,
+    "anchors_added": false,
     "asked_at": "<ISO 8601 UTC from Phase 3.5>"
   },
   "findings_state": {
@@ -1459,3 +1529,4 @@ Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. 
 - Don't ask the user about TR pronunciation findings (foreign_word + abbreviation) in Phase 9. They auto-file to the overlay's Pronunciation map. Showing them in the summary table or decision prompt is a UX regression — the pronunciation hint is never going to be applied (advisory rule), so surfacing it as a decision wastes the user's attention. They appear ONLY in Phase 8's auto-filed count line and in `inline-suggestions.md`'s bottom Pronunciation map section.
 - Don't apply a TODO/Intentional sentinel as if it were a regular structural fix. The sentinel guard in Phase 10.3 (step 4) intercepts them: `TODO:` routes to overlay (`sentinel_todo`), `Intentional —` is dismissed (`sentinel_intentional`). Neither ever reaches the Edit tool.
 - Don't overwrite the `## Custom additions` block in `pronunciations.md`. The author owns content between the `<!-- promptchecker:custom-additions:start -->` and `<!-- promptchecker:custom-additions:end -->` markers; the rebuild MUST preserve that block verbatim.
+- Don't merge schema findings into findings.json when `schema.json.applicable == false`. Auto-skipped lenses contribute zero findings — the summary just notes the reason. Adding a phantom `Schema: 0` row without applicability context is misleading on flat prompts.
