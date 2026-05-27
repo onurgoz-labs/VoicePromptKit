@@ -40,7 +40,7 @@ echo "CONFIG_EXISTS=$CONFIG_EXISTS"
 **Branch on the `CONFIG_EXISTS` line the bash block just echoed — do not infer from the path string alone.**
 
 - **If `CONFIG_EXISTS=true` (the bash block printed this line):** STOP — skip the wizard, do not write `.promptchecker.json`, do not ask any questions. Continue to Phase 1. The pre-existing file is the source of truth and will be read in Phase 2 during the frontmatter merge.
-- **Only if `CONFIG_EXISTS=false`:** run the first-run wizard before continuing. Ask the user the six questions below (prefer `AskUserQuestion` if available, otherwise plain conversational prompts; either way wait for all six answers before writing the file).
+- **Only if `CONFIG_EXISTS=false`:** run the first-run wizard before continuing. Ask the user the seven questions below (prefer `AskUserQuestion` if available, otherwise plain conversational prompts; either way wait for all seven answers before writing the file).
 
 **Sanity check before asking the wizard questions:** read the last echoed `CONFIG_EXISTS=` line from the bash output. If it is `true`, the wizard MUST NOT run regardless of any other reasoning. Overwriting an existing config is a silent data-loss bug.
 
@@ -58,6 +58,9 @@ echo "CONFIG_EXISTS=$CONFIG_EXISTS"
    - Options: 25000 (small), 50000 (default ✓), 100000 (large), 0 (unlimited — disables compact mode entirely)
    - Free text accepted (positive integer or 0).
    - When set to a non-zero value, prompts whose body exceeds this threshold are audited in "compact mode" — cheaper analysis policies that trade depth for speed (low-severity findings skipped, conflict pair budget capped, drift expand_count halved, rule text trimmed). The threshold compares against the BODY length (frontmatter stripped), not the full file size.
+7. **Report language** (controls skill-rendered text in report.md, terminal summary, and Phase 9 dialog prompts):
+   - Options: `tr` (Türkçe, default ✓), `en` (English).
+   - Lens-generated content (rationale, suggested_fix, current_excerpt) stays in whatever language the lens runner produces — only the skill's own template strings translate. So an English conflict rationale remains English in a TR report; the surrounding section headings (Summary / Findings / High severity / etc.) translate.
 
 After collecting answers, write `$CONFIG_PATH` as pretty JSON (2-space indent):
 
@@ -68,7 +71,8 @@ After collecting answers, write `$CONFIG_PATH` as pretty JSON (2-space indent):
   "output": ["..."],
   "expand_count": <int>,
   "tr_phonetic": <bool>,
-  "max_char_limit": <int>
+  "max_char_limit": <int>,
+  "report_language": "<tr | en>"
 }
 ```
 
@@ -267,10 +271,33 @@ resolved['compact_mode'] = (
     resolved['max_char_limit'] > 0 and body_char_count > resolved['max_char_limit']
 )
 
+# Resolve report_language: frontmatter > env (PROMPTCHECKER_REPORT_LANGUAGE) > project config > default 'tr'
+rlang = fm.get('report_language')
+if rlang is None:
+    rlang_env = env('PROMPTCHECKER_REPORT_LANGUAGE')
+    if rlang_env is not None and str(rlang_env).strip() != '':
+        rlang = str(rlang_env).strip().lower()
+    if rlang is None:
+        rlang = project.get('report_language', 'tr')
+# Normalise + fallback warning if unknown value supplied.
+rlang_norm = rlang.strip().lower() if isinstance(rlang, str) else None
+if rlang_norm in ('tr', 'en'):
+    resolved['report_language'] = rlang_norm
+    _rlang_unknown = None
+else:
+    resolved['report_language'] = 'tr'
+    # Only warn when the user (or env / config) supplied an unknown value;
+    # silent default-fallback when nothing was set at all.
+    _rlang_unknown = rlang if rlang is not None else None
+
 # Collect warnings for unknown frontmatter / config keys (surfaced in Phase 8).
-KNOWN_FM = {'type','target_model','output','expand_count','anchors','tr_phonetic','max_char_limit'}
-KNOWN_CFG = {'$schema','default_type','target_model','output','expand_count','tr_phonetic','max_char_limit'}
+KNOWN_FM = {'type','target_model','output','expand_count','anchors','tr_phonetic','max_char_limit','report_language'}
+KNOWN_CFG = {'$schema','default_type','target_model','output','expand_count','tr_phonetic','max_char_limit','report_language'}
 warnings = []
+if _rlang_unknown is not None:
+    warnings.append(
+        f"unknown report_language value: {_rlang_unknown!r} — falling back to 'tr'"
+    )
 if resolved['compact_mode']:
     warnings.append(
         f"compact mode active: body is {body_char_count} chars, exceeds max_char_limit "
@@ -301,11 +328,106 @@ PY
 
 If `python3` is unavailable, fall back to reading the file yourself, splitting on the first two `---` lines, and applying the same merge logic by reasoning. State the fallback in the terminal summary.
 
-## Phase 3 — Rule extraction (inline)
+## Phase 3 — Rule extraction (inline) + section_index build
 
 ```bash
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_start" >> "$TIMING_LOG"
 ```
+
+**Phase 3 also produces `section_index.json` — a deterministic line-to-section map.**
+
+The skill scans body.txt once and records every numbered section header. The resulting map lets every downstream lens (and Phase 7 render) attach a `section_ref` to every finding by simple line lookup.
+
+Bash + Python implementation (runs as part of Phase 3, before rule extraction):
+
+```bash
+python3 - "$RUN_DIR/body.txt" "$RUN_DIR/section_index.json" <<'PY'
+import sys, re, json
+
+body_path, out_path = sys.argv[1], sys.argv[2]
+lines = open(body_path, encoding='utf-8').read().split('\n')
+
+section_re    = re.compile(r'^##\s+SECTION\s+(\d+)\b\s*[—\-:]?\s*(.*)$')
+subsection_re = re.compile(r'^###\s+(\d+)\.(\d+)\b\s*[—\-:]?\s*(.*)$')
+
+current_section = None
+current_section_title = None
+current_subsection = None
+current_subsection_title = None
+index = []  # list of {line, section, subsection, section_title, subsection_title}
+
+for i, line in enumerate(lines, start=1):
+    m_sec = section_re.match(line)
+    m_sub = subsection_re.match(line)
+    if m_sec:
+        current_section = m_sec.group(1)
+        current_section_title = m_sec.group(2).strip() or None
+        current_subsection = None
+        current_subsection_title = None
+    elif m_sub:
+        # Subsection number must match current section; orphans handled by schema lens.
+        current_subsection = f"{m_sub.group(1)}.{m_sub.group(2)}"
+        current_subsection_title = m_sub.group(3).strip() or None
+    index.append({
+        "line": i,
+        "section": current_section,
+        "subsection": current_subsection,
+        "section_title": current_section_title if current_section else None,
+        "subsection_title": current_subsection_title if current_subsection else None
+    })
+
+# Compact representation: ranges of consecutive same-section lines.
+compact_ranges = []
+last_key = None
+range_start = None
+prev_section_title = None
+prev_subsection_title = None
+for entry in index:
+    key = (entry["section"], entry["subsection"])
+    if key != last_key:
+        if last_key is not None:
+            compact_ranges.append({
+                "from_line": range_start,
+                "to_line": entry["line"] - 1,
+                "section": last_key[0],
+                "subsection": last_key[1],
+                "section_title": prev_section_title,
+                "subsection_title": prev_subsection_title
+            })
+        range_start = entry["line"]
+        last_key = key
+    prev_section_title = entry["section_title"]
+    prev_subsection_title = entry["subsection_title"]
+
+# Flush final range
+if last_key is not None and range_start is not None:
+    compact_ranges.append({
+        "from_line": range_start,
+        "to_line": index[-1]["line"],
+        "section": last_key[0],
+        "subsection": last_key[1],
+        "section_title": prev_section_title,
+        "subsection_title": prev_subsection_title
+    })
+
+out = {
+    "applicable": any(e["section"] is not None for e in index),
+    "ranges": compact_ranges
+}
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(out, f, ensure_ascii=False, indent=2)
+PY
+```
+
+The output shape is `{"applicable": bool, "ranges": [{from_line, to_line, section, subsection, section_title, subsection_title}]}`. When the body has no numbered sections, `applicable: false` and `ranges: []`. Lens runners use this for `section_ref` lookups; Phase 7 renderer uses it for section-aware report headings.
+
+**Lookup helper** (downstream lens runners + Phase 7 use this):
+- Given a line number L, find the range R where `R.from_line <= L <= R.to_line`.
+- If R exists AND R.section is not null: `section_ref = {"section": R.section, "subsection": R.subsection, "section_title": R.section_title, "subsection_title": R.subsection_title}`.
+- Otherwise: `section_ref = null` (line is outside any numbered section, e.g. preamble).
+
+### Rule extraction
 
 Read `$RUN_DIR/body.txt`. Number lines starting at 1, **including blank lines**, so that `body.txt` line N maps to original-file line `N + frontmatter.body_line_offset - 1`. Extract every atomic rule, instruction, constraint, or directive into a flat list. Apply the criteria in `references/lens-rules.md` section "Rule extraction" — split compound sentences, preserve absolutes ("always", "never"), use the lowest line where the rule begins.
 
@@ -426,7 +548,8 @@ Agent({
       lens_rules_ref:  "<absolute path to skills/prompt-check/references/lens-rules.md>",
       selected_lenses: <subset of ["conflict", "dominance", "gap", "schema"] from user_intent>,
       compact_mode:    <bool from frontmatter.compact_mode>,
-      max_char_limit:  <int from frontmatter.max_char_limit>
+      max_char_limit:  <int from frontmatter.max_char_limit>,
+      section_index:   "<absolute path to $RUN_DIR/section_index.json>"
     },
     output_paths: {
       conflicts:  "<absolute path to $RUN_DIR/conflicts.json>",
@@ -501,7 +624,8 @@ Agent({
       probes_ref:            "<absolute path to skills/prompt-check/references/probes.md>",
       expand_count_override: 3,  // ← from user_intent.expand_count; takes precedence over frontmatter
       compact_mode:          <bool from frontmatter.compact_mode>,
-      max_char_limit:        <int from frontmatter.max_char_limit>
+      max_char_limit:        <int from frontmatter.max_char_limit>,
+      section_index:         "<absolute path to $RUN_DIR/section_index.json>"
     },
     output_path: "<absolute path to $RUN_DIR/drift.json>"
   }),
@@ -550,7 +674,8 @@ Agent({
       tr_phonetic_ref:       "<absolute path to skills/prompt-check/references/tr-phonetic.md>",
       user_intent_tr_phonetic: true,  // ← from user_intent.tr_phonetic_enabled; runtime authoritative
       compact_mode:          <bool from frontmatter.compact_mode>,
-      max_char_limit:        <int from frontmatter.max_char_limit>
+      max_char_limit:        <int from frontmatter.max_char_limit>,
+      section_index:         "<absolute path to $RUN_DIR/section_index.json>"
     },
     output_path: "<absolute path to $RUN_DIR/tr_phonetic.json>"
   }),
@@ -561,6 +686,8 @@ Agent({
 Populate `user_intent_tr_phonetic` with `user_intent.tr_phonetic_enabled`. The runner's defensive guard checks this field instead of `frontmatter.tr_phonetic`, so user runtime overrides survive even when the frontmatter default would have suppressed the lens.
 
 TR phonetic is already line-level / cheap; `compact_mode` has no effect on its analysis. The fields are passed for symmetry and future use (logging, telemetry).
+
+**Section_index propagation (applies to every runner — Phase 4 / 5 / 6).** Every runner receives `section_index` so it can attach a `section_ref` to each finding via line lookup. Runners that don't need section context still receive the path — they simply ignore it. Findings without a section context get `section_ref: null`. Runs from versions before this field existed (no `section_index.json` on disk) are handled gracefully: runners that find the file missing skip the lookup and emit `section_ref: null` on every finding; Phase 7's renderer falls back to bare line markers.
 
 `tr-phonetic-runner` writes `$RUN_DIR/tr_phonetic.json` with shape `{ findings[], seed_entries[], warnings[] }`. The skill reads it in Phase 7.
 
@@ -602,6 +729,107 @@ Apply this to every `findings[].line` and `findings[].related_lines[]`. After tr
 
 **Carry the prompt hash:** copy `frontmatter.prompt_sha256` into the top of findings.json so Phase 10's applied step can detect a stale audit and auto-route to overlay.
 
+**Section_ref attachment (mandatory):** For every finding, attach a `section_ref` object using `section_index.json`. Look up `finding.line` (the post-translation original-file line — but `section_index.json` was built from body.txt, so do the lookup BEFORE applying `body_line_offset`, or apply the offset to the index ranges first; the simpler path is to record `section_ref` while still in body.txt coordinates, then translate `line` / `related_lines` independently — `section_ref` carries no line numbers itself). When `section_index.applicable == false` OR the line falls outside every range, emit `section_ref: null`. Never omit the field — explicit null signals "line outside any numbered section".
+
+For backward compatibility: if `section_index.json` does not exist (older run dirs from before this feature), set `section_ref: null` for every finding without crashing. The renderer below also falls back to bare line markers when `section_ref` is null.
+
+**Language switching (mandatory):** Load `frontmatter.report_language` (`tr` or `en`; default `tr` — Phase 2 already normalised it). Use this as the key into `TEMPLATE_STRINGS` (defined below). Apply throughout the report.md render: title, top metadata labels, summary heading + column headers + lens row labels, findings heading, severity sub-headings, lens-group sub-headings, "none" marker, section/line prefixes inside finding headers, and the per-finding body labels (Current / Fix / Action / Rationale / Diff).
+
+```
+TEMPLATE_STRINGS = {
+  "tr": {
+    "report_title": "PromptChecker Raporu — {basename}",
+    "prompt_label": "**Prompt:**",
+    "run_label": "**Çalıştırma:**",
+    "generated_label": "**Oluşturulma:**",
+    "target_model_label": "**Hedef model:**",
+    "summary_heading": "## Özet",
+    "lens_column": "Mercek",
+    "total_column": "Toplam",
+    "high_column": "Yüksek",
+    "medium_column": "Orta",
+    "low_column": "Düşük",
+    "conflict_row": "Çelişki",
+    "dominance_row": "Baskınlık",
+    "gap_row": "Boşluk",
+    "schema_row": "Şema",
+    "drift_row": "Davranışsal sapma",
+    "tr_phonetic_row": "Türkçe fonetik",
+    "findings_heading": "## Bulgular",
+    "high_severity_heading": "### Yüksek önem",
+    "medium_severity_heading": "### Orta önem",
+    "low_severity_heading": "### Düşük önem",
+    "conflicts_subheading": "#### Çelişkiler",
+    "dominances_subheading": "#### Baskınlıklar",
+    "gaps_subheading": "#### Boşluklar",
+    "schema_subheading": "#### Şema",
+    "drift_subheading": "#### Davranışsal sapma",
+    "tr_phonetic_subheading": "#### Türkçe fonetik",
+    "none_marker": "_(yok)_",
+    "section_prefix": "Bölüm",
+    "line_prefix": "Satır",
+    "current_label": "**Mevcut:**",
+    "fix_label": "**Düzeltme:**",
+    "action_label": "**Eylem:**",
+    "rationale_label": "**Gerekçe:**",
+    "diff_label": "**Değişiklik:**"
+  },
+  "en": {
+    "report_title": "PromptChecker Report — {basename}",
+    "prompt_label": "**Prompt:**",
+    "run_label": "**Run:**",
+    "generated_label": "**Generated:**",
+    "target_model_label": "**Target model:**",
+    "summary_heading": "## Summary",
+    "lens_column": "Lens",
+    "total_column": "Total",
+    "high_column": "High",
+    "medium_column": "Medium",
+    "low_column": "Low",
+    "conflict_row": "Conflict",
+    "dominance_row": "Dominance",
+    "gap_row": "Gap",
+    "schema_row": "Schema",
+    "drift_row": "Drift",
+    "tr_phonetic_row": "TR phonetic",
+    "findings_heading": "## Findings",
+    "high_severity_heading": "### HIGH severity",
+    "medium_severity_heading": "### MEDIUM severity",
+    "low_severity_heading": "### LOW severity",
+    "conflicts_subheading": "#### Conflicts",
+    "dominances_subheading": "#### Dominances",
+    "gaps_subheading": "#### Gaps",
+    "schema_subheading": "#### Schema",
+    "drift_subheading": "#### Drift",
+    "tr_phonetic_subheading": "#### TR phonetic",
+    "none_marker": "_None._",
+    "section_prefix": "Section",
+    "line_prefix": "L",
+    "current_label": "**Current:**",
+    "fix_label": "**Fix:**",
+    "action_label": "**Action:**",
+    "rationale_label": "**Rationale:**",
+    "diff_label": "**Diff:**"
+  }
+}
+```
+
+Lens-generated content (`rationale`, `suggested_fix`, `current_excerpt`) is NOT translated — it stays in whatever language the runner produced. Only the skill-side template strings above switch language. So an English conflict rationale remains English in a TR report; the surrounding section headings and labels translate.
+
+**Section-aware finding headers.** Each finding bullet currently looks like `**L<line>** [C1 severity=high, R3↔R8] — <rationale>`. With `section_ref`, the bullet header becomes:
+
+- When `section_ref.subsection` is present (most common case):
+  - `tr` →  `**Bölüm 7.2 — Satır 284** [C1 severity=high, R3↔R8] — <rationale>`
+  - `en` →  `**Section 7.2 — L284** [C1 severity=high, R3↔R8] — <rationale>`
+- When `section_ref` is non-null but `section_ref.subsection` is null (line in a section but not in a subsection):
+  - `tr` →  `**Bölüm 7 — Satır 284** [...]`
+  - `en` →  `**Section 7 — L284** [...]`
+- When `section_ref` is null (line outside any numbered section, e.g. preamble):
+  - `tr` →  `**Satır 284** [...]`
+  - `en` →  `**L284** [...]`
+
+The prefixes (`Bölüm` / `Section`, `Satır` / `L`) come from `TEMPLATE_STRINGS[lang]["section_prefix"]` and `TEMPLATE_STRINGS[lang]["line_prefix"]`.
+
 ### `$RUN_DIR/findings.json`
 
 ```json
@@ -631,6 +859,12 @@ Apply this to every `findings[].line` and `findings[].related_lines[]`. After tr
       "fix_kind": "replace|advisory",
       "severity": "low|medium|high",
       "line": 42,
+      "section_ref": {
+        "section": "7",
+        "subsection": "7.2",
+        "section_title": "VALUE FRAMING AXES",
+        "subsection_title": "MÜBADELE VALUE HIERARCHY"
+      },
       "related_lines": [42, 47],
       "current_excerpt": "<verbatim from body.txt>",
       "suggested_fix": "<concrete edit — populated only for fix_kind: replace>",
@@ -663,6 +897,8 @@ Apply this to every `findings[].line` and `findings[].related_lines[]`. After tr
 ```
 
 `pronunciation_map` is the union of `tr_phonetic.json.seed_entries` (entries the prompt already had — `source: "seed"`) and the `pronunciation_entry` payload of TR findings (`source: "finding"`). Dedupe by `term` (case-insensitive); if a seed entry and a finding entry collide, **seed wins** (the author's curated text is the source of truth). It is a flat reference list rendered in `report.md` and surfaced in `findings.json` for downstream tooling — Phase 10 never injects it back into the prompt.
+
+`section_ref` is a new top-level field on EVERY finding. Shape: `{"section": "<n>", "subsection": "<n.m> | null", "section_title": "<str | null>", "subsection_title": "<str | null>"}`. When the finding's line falls outside every numbered section (e.g. preamble before SECTION 1), emit `section_ref: null` explicitly — absent field is ambiguous; explicit null signals "line outside any numbered section". Lookup is via `section_index.json` (built in Phase 3). When `section_index.json` does not exist on disk (runs from older versions), set `section_ref: null` on every finding and let the renderer fall back to bare line markers.
 
 **`summary.schema` shape variants** depend on the lens state and follow the Schema findings merging rules above:
 
@@ -702,66 +938,70 @@ For each finding:
 
 ### `$RUN_DIR/report.md`
 
+The template skeleton below is shown in `en` (English) for readability; the actual rendered output uses `TEMPLATE_STRINGS[frontmatter.report_language]` for every label. The structural layout (heading levels, table columns, severity grouping, lens grouping) is identical across both languages — only the text translates.
+
 ```markdown
-# PromptChecker Report — <basename>
+# <report_title — TEMPLATE_STRINGS.report_title with {basename} interpolation>
 
-- **Prompt:** `<absolute path>`
-- **Run:** `<run-NNN>`
-- **Generated:** <ISO 8601>
-- **Target model:** <target_model>
+- <prompt_label> `<absolute path>`
+- <run_label> `<run-NNN>`
+- <generated_label> <ISO 8601>
+- <target_model_label> <target_model>
 
-## Summary
+<summary_heading>
 
-| Lens | Total | High | Medium | Low |
+| <lens_column> | <total_column> | <high_column> | <medium_column> | <low_column> |
 |---|---|---|---|---|
-| Conflict | … | … | … | … |
-| Dominance | … | … | … | … |
-| Gap | … | … | … | … |
-| Schema | … | … | … | … | (render `Schema | 0 (not applicable — no numbered section headings)` when `applicable: false`; render `Schema | 0 (skipped — lens deselected)` when `applicable: null && skipped: true`)
-| Drift | <scenarios>: <passed>✓ / <failed>✗ | — | — | — |
-| TR phonetic | … | … | … | … | (omit row if tr_phonetic disabled)
+| <conflict_row> | … | … | … | … |
+| <dominance_row> | … | … | … | … |
+| <gap_row> | … | … | … | … |
+| <schema_row> | … | … | … | … | (render `<schema_row> | 0 (not applicable — no numbered section headings)` when `applicable: false`; render `<schema_row> | 0 (skipped — lens deselected)` when `applicable: null && skipped: true`)
+| <drift_row> | <scenarios>: <passed>✓ / <failed>✗ | — | — | — |
+| <tr_phonetic_row> | … | … | … | … | (omit row if tr_phonetic disabled)
 
-## Findings
+<findings_heading>
 
 (Grouped by severity, then by lens. Within each (severity, lens) group, findings are line-ordered.)
 
-### HIGH severity
+<high_severity_heading>
 
-#### Conflicts
-- **L<line>** [<id> severity=high, R<a>↔R<b>] — <rationale>
+<conflicts_subheading>
+- **<section_prefix> 7.2 — <line_prefix>284** [<id> severity=high, R<a>↔R<b>] — <rationale>
   - <diff-aware body — see render rules below>
-- (or "_None._" if no high-severity conflicts)
+- (or "<none_marker>" if no high-severity conflicts)
 
-#### Dominances
+<dominances_subheading>
 - ...
 
-#### Gaps
+<gaps_subheading>
 - ...
 
-#### Schema
+<schema_subheading>
 - ...
-- (or "_Not applicable — no numbered section headings detected._" when `summary.schema.applicable == false`)
-- (or "_Skipped — lens deselected in wizard._" when `summary.schema.applicable == null && summary.schema.skipped == true`)
+- (or "_Not applicable — no numbered section headings detected._" / "_Şema uygulanabilir değil — numaralandırılmış başlık yok._" when `summary.schema.applicable == false`)
+- (or "_Skipped — lens deselected in wizard._" / "_Atlandı — mercek sihirbazda seçilmedi._" when `summary.schema.applicable == null && summary.schema.skipped == true`)
 
-#### Drift
-- ...
-
-#### TR phonetic
+<drift_subheading>
 - ...
 
-### MEDIUM severity
+<tr_phonetic_subheading>
+- ...
 
-#### Conflicts
+<medium_severity_heading>
+
+<conflicts_subheading>
 - ...
 
 (etc.)
 
-### LOW severity
+<low_severity_heading>
 
 (etc.)
 ```
 
-If an entire severity bucket has zero findings across all lenses, omit that bucket entirely (don't render "### HIGH severity\n_None._"). If a (severity, lens) pair has zero findings, render the section heading with "_None._" so the structure stays consistent.
+If an entire severity bucket has zero findings across all lenses, omit that bucket entirely (don't render the severity heading followed by "_None._"). If a (severity, lens) pair has zero findings, render the lens sub-heading with `none_marker` (TEMPLATE_STRINGS-driven) so the structure stays consistent.
+
+The finding-header line itself uses the section-aware format described above (`Section 7.2 — L284` / `Bölüm 7.2 — Satır 284`); when `section_ref` is null fall back to the bare line marker (`L284` / `Satır 284`); when `section_ref.subsection` is null but `section_ref.section` is present, drop the subsection part (`Section 7 — L284` / `Bölüm 7 — Satır 284`).
 
 **Drift section special-case:** when drift was skipped at the run level (`drift.json.skipped_reason` is set), render a single `_Skipped — <skipped_reason>._` line under whichever severity bucket the drift scenarios would have landed in, OR under HIGH if no severity context exists. Per-scenario rendering still uses:
 
@@ -839,6 +1079,10 @@ ln -sfn "$RUN_NAME" "$PROMPT_DIR/latest"
 
 If `frontmatter.config_warnings[]` is non-empty, include them in the summary so the user notices typos / removed fields.
 
+**Language switching.** The Phase 8 summary block also honours `frontmatter.report_language`. The body of the summary (file paths, counts, run identifier) stays the same across languages — only the human-readable labels translate. Two canonical templates follow.
+
+**`en` (English) template:**
+
 ```
 PromptChecker complete — <run-NNN>
 
@@ -847,18 +1091,48 @@ PromptChecker complete — <run-NNN>
 - TR phonetic: <disabled|<N> findings>
 - <K> TR pronunciation findings auto-filed to overlay's pronunciation_map (foreign_word: <a>, abbreviation: <b>)
 
-Report:   <relative path to $RUN_DIR/report.md>
-Findings: <relative path to $RUN_DIR/findings.json>
-Pronunciations master: .promptcheck/<basename>/pronunciations.md (<M> unique terms across <N> runs)
+Report:          <relative path to $RUN_DIR/report.md>
+Findings:        <relative path to $RUN_DIR/findings.json>
+Session:         <relative path to $RUN_DIR/session.json>
+Decisions log:   <relative path to $RUN_DIR/decisions.jsonl>
+Overlay:         <relative path to $RUN_DIR/inline-suggestions.md>
+Pronunciations:  .promptcheck/<basename>/pronunciations.md (<M> unique terms across <N> runs)
 Previous runs: .promptcheck/<basename>/ (run-001 … run-NNN)
 Repo defaults: <relative path to .promptchecker.json>
-- Body size: <body_char_count> chars [compact mode <ACTIVE | inactive — under <max_char_limit> char threshold | DISABLED via max_char_limit=0>]
+Body size: <body_char_count> chars [compact mode <ACTIVE | inactive — under <max_char_limit> char threshold | DISABLED via max_char_limit=0>]
 
 Entering interactive review (Phase 9). Use a compact decision string such as
   "C1, C3 düzelt; G2 yorum bırak; T1..T5 konuşalım; gerisini atla"
 to choose what to do with each finding. Type "iptal" to leave the session as
 pending and resume later with /prompt-check-resume.
 ```
+
+**`tr` (Türkçe) template:**
+
+```
+PromptChecker tamamlandı — <run-NNN>
+
+- Kurallar: <N> | Çelişki: <N> (<H> yüksek) | Baskınlık: <N> | Boşluk: <N> | Şema: <N> (<M> yüksek) [uygulanabilir: <AKTİF | DEĞİL | ATLANDI>]
+- Davranışsal sapma: <atlandı|<N> senaryo, <P> geçti, <F> kaldı>
+- Türkçe fonetik: <devre dışı|<N> bulgu>
+- <K> Türkçe telaffuz bulgusu overlay'in pronunciation_map bölümüne otomatik kaydedildi (foreign_word: <a>, abbreviation: <b>)
+
+Rapor:           <relative path to $RUN_DIR/report.md>
+Bulgular:        <relative path to $RUN_DIR/findings.json>
+Oturum:          <relative path to $RUN_DIR/session.json>
+Karar günlüğü:   <relative path to $RUN_DIR/decisions.jsonl>
+Overlay:         <relative path to $RUN_DIR/inline-suggestions.md>
+Telaffuz ana:    .promptcheck/<basename>/pronunciations.md (<M> benzersiz terim, <N> koşu boyunca)
+Önceki koşular: .promptcheck/<basename>/ (run-001 … run-NNN)
+Repo varsayılan: <relative path to .promptchecker.json>
+Body boyutu: <body_char_count> chars [compact mode <AKTİF | inaktif — <max_char_limit> char eşiğin altında | DEVRE DIŞI (max_char_limit=0)>]
+
+Etkileşimli incelemeye geçiyorum (Faz 9). Karar dizesi olarak şu örneği kullanabilirsin:
+  "C1, C3 düzelt; G2 yorum bırak; T1..T5 konuşalım; gerisini atla"
+Oturumu beklemeye almak için "iptal" yaz; sonra /prompt-check-resume ile devam edebilirsin.
+```
+
+Note that the *example* decision string inside both templates stays Turkish even in `en` mode — the verb tokens (`düzelt`, `yorum bırak`, `konuşalım`, `atla`, `iptal`, `evet`) are the parser's canonical keywords (see `references/dialog-flow.md`). English synonyms (`fix`, `note`, `discuss`, `skip`, `cancel`, `yes`) are still accepted; the example just shows the Turkish form because it is the documented default. Phase 9 dialog prompts in the decision-string ask surface in the chosen language as well, but the verb tokens stay Turkish in both modes.
 
 The auto-filed line is shown ONLY when the count is non-zero. It sits alongside the existing rules / conflicts / dominances / gaps / schema / drift / TR phonetic counts. **The TR phonetic count line still shows the TOTAL TR findings (advisory + replace) — the auto-filed line is an additional drill-down, not a replacement.** Compute `K` as the number of TR findings with `lens == "tr_phonetic" AND fix_kind == "advisory"`; `a` = count where `kind == "foreign_word"`; `b` = count where `kind == "abbreviation"`. These are the same findings that Phase 9.2's partition will assign to AUTO_FILED_SET.
 
@@ -1592,3 +1866,5 @@ Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. 
 - Don't merge schema findings into findings.json when `schema.json.applicable == false`. Auto-skipped lenses contribute zero findings — the summary just notes the reason. Adding a phantom `Schema: 0` row without applicability context is misleading on flat prompts.
 - Don't apply compact mode when `max_char_limit == 0`. Zero explicitly disables the threshold; the body can be arbitrarily large without triggering cheaper policies.
 - Don't treat compact mode as a hard abort. The audit STILL runs — it just runs with cheaper-per-lens policies. Severity floors, pair budgets, and drift halving are the contract; never use compact mode as an excuse to skip a lens entirely.
+- Don't translate lens-generated content (rationale, suggested_fix, current_excerpt) in Phase 7. Only skill-side template strings translate. A lens runner that wrote an English rationale stays English in a TR report.
+- Don't omit `section_ref: null` from findings.json — emit it explicitly (null is a valid value, signalling "line outside any numbered section"). Absent field is ambiguous; explicit null is clear.
