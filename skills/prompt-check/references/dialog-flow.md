@@ -100,7 +100,7 @@ The user's reply is a single free-form string. Parse it into a list of `(finding
 
 | Turkish | English aliases | Resulting status |
 |---|---|---|
-| `düzelt`, `uygula` | `apply`, `fix` | `applied` (TR findings auto-routed to `overlay` — see §4) |
+| `düzelt`, `uygula` | `apply`, `fix` | `applied` (TR `foreign_word` / `abbreviation` auto-routed to `overlay` — see §4) |
 | `yorum bırak`, `not düş`, `kenara koy` | `overlay`, `comment` | `overlay` |
 | `atla`, `geç`, `bırak` | `skip`, `dismiss` | `dismissed` |
 | `konuşalım`, `tartış`, `inceleyelim` | `discuss`, `talk` | `discussed` (transient — triggers sub-flow in §5) |
@@ -113,8 +113,8 @@ The parser is LLM-driven, not regex-driven. Natural variants (`fix bunları`, `�
 |---|---|
 | `gerisini atla` / `rest skip` / `dismiss rest` | All findings still `pending` → `dismissed` |
 | `gerisini yorum` / `gerisini yorum bırak` / `rest overlay` | All findings still `pending` → `overlay` |
-| `gerisini düzelt` / `rest apply` / `apply rest` | All findings still `pending` → `applied` (TR auto-routed to `overlay` — see §4) |
-| `hepsini düzelt` / `hepsini apply` / `tümü düzelt` / `tümünü düzelt` / `all apply` / `apply all` / `fix all` | Every finding → `applied` (TR auto-routed to `overlay` — see §4), overriding any earlier per-id decision in the same string |
+| `gerisini düzelt` / `rest apply` / `apply rest` | All findings still `pending` → `applied` (TR `foreign_word` / `abbreviation` auto-routed to `overlay` — see §4) |
+| `hepsini düzelt` / `hepsini apply` / `tümü düzelt` / `tümünü düzelt` / `all apply` / `apply all` / `fix all` | Every finding → `applied` (TR `foreign_word` / `abbreviation` auto-routed to `overlay` — see §4), overriding any earlier per-id decision in the same string |
 | `hepsini yorum bırak` / `tümü overlay` / `all overlay` / `comment all` | Every finding → `overlay`, overriding any earlier per-id decision |
 | `hepsini atla` / `tümü atla` / `all skip` / `skip all` / `dismiss all` | Every finding → `dismissed`, overriding any earlier per-id decision |
 | `hepsini konuşalım` / `tümünü konuşalım` / `discuss all` | Every finding → `discussed` (rare; mainly for edge cases) |
@@ -155,8 +155,8 @@ After parsing, surface a one-paragraph plan **before** Phase 10 dispatches:
 
 ```
 Plan:
-  applied  → C1, C3
-  overlay  → G2, T1, T2, T3, T4, T5  (T1..T5 auto-routed: TR phonetic)
+  applied  → C1, C3, T4, T5  (T4..T5: TR number_readability / punctuation — normal apply)
+  overlay  → G2, T1, T2, T3  (T1..T3 auto-routed: TR foreign_word / abbreviation)
   dismissed → C2, D1, D2, G1
   discussed → (none)
 Warnings: unknown finding id: Z9 — skipped
@@ -165,21 +165,23 @@ Proceed? (yes/no)
 
 Wait for explicit confirmation before any side-effect. If the user says no, return to the free-form decision prompt with the same findings table.
 
-## 4 — TR routing rule (hard)
+## 4 — TR routing rule (per-category)
 
-Every finding with `lens == "tr_phonetic"` is **force-routed to `overlay`**, regardless of the verb the user typed.
+TR phonetic findings split into two routing buckets based on `kind`:
 
-- This applies to `düzelt`, `apply`, and `fix` — they would otherwise modify the prompt file.
-- It does NOT apply to `atla` (still dismissed) or `konuşalım` (still enters the sub-flow — but inside the sub-flow, "kabul et" and "ben revize ediyorum → apply" also redirect to overlay).
-- The skill MUST surface the redirect explicitly, one line per finding, before dispatch:
+- **`foreign_word` / `abbreviation` → force-routed to `overlay`**, regardless of the verb the user typed. These findings carry `fix_kind: "advisory"`; pronunciation hints (DHL → "de-ha-el", Gaggia → "gacca") are voice-design decisions the author owns, and a silent prompt edit would corrupt the visible script.
+- **`number_readability` / `punctuation` → normal apply flow**. These findings carry `fix_kind: "replace"`. `düzelt` modifies the prompt file just like a `conflict` or `gap` finding; `yorum bırak` routes to overlay; `atla` dismisses.
 
-```
-T3 TR phonetic — auto-routed to overlay (TR findings never modify the prompt file).
-```
+`atla` always dismisses. `konuşalım` still enters the sub-flow for any TR `kind` — but inside the sub-flow, "kabul et" and "ben revize ediyorum → apply" on a `foreign_word` / `abbreviation` finding redirect to overlay (the advisory rule still holds inside discussion).
 
-This rule is non-negotiable. There is no opt-out flag, no frontmatter switch, no env var. The prompt file is the author's curated text; TR pronunciation belongs in the overlay.
+The advisory rule for `foreign_word` / `abbreviation` is non-negotiable. There is no opt-out flag, no frontmatter switch, no env var. The prompt file is the author's curated text; pronunciation belongs in the overlay.
 
-**Wildcard visibility.** When a wildcard verb (`hepsini düzelt`, `gerisini düzelt`, `apply all`, etc.) hits a TR phonetic finding, surface the redirect EXPLICITLY per finding: `T3 TR phonetic — auto-routed to overlay (TR findings never modify the prompt file).` This is mandatory — silent redirects confuse the user (cf. real runtime: user said `hepsini düzelt`, plugin applied 0, user surprised). Always announce the redirect line by line, then proceed with the rest of the wildcard's effect.
+**Wildcard visibility.** When a wildcard verb (`hepsini düzelt`, `gerisini düzelt`, `apply all`, etc.) hits a TR phonetic finding, the action depends on `kind`:
+
+- `foreign_word` / `abbreviation` → auto-route to overlay, surface the redirect explicitly per finding: `T1 TR foreign_word — auto-routed to overlay (voice-design, prompt text never modified).`
+- `number_readability` / `punctuation` → normal apply flow, no special surface line (the finding is applied or routed exactly like a non-TR finding).
+
+This split is mandatory — silent redirects confuse the user (cf. real runtime: user said `hepsini düzelt`, plugin applied 0, user surprised). Always announce the per-category redirect for `foreign_word` / `abbreviation`, then proceed with the rest of the wildcard's effect.
 
 ## 5 — "Konuşalım" sub-flow (Phase 10, for `status: discussed`)
 
@@ -217,7 +219,7 @@ options:
 | Answer | Action |
 |---|---|
 | `kabul et` | Apply `suggested_fix` (or overlay if TR per §4). Log `action: "discussed"` then `action: "applied"` (or `"overlay"`) to decisions.jsonl. |
-| `ben revize ediyorum` | Open a free-form prompt: `Type the replacement text:`. Read the user's next message verbatim. Then ask via AskUserQuestion: `Apply this to the prompt file, or write it to the overlay?` (two options: `düzelt` / `yorum bırak`; TR findings have only `yorum bırak` per §4). Log `action: "discussed"` → `action: "revised"` with `from`/`to` fields → final `action: "applied"` or `"overlay"`. |
+| `ben revize ediyorum` | Open a free-form prompt: `Type the replacement text:`. Read the user's next message verbatim. Then ask via AskUserQuestion: `Apply this to the prompt file, or write it to the overlay?` (two options: `düzelt` / `yorum bırak`; TR `foreign_word` / `abbreviation` findings have only `yorum bırak` per §4 — TR `number_readability` / `punctuation` findings offer both). Log `action: "discussed"` → `action: "revised"` with `from`/`to` fields → final `action: "applied"` or `"overlay"`. |
 | `yorum bırak` | Write to overlay. Log `action: "discussed"` → `action: "overlay"`. |
 | `atla` | No file changes. Log `action: "discussed"` → `action: "dismissed"`. |
 

@@ -47,7 +47,7 @@ The grammar accepts Turkish and English keywords:
 
 For findings you say "konuşalım" to, PromptChecker enters a per-finding dialogue: you see the full finding, then choose: accept the default suggestion / revise it yourself / route to overlay / dismiss. The dialogue terminates when every discussed finding has a final status.
 
-**TR phonetic exception:** even if you say `düzelt` for a TR finding, PromptChecker routes it to the overlay instead. Phonetic adjustments and pronunciation choices are voice-design decisions the author owns; false positives are common, and a silent prompt edit can poison a Vapi / ElevenLabs script.
+**TR phonetic — split by category.** For `foreign_word` and `abbreviation` findings, `düzelt` is auto-routed to the overlay (pronunciation hints are voice-design decisions the author owns — a silent prompt edit can poison a Vapi / ElevenLabs script). For `number_readability` and `punctuation` findings, `düzelt` follows the normal apply flow and modifies the prompt — these are textual corrections like missing commas or malformed Turkish numbers.
 
 Every decision lands in three places under `.promptcheck/<basename>/run-NNN/`:
 - `session.json` — current snapshot (what's pending, what's applied, what's overlay, what's dismissed)
@@ -66,15 +66,17 @@ Mid-session interruption is fine. Run `/prompt-check-resume` later and it re-ent
 | **Dominance** | Rules that silently override others through position, length, specificity, recency, or role-override patterns ("ignore previous instructions…") | yes |
 | **Gap** | Undefined edge cases (incomplete conditionals) and ambiguous terms ("appropriate", "reasonable") that the prompt's own rules raise | yes |
 | **Drift** | Behavioural mismatch between the prompt's stated rules and the model's actual output, surfaced by adversarial scenarios | only when anchors / conflicts / role-overrides exist (skipped otherwise) |
-| **TR phonetic** | Numbers, abbreviations, foreign words, and pacing problems that break Turkish text-to-speech. TR phonetic findings are advisory-only — always routed to overlay, even on `düzelt`. The original prompt file is never modified by them. | opt-in via `tr_phonetic: true` frontmatter or project config |
+| **TR phonetic** | Numbers, abbreviations, foreign words, and pacing problems that break Turkish text-to-speech. Split by category: `foreign_word` + `abbreviation` routed to overlay (voice-design — prompt text never modified); `number_readability` + `punctuation` follow normal apply flow (`düzelt` modifies the prompt). | opt-in via `tr_phonetic: true` frontmatter or project config |
 
-### TR phonetic — advisory only, never auto-applied
+### TR phonetic — split by category
 
-The TR lens is **report-only**. Every TR finding has `fix_kind: "advisory"` and PromptChecker never modifies your prompt because of one — no substring replacement, no pronunciation block injection. Phonetic adjustments and pronunciation hints are voice-design decisions the human author owns; false positives are common (proper nouns, brand voice, dialect choice), and a silently-inserted block can poison a Vapi / ElevenLabs script in subtle ways.
+The TR lens splits its four detection categories into two routing buckets, so voice-design decisions stay overlay-only while textual corrections follow the normal apply flow.
 
-What you get instead: a rich `report.md` section listing every flagged line, the four detection categories (`number_readability`, `abbreviation`, `foreign_word`, `punctuation`), a concrete suggestion (`suggested_fix` for textual issues like `100 TL → yüz lira`, or a `pronunciation_entry` for foreign words like `DHL → "de-ha-el"`), and a top-level `pronunciation_map` summary so you can see at a glance every risky term the lens spotted. The lens never translates: `pound → paund` is a phonetic hint; `pound → İngiliz lirası` is forbidden semantic substitution.
+- **`foreign_word` + `abbreviation`: advisory-only.** Pronunciation hints for `Gaggia → "gacca"` or `DHL → "de-ha-el"` carry `fix_kind: "advisory"` and always land in the overlay file (`inline-suggestions.md`); the prompt text is never auto-edited, even on `düzelt`. The author hand-merges these into a TTS pronunciation guide block or the voice provider's config. A silent prompt edit (`DHL` becoming `de-ha-el` in the visible script) would corrupt the meaning, so this routing is non-negotiable.
+- **`number_readability` + `punctuation`: normal apply flow.** Missing commas, malformed Turkish numbers, monetary spelling (`100 TL → yüz lira`) — these ARE textual fixes. They carry `fix_kind: "replace"`. When the user picks `düzelt` in the Phase 9 dialogue, Phase 10 modifies the prompt file just like a `conflict` or `gap` finding. The user can still route them to overlay via `yorum bırak` per-finding when they want to review by hand.
+- **Migration note:** the TR routing rule from earlier versions was over-strict — it forced every TR finding to overlay regardless of category, even when the user explicitly said `düzelt` on a textual fix like a missing comma. v0.4.2 fixes this: only the voice-design categories (`foreign_word`, `abbreviation`) stay advisory.
 
-In the interactive session, even if you say `düzelt` for a TR finding PromptChecker routes it to the overlay (`inline-suggestions.md`) instead of editing the prompt. Both the `suggested_fix` text and the `pronunciation_entry` land in the overlay so you can hand-merge them on your terms — edit the prompt yourself, add a pronunciation guide block, or rephrase.
+The lens never translates: `pound → paund` is a phonetic hint; `pound → İngiliz lirası` is forbidden semantic substitution.
 
 All five lenses live in `skills/prompt-check/SKILL.md` and its `references/`.
 
@@ -183,8 +185,8 @@ Every run gets its own directory. Older runs are preserved so you can diff audit
 
 Each finding declares one of two `fix_kind` values:
 
-- `replace` — substring replacement (`current_excerpt` → `suggested_fix`). Emitted by `conflict`, `dominance`, `gap`, and `drift` lenses only.
-- `advisory` — reported only, never auto-applied. **Every TR phonetic finding uses this**, even when `suggested_fix` or `pronunciation_entry` is populated. The author decides whether and how to act on TR suggestions.
+- `replace` — substring replacement (`current_excerpt` → `suggested_fix`). Emitted by `conflict`, `dominance`, `gap`, `drift` lenses, and TR phonetic findings with `kind: "number_readability"` or `kind: "punctuation"`.
+- `advisory` — reported only, never auto-applied. Emitted by TR phonetic findings with `kind: "foreign_word"` or `kind: "abbreviation"` (the `pronunciation_entry` lands in the overlay for the author to hand-merge into a TTS pronunciation guide).
 
 After the summary, you make per-finding decisions in free-form text (see Usage above). The skill carries out each decision in Phase 10.
 
