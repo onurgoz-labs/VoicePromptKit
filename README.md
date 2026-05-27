@@ -232,15 +232,17 @@ Every field is optional. Most users only override `anchors` (per-prompt regressi
 
 ## Pipeline
 
-The plugin runs one orchestrating skill that fans out to three subagents for the lens work. `static-lens-runner` is dispatched on every run; `drift-runner` and `tr-phonetic-runner` are conditional (drift only when anchors / conflicts / role-overrides exist AND `expand_count > 0`; TR only when `tr_phonetic: true`). Phases 4-6 happen in parallel where possible — the skill dispatches all eligible subagents in one fan-out and awaits all results before Phase 7.
+The plugin runs one orchestrating skill that fans out to three subagents for the lens work. `static-lens-runner` is dispatched on every run; `drift-runner` and `tr-phonetic-runner` are conditional (drift only when anchors / conflicts / role-overrides exist AND `expand_count > 0`; TR only when `tr_phonetic: true`).
+
+**Parallel topology:** Phase 4 (static lenses) and Phase 6 (TR phonetic) are independent — the skill dispatches both subagents in a single message with two concurrent `Agent` calls. Phase 5 (drift) is **downstream of Phase 4** because drift-runner reads `conflicts.json`, `gaps.json`, and `dominances.json` as inputs; it runs after Phase 4 lands.
 
 1. **Phase 0** — First-run wizard or load existing `.promptchecker.json`.
 2. **Phase 1** — Allocate a fresh `run-NNN` directory (atomic; `latest` symlink is updated only on success).
 3. **Phase 2** — Parse frontmatter deterministically and split body. Stores `body_line_offset` and `prompt_sha256` for line-mapping and stale-audit checks.
 4. **Phase 3** — Extract atomic, line-anchored rules from `body.txt`.
-5. **Phase 4** — Dispatch `static-lens-runner` (subagent) which applies conflict + dominance + gap lenses and writes the three JSON outputs (`conflicts.json`, `dominances.json`, `gaps.json`).
-6. **Phase 5** — In parallel with Phase 4, if warranted (anchors / conflicts / role-overrides present AND `expand_count > 0`), dispatch `drift-runner` (subagent) for adversarial scenarios + judging.
-7. **Phase 6** — In parallel with Phases 4-5, if `tr_phonetic: true`, dispatch `tr-phonetic-runner` (subagent) which seeds from existing pronunciation blocks and scans the body for new advisory findings.
+5. **Phase 4** — Dispatch `static-lens-runner` (subagent) which applies conflict + dominance + gap lenses and writes the three JSON outputs (`conflicts.json`, `dominances.json`, `gaps.json`). Dispatched **in parallel with Phase 6**.
+6. **Phase 6** — In parallel with Phase 4, if `tr_phonetic: true`, dispatch `tr-phonetic-runner` (subagent) which seeds from existing pronunciation blocks and scans the body for new advisory findings.
+7. **Phase 5** — After Phase 4 completes, if warranted (anchors / conflicts / role-overrides present AND `expand_count > 0`), dispatch `drift-runner` (subagent) for adversarial scenarios + judging.
 8. **Phase 7** — Render `report.md` + `findings.json` (line numbers translated back to the original prompt file; `prompt_sha256` carried through).
 9. **Phase 8** — Update `latest` symlink (commit point), print terminal summary.
 

@@ -245,6 +245,19 @@ Hold the rules in memory as JSON. Also write `$RUN_DIR/rules.json` with shape:
 
 If you extract zero rules, abort with an error written to `$RUN_DIR/error.txt` and surface that to the user.
 
+## Phases 4 + 6 — Parallel lens dispatch (with Phase 5 downstream of 4)
+
+Phase 4 (static lenses) and Phase 6 (TR phonetic, when its gate passes) are **independent** — they read different inputs and write different outputs. Dispatch both subagents in a **single message with two concurrent `Agent` calls** so they execute in parallel. Phase 5 (drift) is **downstream of Phase 4** — drift-runner reads `conflicts.json`, `gaps.json`, and `dominances.json` as inputs, so it MUST run after Phase 4's outputs land. The correct order is:
+
+```
+   ┌─ static-lens-runner ─┐
+   │                      ├─→ drift-runner (Phase 5, conditional)
+   └─ tr-phonetic-runner ─┘    (only reads Phase 4's outputs)
+   (Phase 4 + Phase 6 fan out together)
+```
+
+Concretely: in one assistant turn, emit both Phase 4 and Phase 6 `Agent` tool calls. Await both. Then evaluate Phase 5's gate and dispatch drift-runner if warranted.
+
 ## Phase 4 — Static lenses (conflict + dominance + gap)
 
 Dispatch the `static-lens-runner` subagent to apply the three static lenses in one pass. Detection criteria live in `references/lens-rules.md` — the subagent reads that document. The skill itself does no lens analysis.
