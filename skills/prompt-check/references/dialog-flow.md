@@ -83,7 +83,7 @@ Hangilerini ne yapayım? Örnek:
   C1, C3 düzelt; G2 yorum bırak; T1..T5 konuşalım; gerisini atla
 
 Verbs: düzelt | yorum bırak | atla | konuşalım  (alias: apply | overlay | dismiss | discuss)
-Special: gerisini atla | gerisini yorum | iptal
+Special: gerisini atla | gerisini yorum | hepsini düzelt | hepsini yorum bırak | hepsini atla | iptal
 ```
 
 After the table, render the prompt verbatim and accept free-form text on the next user turn.
@@ -100,18 +100,27 @@ The user's reply is a single free-form string. Parse it into a list of `(finding
 
 | Turkish | English aliases | Resulting status |
 |---|---|---|
-| `düzelt` | `apply`, `fix` | `applied` (TR findings auto-routed to `overlay` — see §4) |
-| `yorum bırak` | `overlay`, `comment` | `overlay` |
-| `atla` | `skip`, `dismiss` | `dismissed` |
-| `konuşalım` | `discuss`, `talk` | `discussed` (transient — triggers sub-flow in §5) |
+| `düzelt`, `uygula` | `apply`, `fix` | `applied` (TR findings auto-routed to `overlay` — see §4) |
+| `yorum bırak`, `not düş`, `kenara koy` | `overlay`, `comment` | `overlay` |
+| `atla`, `geç`, `bırak` | `skip`, `dismiss` | `dismissed` |
+| `konuşalım`, `tartış`, `inceleyelim` | `discuss`, `talk` | `discussed` (transient — triggers sub-flow in §5) |
+
+The parser is LLM-driven, not regex-driven. Natural variants (`fix bunları`, `şunu düzelt`, `bunları yorum bırakalım`) MUST be accepted as long as the verb intent is clear. When the verb is ambiguous, re-prompt the user with: `Bu kararı net anlayamadım: <segment>. Açar mısın?` rather than silently dropping the segment.
 
 **Special tokens:**
 
 | Token | Meaning |
 |---|---|
 | `gerisini atla` / `rest skip` / `dismiss rest` | All findings still `pending` → `dismissed` |
-| `gerisini yorum` / `rest overlay` | All findings still `pending` → `overlay` |
+| `gerisini yorum` / `gerisini yorum bırak` / `rest overlay` | All findings still `pending` → `overlay` |
+| `gerisini düzelt` / `rest apply` / `apply rest` | All findings still `pending` → `applied` (TR auto-routed to `overlay` — see §4) |
+| `hepsini düzelt` / `hepsini apply` / `tümü düzelt` / `tümünü düzelt` / `all apply` / `apply all` / `fix all` | Every finding → `applied` (TR auto-routed to `overlay` — see §4), overriding any earlier per-id decision in the same string |
+| `hepsini yorum bırak` / `tümü overlay` / `all overlay` / `comment all` | Every finding → `overlay`, overriding any earlier per-id decision |
+| `hepsini atla` / `tümü atla` / `all skip` / `skip all` / `dismiss all` | Every finding → `dismissed`, overriding any earlier per-id decision |
+| `hepsini konuşalım` / `tümünü konuşalım` / `discuss all` | Every finding → `discussed` (rare; mainly for edge cases) |
 | `iptal` / `cancel` | Abort; leave every finding at `pending`; do not run Phase 10 |
+
+**`gerisini X` vs `hepsini X`.** `gerisini X` applies the verb only to findings the user did NOT explicitly mention earlier in the decision string. `hepsini X` applies the verb to ALL findings, overriding any earlier per-id decision. Concretely, in `C1 yorum bırak; hepsini düzelt`, C1 ends up as `applied` (the `hepsini` clause overrides the earlier `yorum bırak` for C1). If the user wants to preserve earlier decisions, they should use `gerisini düzelt` instead.
 
 **ID forms inside a segment:**
 
@@ -121,6 +130,7 @@ The user's reply is a single free-form string. Parse it into a list of `(finding
 | comma-list | `C1, C3, C7` | three findings |
 | range | `T1..T5` | inclusive range across same lens prefix (T1, T2, T3, T4, T5) |
 | wildcard | `gerisini` (rest) | every finding still `pending` at the moment this segment is evaluated |
+| wildcard-all | `hepsini` / `tümü` / `tümünü` / `all` | every finding regardless of earlier decisions (overrides per-id decisions in the same string) |
 
 ### 3.2 — Segment grammar
 
@@ -128,6 +138,7 @@ The user's reply is a single free-form string. Parse it into a list of `(finding
 - Each segment is `<id-list> <verb>` OR `<verb> <id-list>`. Both orders are valid: `C1 düzelt` and `düzelt C1` mean the same thing.
 - Verbs of multiple words (`yorum bırak`, `gerisini atla`) match as a single token — the parser must look ahead.
 - Segments are evaluated **left to right**. `gerisini` always means "the rest at this point", so order matters: `C1 düzelt; gerisini atla` applies C1 then dismisses the others.
+- `hepsini` / `tümü` / `all` is the only token that overrides earlier per-id decisions in the same string. Evaluate it last so it wins: `C1 yorum bırak; hepsini düzelt` ends with C1 as `applied`.
 
 ### 3.3 — Error handling (per-segment, never abort the batch)
 
@@ -167,6 +178,8 @@ T3 TR phonetic — auto-routed to overlay (TR findings never modify the prompt f
 ```
 
 This rule is non-negotiable. There is no opt-out flag, no frontmatter switch, no env var. The prompt file is the author's curated text; TR pronunciation belongs in the overlay.
+
+**Wildcard visibility.** When a wildcard verb (`hepsini düzelt`, `gerisini düzelt`, `apply all`, etc.) hits a TR phonetic finding, surface the redirect EXPLICITLY per finding: `T3 TR phonetic — auto-routed to overlay (TR findings never modify the prompt file).` This is mandatory — silent redirects confuse the user (cf. real runtime: user said `hepsini düzelt`, plugin applied 0, user surprised). Always announce the redirect line by line, then proceed with the rest of the wildcard's effect.
 
 ## 5 — "Konuşalım" sub-flow (Phase 10, for `status: discussed`)
 
