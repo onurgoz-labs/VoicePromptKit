@@ -313,18 +313,21 @@ Persist the answer in memory as `user_intent`:
   "selected_lenses": ["conflict","dominance","gap","drift","tr_phonetic"],
   "expand_count": 3,
   "anchors": [],
+  "tr_phonetic_enabled": true,
   "asked_at": "<ISO 8601 UTC>"
 }
 ```
 
 `anchors` is copied verbatim from `frontmatter.anchors` (no per-run question for anchors; they live in frontmatter only).
 
+`tr_phonetic_enabled` is the **runtime authoritative** value for whether to run the TR phonetic lens this pass — computed as `("tr_phonetic" in selected_lenses)` after the wizard answers + Phase 3.5 confirmation. Frontmatter's `tr_phonetic` is only the **default** that pre-selects the checkbox; once the user has answered, `user_intent.tr_phonetic_enabled` overrides it for this run.
+
 Phase 9 writes this `user_intent` block into `session.json` at interactive entry. Until then it is held in memory by the skill.
 
 **Dispatch impact:**
-- Phase 4 (static lenses): if `conflict`, `dominance`, or `gap` is unselected, instruct `static-lens-runner` to skip those sub-lenses (the runner writes an empty `{"conflicts": []}` etc. for skipped sub-lenses, OR the skill simply does not dispatch when all three are unselected).
+- Phase 4 (static lenses): if `conflict`, `dominance`, or `gap` is unselected, instruct `static-lens-runner` to skip those sub-lenses by passing `selected_lenses` in the dispatch inputs (see Phase 4). If all three are unselected, skip the dispatch entirely and write empty placeholder files.
 - Phase 5 (drift): the existing skip gate (`expand_count == 0` OR no anchors/conflicts/role-overrides) already handles drift opt-out. Additionally, if `drift` is unselected here, skip Phase 5 entirely and write `drift.json` with `skipped_reason: "drift lens deselected by user"`.
-- Phase 6 (TR phonetic): only dispatch if `tr_phonetic` is in `user_intent.selected_lenses` AND `frontmatter.tr_phonetic == true` (after the Phase 3.5 confirmation). Otherwise skip — no `tr_phonetic.json` is written, and Phase 7 treats missing files as "lens disabled".
+- Phase 6 (TR phonetic): gate on `user_intent.tr_phonetic_enabled == true` — NOT on `frontmatter.tr_phonetic`. The user's runtime selection is authoritative. If false, skip Phase 6 entirely — no `tr_phonetic.json` is written, and Phase 7 treats missing files as "lens disabled".
 
 Phase 7 already handles missing per-lens JSON files as "lens disabled" — no change there.
 
@@ -332,18 +335,20 @@ Phase 7 already handles missing per-lens JSON files as "lens disabled" — no ch
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_5_end" >> "$TIMING_LOG"
 ```
 
-## Phases 4 + 6 — Parallel lens dispatch (with Phase 5 downstream of 4)
+## Phases 4 + 5 + 6 — Parallel lens dispatch (drift fans out as soon as Phase 4 lands)
 
-Phase 4 (static lenses) and Phase 6 (TR phonetic, when its gate passes) are **independent** — they read different inputs and write different outputs. Dispatch both subagents in a **single message with two concurrent `Agent` calls** so they execute in parallel. Phase 5 (drift) is **downstream of Phase 4** — drift-runner reads `conflicts.json`, `gaps.json`, and `dominances.json` as inputs, so it MUST run after Phase 4's outputs land. The correct order is:
+Phase 4 (static lenses) and Phase 6 (TR phonetic, when its gate passes) are **independent** — they read different inputs and write different outputs. Dispatch both subagents in a **single message with two concurrent `Agent` calls** so they execute in parallel. Phase 5 (drift) is **downstream of Phase 4 only** — drift-runner reads `conflicts.json`, `gaps.json`, and `dominances.json` as inputs, so it MUST run after Phase 4's outputs land, but it does NOT depend on Phase 6. The correct order is:
 
 ```
-   ┌─ static-lens-runner ─┐
-   │                      ├─→ drift-runner (Phase 5, conditional)
-   └─ tr-phonetic-runner ─┘    (only reads Phase 4's outputs)
-   (Phase 4 + Phase 6 fan out together)
+   ┌─ static-lens-runner ──┬─→ drift-runner (Phase 5 — needs Phase 4 outputs)
+   │                       │
+   └─ tr-phonetic-runner ──┘
+   (Phase 4 + Phase 6 fan out together;
+    Phase 5 starts as soon as Phase 4 lands,
+    in parallel with Phase 6 — does not wait for TR)
 ```
 
-Concretely: in one assistant turn, emit both Phase 4 and Phase 6 `Agent` tool calls. Await both. Then evaluate Phase 5's gate and dispatch drift-runner if warranted.
+Concretely: in one assistant turn, emit both Phase 4 and Phase 6 `Agent` tool calls. As soon as Phase 4's outputs land, evaluate Phase 5's gate and dispatch drift-runner — do NOT wait for Phase 6 to finish first. Phase 7 awaits all three (Phase 4 + Phase 5 + Phase 6) before rendering.
 
 ## Phase 4 — Static lenses (conflict + dominance + gap)
 
@@ -363,10 +368,11 @@ Agent({
   subagent_type: "static-lens-runner",
   prompt: JSON.stringify({
     inputs: {
-      body:           "<absolute path to $RUN_DIR/body.txt>",
-      frontmatter:    "<absolute path to $RUN_DIR/frontmatter.json>",
-      rules:          "<absolute path to $RUN_DIR/rules.json>",
-      lens_rules_ref: "<absolute path to skills/prompt-check/references/lens-rules.md>"
+      body:            "<absolute path to $RUN_DIR/body.txt>",
+      frontmatter:     "<absolute path to $RUN_DIR/frontmatter.json>",
+      rules:           "<absolute path to $RUN_DIR/rules.json>",
+      lens_rules_ref:  "<absolute path to skills/prompt-check/references/lens-rules.md>",
+      selected_lenses: ["conflict", "dominance", "gap"]  // ← subset of these three; runner skips unselected
     },
     output_paths: {
       conflicts:  "<absolute path to $RUN_DIR/conflicts.json>",
@@ -378,6 +384,18 @@ Agent({
 })
 ```
 
+Populate `selected_lenses` from `user_intent.selected_lenses` (computed in Phase 3.5), intersected with `["conflict", "dominance", "gap"]` — i.e. drop `drift` and `tr_phonetic` since those belong to other runners. The static-lens-runner reads this field and writes empty `{"conflicts": []}` / `{"dominances": []}` / `{"gaps": []}` for any sub-lens not in the list.
+
+**Skip the Phase 4 dispatch entirely** if all three static lenses are deselected (the intersection is empty). In that case write empty placeholders directly:
+
+```bash
+printf '{"conflicts": []}' > "$RUN_DIR/conflicts.json"
+printf '{"dominances": []}' > "$RUN_DIR/dominances.json"
+printf '{"gaps": []}' > "$RUN_DIR/gaps.json"
+```
+
+…and proceed to Phase 5 / 7 without spawning the runner.
+
 `static-lens-runner` writes `$RUN_DIR/conflicts.json`, `$RUN_DIR/dominances.json`, and `$RUN_DIR/gaps.json`. The skill reads them in Phase 7.
 
 ```bash
@@ -385,6 +403,8 @@ Agent({
 ```
 
 ## Phase 5 — Drift (conditional)
+
+**Orchestration:** dispatched as soon as Phase 4 completes (i.e. when `conflicts.json`, `dominances.json`, `gaps.json` have landed). Runs **in parallel with Phase 6** (if Phase 6 was triggered) — Phase 5 does NOT wait for the TR runner. Phase 7 awaits all in-flight subagents (Phase 4 + Phase 5 + Phase 6) before rendering.
 
 **Skip Phase 5 if EITHER condition holds:**
 
@@ -414,19 +434,22 @@ Agent({
   subagent_type: "drift-runner",
   prompt: JSON.stringify({
     inputs: {
-      body:        "<absolute path to $RUN_DIR/body.txt>",
-      frontmatter: "<absolute path to $RUN_DIR/frontmatter.json>",
-      rules:       "<absolute path to $RUN_DIR/rules.json>",
-      conflicts:   "<absolute path to $RUN_DIR/conflicts.json>",
-      gaps:        "<absolute path to $RUN_DIR/gaps.json>",
-      dominances:  "<absolute path to $RUN_DIR/dominances.json>",
-      probes_ref:  "<absolute path to skills/prompt-check/references/probes.md>"
+      body:                  "<absolute path to $RUN_DIR/body.txt>",
+      frontmatter:           "<absolute path to $RUN_DIR/frontmatter.json>",
+      rules:                 "<absolute path to $RUN_DIR/rules.json>",
+      conflicts:             "<absolute path to $RUN_DIR/conflicts.json>",
+      gaps:                  "<absolute path to $RUN_DIR/gaps.json>",
+      dominances:            "<absolute path to $RUN_DIR/dominances.json>",
+      probes_ref:            "<absolute path to skills/prompt-check/references/probes.md>",
+      expand_count_override: 3  // ← from user_intent.expand_count; takes precedence over frontmatter
     },
     output_path: "<absolute path to $RUN_DIR/drift.json>"
   }),
   description: "drift analysis for " + BASENAME
 })
 ```
+
+Populate `expand_count_override` with `user_intent.expand_count` from Phase 3.5 (the per-run integer the user picked in the lens-selection wizard). The drift-runner uses this override when present, falling back to `frontmatter.expand_count` only when the override is absent.
 
 `drift-runner` generates scenarios, simulates the model on each, judges outputs, and writes `$RUN_DIR/drift.json` with shape `{scenarios, runs, verdicts}`. The skill never decomposes drift inline because it is the only step whose token cost scales with prompt length.
 
@@ -436,7 +459,7 @@ Agent({
 
 ## Phase 6 — Turkish phonetic lens (conditional)
 
-**Run this phase only if `frontmatter.tr_phonetic == true`.** Otherwise skip to Phase 7 — `tr_phonetic.json` is not written, and Phase 7 treats the absence as "TR lens disabled".
+**Run this phase only if `user_intent.tr_phonetic_enabled == true`** (the runtime value computed in Phase 3.5 — NOT `frontmatter.tr_phonetic`). Frontmatter's `tr_phonetic` is the default that pre-selects the wizard checkbox; the user can flip the selection on or off in Phase 3.5, and that runtime decision is authoritative here. Otherwise skip to Phase 7 — `tr_phonetic.json` is not written, and Phase 7 treats the absence as "TR lens disabled".
 
 ```bash
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_6_skip" >> "$TIMING_LOG"
@@ -446,7 +469,12 @@ When the gate passes, dispatch the `tr-phonetic-runner` subagent. It seeds `pron
 
 **Line-number contract:** every `line` field (including `seed_block_range.start_line` / `end_line`) the subagent writes is a body.txt index. Phase 7 translates to original-file lines.
 
-**Advisory invariant:** every TR finding has `fix_kind: "advisory"`. PromptChecker never auto-applies any TR phonetic suggestion to the prompt file — neither substring replacement nor pronunciation block injection. The subagent populates either `suggested_fix` (textual issues) or `pronunciation_entry` (foreign words / abbreviations) for the report. Phase 9's TR routing rule guarantees this at the interactive layer: any TR finding decided as `applied` is auto-converted to `overlay` before Phase 10 ever sees it. The author decides whether and how to act on TR findings by hand.
+**Category-based fix_kind (v0.4.2+):** TR findings carry `fix_kind: "advisory"` OR `fix_kind: "replace"` depending on the category:
+
+- `foreign_word` and `abbreviation` → `fix_kind: "advisory"` — PromptChecker never auto-applies these. They populate `pronunciation_entry` (and optionally `suggested_fix`) and are surfaced for the author to act on by hand. Phase 9.6's commit and Phase 10.3's TR advisory guard force-route any such finding decided as `applied` to `overlay` before any write happens.
+- `number_readability` and `punctuation` → `fix_kind: "replace"` — these are concrete substring replacements (e.g. "10kg" → "on kilogram", "—" → ", ") and follow the normal apply flow in Phase 10.3 (SHA check → fix_strategy dispatch → strategy-specific feasibility → apply). They are NOT force-routed to overlay.
+
+PromptChecker therefore auto-applies TR `replace` findings just like conflict / dominance / gap / drift findings, while keeping TR `advisory` findings author-driven. The author still owns the pronunciation_map injection — Phase 10 never writes pronunciation block content back into the prompt file.
 
 Pass inputs and the output path as **separate** top-level fields:
 
@@ -455,15 +483,18 @@ Agent({
   subagent_type: "tr-phonetic-runner",
   prompt: JSON.stringify({
     inputs: {
-      body:             "<absolute path to $RUN_DIR/body.txt>",
-      frontmatter:      "<absolute path to $RUN_DIR/frontmatter.json>",
-      tr_phonetic_ref:  "<absolute path to skills/prompt-check/references/tr-phonetic.md>"
+      body:                  "<absolute path to $RUN_DIR/body.txt>",
+      frontmatter:           "<absolute path to $RUN_DIR/frontmatter.json>",
+      tr_phonetic_ref:       "<absolute path to skills/prompt-check/references/tr-phonetic.md>",
+      user_intent_tr_phonetic: true  // ← from user_intent.tr_phonetic_enabled; runtime authoritative
     },
     output_path: "<absolute path to $RUN_DIR/tr_phonetic.json>"
   }),
   description: "TR phonetic lens for " + BASENAME
 })
 ```
+
+Populate `user_intent_tr_phonetic` with `user_intent.tr_phonetic_enabled`. The runner's defensive guard checks this field instead of `frontmatter.tr_phonetic`, so user runtime overrides survive even when the frontmatter default would have suppressed the lens.
 
 `tr-phonetic-runner` writes `$RUN_DIR/tr_phonetic.json` with shape `{ findings[], seed_entries[], warnings[] }`. The skill reads it in Phase 7.
 
@@ -565,10 +596,8 @@ findings.sort(key=lambda f: (
 Apply this sort BOTH to `findings.json.findings[]` AND to the visual rendering in report.md.
 
 For each finding:
-- `fix_kind: "replace"` → Phase 10's applied step rewrites the line so it produces `suggested_fix` instead of `current_excerpt`. Only emitted by `conflict`, `dominance`, `gap`, `drift` lenses (never TR phonetic).
-- `fix_kind: "advisory"` → no automatic apply. **Every TR phonetic finding uses this**, regardless of whether `suggested_fix` or `pronunciation_entry` is populated.
-
-The TR lens never produces `replace` findings — TR suggestions are always reported, never written.
+- `fix_kind: "replace"` → Phase 10's applied step rewrites the line so it produces `suggested_fix` instead of `current_excerpt`. Emitted by `conflict`, `dominance`, `gap`, `drift` lenses, and by TR `number_readability` / `punctuation` findings.
+- `fix_kind: "advisory"` → no automatic apply. Emitted by TR `foreign_word` / `abbreviation` findings — Phase 9.6's commit and Phase 10.3's TR advisory guard force-route these to overlay.
 
 ### `$RUN_DIR/report.md`
 
@@ -791,9 +820,13 @@ Emit the prompt string from `references/dialog-flow.md` (Turkish + English examp
 
 If the user types `iptal` (or `cancel`), write `session.json.phase = "paused"`, surface a one-line "Session paused. Resume with /prompt-check-resume <run-NNN>." message, and exit. `decisions.jsonl` stays untouched.
 
-### 9.4 — Parse the decision string (deterministic)
+### 9.4 — Parse + plan (Stage 1: NO writes)
 
-The detailed grammar (id-lists, ranges with `..`, wildcards like `gerisini` / `rest`, verb aliases for `düzelt`/`fix`/`apply`, `yorum bırak`/`overlay`/`note`, `atla`/`skip`/`dismiss`, `konuşalım`/`discuss`/`talk`) lives in `references/dialog-flow.md`. Implement the parser as a single Python heredoc so it is deterministic. Skeleton:
+`references/dialog-flow.md` Section 3.2 mandates a **plan → confirm → commit** flow: parse the user's decision string into an in-memory plan, surface the plan with counts + TR redirects + parse errors, get explicit `evet`-style confirmation, and **only then** write to `decisions.jsonl` or rewrite `session.json`.
+
+This sub-section (9.4) is **Stage 1 — parse only, no I/O writes**. Stage 2 (commit) lives in 9.6 and is gated on Stage 1.5's confirmation.
+
+The detailed grammar (id-lists, ranges with `..`, wildcards like `gerisini` / `rest`, verb aliases for `düzelt`/`fix`/`apply`, `yorum bırak`/`overlay`/`note`, `atla`/`skip`/`dismiss`, `konuşalım`/`discuss`/`talk`) lives in `references/dialog-flow.md`. Implement the parser as a single Python heredoc so it is deterministic. The block below **parses into memory and emits a plan JSON to stdout** — it must NOT open `decisions.jsonl` or `session.json` for writing. Skeleton:
 
 ```bash
 python3 - "$RUN_DIR" <<'PY'
@@ -804,6 +837,20 @@ user_input = os.environ.get('PROMPTCHECKER_DECISION_INPUT', '')
 session = json.load(open(os.path.join(run_dir, 'session.json'), encoding='utf-8'))
 findings_state = session['findings_state']
 known_ids = list(findings_state.keys())
+
+# Load findings.json so we can look up fix_kind per finding (needed for TR routing).
+# Only TR findings with fix_kind == "advisory" (foreign_word / abbreviation) are
+# force-routed to overlay; TR findings with fix_kind == "replace" (number_readability
+# / punctuation) follow the normal apply flow.
+findings_path = os.path.join(run_dir, 'findings.json')
+findings_by_id = {}
+if os.path.exists(findings_path):
+    try:
+        fj = json.load(open(findings_path, encoding='utf-8'))
+        for f in fj.get('findings', []):
+            findings_by_id[f['id']] = f
+    except Exception:
+        pass
 
 # Verb mapping — full table is in references/dialog-flow.md
 VERBS = {
@@ -868,74 +915,137 @@ for segment in user_input.split(';'):
         seen_ids.add(fid)
         decisions_resolved.append((fid, status, segment))
 
-# TR routing rule: tr_phonetic + applied → overlay
+# TR routing rule: tr_phonetic + applied + fix_kind == "advisory" → overlay.
+# Only foreign_word / abbreviation (fix_kind: advisory) are force-routed.
+# number_readability / punctuation (fix_kind: replace) follow the normal apply flow.
 routed = []
 for i, (fid, status, raw) in enumerate(decisions_resolved):
-    if status == 'applied' and findings_state[fid]['lens'] == 'tr_phonetic':
+    if status != 'applied' or findings_state[fid]['lens'] != 'tr_phonetic':
+        continue
+    finding = findings_by_id.get(fid, {})
+    if finding.get('fix_kind') == 'advisory':
         routed.append(fid)
         decisions_resolved[i] = (fid, 'overlay', raw)
 
-# Append to decisions.jsonl: routed entries FIRST (one per routed id), then the actual decisions
-out_path = os.path.join(run_dir, 'decisions.jsonl')
-with open(out_path, 'a', encoding='utf-8') as f:
-    for fid in routed:
-        f.write(json.dumps({
-            'finding_id': fid,
-            'action': 'routed_to_overlay',
-            'reason': 'TR phonetic findings never modify the prompt file',
-            'at': now(),
-        }, ensure_ascii=False) + '\n')
-    for fid, status, raw in decisions_resolved:
-        f.write(json.dumps({
-            'finding_id': fid,
-            'action': status,
-            'source': 'phase_9_decision_string',
-            'raw_segment': raw,
-            'at': now(),
-        }, ensure_ascii=False) + '\n')
-
-# Update session.json
-for fid, status, _ in decisions_resolved:
-    findings_state[fid]['status'] = status
-    findings_state[fid]['updated_at'] = now()
-session['phase'] = 9
-session['updated_at'] = now()
-json.dump(session, open(os.path.join(run_dir, 'session.json'), 'w', encoding='utf-8'), indent=2, ensure_ascii=False)
-
-# Outcome counters for the terminal line
+# Outcome counters for the plan
 buckets = {'applied':0,'overlay':0,'dismissed':0,'discussed':0}
 for fid, status, _ in decisions_resolved:
     buckets[status] = buckets.get(status, 0) + 1
 
-print(json.dumps({
+# Emit the in-memory plan as JSON — NO writes to decisions.jsonl or session.json here.
+# Stage 2 (Phase 9.6) will commit this plan after the user confirms.
+plan = {
     'parsed': len(decisions_resolved),
     'applied': buckets['applied'],
     'overlay': buckets['overlay'],
     'dismissed': buckets['dismissed'],
     'discussed': buckets['discussed'],
     'tr_routed': len(routed),
+    'tr_routed_ids': routed,
     'unrecognised': unrecognised,
-}, ensure_ascii=False))
+    'decisions': [
+        {'finding': fid, 'lens': findings_state[fid]['lens'], 'action': status, 'raw_segment': raw}
+        for (fid, status, raw) in decisions_resolved
+    ],
+}
+print(json.dumps(plan, ensure_ascii=False))
 PY
 ```
 
 Pass the user's reply as `PROMPTCHECKER_DECISION_INPUT` (or stdin — whichever is cleaner in the harness). The block above is illustrative; trust `references/dialog-flow.md` as the source of truth for the verb table and grammar edge cases.
 
-### 9.5 — Report parse outcome
+### 9.5 — Surface the plan and request confirmation (Stage 1.5)
 
-Print one line:
+Render the parsed plan back to the user as a clear prose message and ask for confirmation. Do NOT write anything to disk yet.
 
 ```
-Parsed N decisions: A applied, B overlay, C dismissed, D discussed, E TR-routed to overlay, F unrecognised.
+Plan: <N> kararı çözümledim — <A> applied, <B> overlay, <C> dismissed, <D> discussed.
+TR auto-redirect: <E> bulgu (<id list>) overlay'e yönlendirilecek (TR findings never modify the prompt).
+Parse errors: <F> segmenti çözemedim (<list>).
+
+Onaylıyor musun? Onay için `evet` yaz; iptal için `iptal` yaz; değiştirmek için yeni karar dizesi yaz.
 ```
 
-If `unrecognised` is non-empty, list the unparsed segments and re-prompt — loop back to 9.3. Do not advance to Phase 10 until every segment is either parsed or the user types `iptal`.
+If `unrecognised` is non-empty, surface the unparsed segments in the same block and remind the user they can type a corrected decision string to retry. If after parsing every pending finding still has `status: "pending"`, mention this and remind the user that `gerisini atla` is the explicit way to dismiss the remainder.
 
-If after parsing every pending finding still has `status: "pending"`, ask the user one clarifying turn (using the template in `references/dialog-flow.md`) before falling through to Phase 10. Pending findings at Phase 10 entry are treated as `dismissed` only when the user explicitly says `gerisini atla` (or equivalent).
+Wait for the user's reply on the next turn.
 
-### 9.6 — Hand off to Phase 10
+### 9.6 — Confirmation gate + commit (Stage 2)
 
-Transition automatically. Do not wait for further confirmation unless `decisions_resolved` is empty.
+Read the user's next message. The accepted confirmation tokens are: `evet`, `yes`, `onayla`, `ok`, `tamam`, `confirm` (case-insensitive).
+
+Branching on the reply:
+
+- **Confirmation token** → commit the plan: append the routed entries + decision entries to `decisions.jsonl`, rewrite `session.json` with updated `findings_state` and `phase: 9`, then transition to Phase 10. The commit block (Python heredoc) is below.
+- **`iptal` / `cancel`** → write `session.json.phase = "paused"`, surface "Session paused. Resume with /prompt-check-resume <run-NNN>.", and exit. `decisions.jsonl` stays untouched (no Stage 2 writes happened).
+- **Any other text** → treat it as a new decision string. Loop back to 9.4 (re-parse), then 9.5 (re-plan), then 9.6 again. Repeat until the user either confirms or cancels.
+
+**Commit block (Stage 2 — runs ONLY after a confirmation token):**
+
+```bash
+python3 - "$RUN_DIR" <<'PY'
+import sys, json, os, datetime
+run_dir = sys.argv[1]
+plan = json.loads(os.environ.get('PROMPTCHECKER_DECISION_PLAN', '{}'))
+
+session = json.load(open(os.path.join(run_dir, 'session.json'), encoding='utf-8'))
+findings_state = session['findings_state']
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00','Z')
+
+REQUIRED_KEYS = ('ts', 'finding', 'lens', 'action')
+
+def emit(f, record):
+    # Self-check: every emitted JSONL record MUST carry ts/finding/lens/action.
+    # Spec: references/overlay-format.md Section 2.
+    missing = [k for k in REQUIRED_KEYS if k not in record or record[k] in (None, '')]
+    if missing:
+        print(f"warning: refusing to write decisions.jsonl record missing keys {missing}: {record}", file=sys.stderr)
+        return
+    f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+out_path = os.path.join(run_dir, 'decisions.jsonl')
+with open(out_path, 'a', encoding='utf-8') as f:
+    # Routed entries first (one per TR-routed id)
+    for fid in plan.get('tr_routed_ids', []):
+        emit(f, {
+            'ts': now(),
+            'finding': fid,
+            'lens': findings_state[fid]['lens'],
+            'action': 'routed_to_overlay',
+            'reason': 'TR phonetic findings never modify the prompt file',
+        })
+    # Then the actual decisions
+    for d in plan.get('decisions', []):
+        emit(f, {
+            'ts': now(),
+            'finding': d['finding'],
+            'lens': d['lens'],
+            'action': d['action'],
+            'source': 'phase_9_decision_string',
+            'raw_segment': d.get('raw_segment', ''),
+        })
+
+# Update session.json
+for d in plan.get('decisions', []):
+    findings_state[d['finding']]['status'] = d['action']
+    findings_state[d['finding']]['updated_at'] = now()
+session['phase'] = 9
+session['updated_at'] = now()
+json.dump(session, open(os.path.join(run_dir, 'session.json'), 'w', encoding='utf-8'), indent=2, ensure_ascii=False)
+PY
+```
+
+Pass the in-memory plan from 9.4 as `PROMPTCHECKER_DECISION_PLAN` (JSON-encoded). The self-check refuses to write any record missing `ts`, `finding`, `lens`, or `action` — these are the spec minimum from `references/overlay-format.md` Section 2.
+
+After the commit succeeds, print a single line:
+
+```
+Parsed N decisions: A applied, B overlay, C dismissed, D discussed, E TR-routed to overlay.
+```
+
+Then hand off to Phase 10 in the same turn. Do not wait for further confirmation — the user already confirmed at Stage 1.5.
 
 ```bash
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_9_end" >> "$TIMING_LOG"
@@ -951,77 +1061,101 @@ Phase 10 reads `session.json` and `decisions.jsonl` from Phase 9 and executes ea
 
 **Do not read decisions.jsonl or session.json while a Phase 10 sub-step is still writing to them.** Each sub-step reads its inputs once at entry, performs its writes, then yields to the next sub-step.
 
+**Pre-flight (Phase 10 entry, runs ONCE before 10.1):** compute the prompt file's SHA at audit time vs now exactly once, then keep that decision frozen for the rest of Phase 10.
+
+```bash
+ORIGINAL_PROMPT_SHA=$(shasum -a 256 "$ABS_PROMPT" | awk '{print $1}')
+AUDIT_SHA=$(python3 -c "import json;print(json.load(open('$RUN_DIR/findings.json'))['prompt_sha256'])")
+if [ "$ORIGINAL_PROMPT_SHA" != "$AUDIT_SHA" ]; then
+  STALE_AUDIT=true
+else
+  STALE_AUDIT=false
+fi
+```
+
+`ORIGINAL_PROMPT_SHA` is the file's hash **at Phase 10 entry** — captured once, before any apply happens. It is compared to `findings.json.prompt_sha256` (the audit snapshot from Phase 2) to answer one question only: "did the file change BEFORE the audit started?" The comparison is performed ONCE here; intra-pass mutations (the file changing because Phase 10.3 itself applied a fix) are intended and MUST NOT trigger a stale-audit signal on subsequent findings.
+
+If `STALE_AUDIT == true`, surface the stale-audit message ONCE (not per finding), and route every `applied` finding to overlay for the rest of this Phase 10 pass (outcome `sha_mismatch` for all of them).
+
+After each successful apply in 10.3, the skill records the post-write SHA in the JSONL entry for archival purposes only — **never** as a new value to compare back against `findings.json.prompt_sha256`. That snapshot stays frozen.
+
 ### 10.1 — Dismissed
 
 For each finding with `findings_state[fid].status == "dismissed"`: log only, no I/O. Count for the closing summary. Do not append anything to `decisions.jsonl` here — the Phase 9 entry already records the decision.
 
 ### 10.2 — Overlay
 
-Collect every finding whose status is `overlay` (this includes the TR-routed findings from Phase 9.4). Rebuild `$RUN_DIR/inline-suggestions.md` in full per the layout in `references/overlay-format.md`. The file is **rewritten from scratch on every Phase 10 pass** — idempotent regeneration ensures resumed sessions produce consistent overlays.
+Collect every finding whose status is `overlay` (this includes the TR-routed findings from Phase 9.6's commit). Rebuild `$RUN_DIR/inline-suggestions.md` in full per the layout in `references/overlay-format.md`. The file is **rewritten from scratch on every Phase 10 pass** — idempotent regeneration ensures resumed sessions produce consistent overlays.
 
-Do not append per-finding entries to `decisions.jsonl` for this step — the `overlay` decision was already logged in Phase 9.4 (or 10.3 if auto-converted from `applied`).
+Do not append per-finding entries to `decisions.jsonl` for this step — the `overlay` decision was already logged in Phase 9.6's commit (or 10.3 if auto-converted from `applied`).
 
 ### 10.3 — Applied (feasibility-first, single-event logging)
 
 **Core invariant:** `decisions.jsonl` records ONE event per finding outcome in this sub-step. The `applied` action is written **only when the prompt file was genuinely modified**. If a finding cannot be applied for any reason, it produces a single `routed_to_overlay` entry followed by a single `overlay` entry — never a misleading `applied` entry first.
 
-Note: Phase 9 already wrote `routed_to_overlay` lines for TR-routed `applied` decisions before they arrived at Phase 10 as `overlay`. The TR-routing path therefore never enters 10.3 — it is handled by 10.2 directly. The TR feasibility check below remains as a defensive guard in case a future caller skips Phase 9's TR routing.
-
-**Pre-flight (mandatory):** compute the current SHA256 of the prompt file once for the whole sub-step:
-
-```bash
-ACTUAL_SHA=$(shasum -a 256 "$PROMPT_PATH" | awk '{print $1}')
-```
+Note on TR routing: Phase 9.6's commit already wrote `routed_to_overlay` lines for TR `foreign_word` / `abbreviation` (`fix_kind: advisory`) decisions, so those TR findings arrive at Phase 10 as `overlay` and are handled by 10.2 directly. TR findings with `fix_kind: "replace"` (i.e. `kind: number_readability` or `kind: punctuation`) are NOT force-routed — they enter 10.3 with `status: applied` and follow the same flow as conflict/dominance/gap/drift findings (SHA → fix_strategy dispatch → strategy-specific feasibility → apply). The advisory-only feasibility check below remains as a defensive guard in case a future caller skips Phase 9's TR routing.
 
 For each finding with `findings_state[fid].status == "applied"`, run a **feasibility check first** (read-only — no writes to `decisions.jsonl`, no writes to the prompt file).
 
 Possible feasibility outcomes (one per finding):
-- `tr_routed` — TR foreign_word/abbreviation, never modifies the prompt file
+- `tr_routed` — TR finding with `fix_kind: "advisory"` (defensive guard; foreign_word/abbreviation never modify the prompt file)
+- `sentinel_todo` — `suggested_fix` starts with `"TODO:"`; author must resolve by hand → routed to overlay
+- `sentinel_intentional` — `suggested_fix` starts with `"Intentional —"` or `"Intentional -"`; runner judged this benign → dismissed
 - `no_concrete_fix` — empty or null `suggested_fix` (should never happen with v0.4.1+, but defensive)
-- `sha_mismatch` — stale audit; SHA256 of prompt file changed since audit snapshot
-- `ambiguous` — `current_excerpt` appears zero or multiple times on `finding.line`
-- `structural_declined` — user declined the risk warning for a `fix_strategy: "structural"` finding (see dispatch below)
-- `applicable` — passes all feasibility checks, proceed to `fix_strategy` dispatch
+- `sha_mismatch` — stale audit detected at Phase 10 entry (Pre-flight saw `STALE_AUDIT == true`)
+- `ambiguous` — substring-strategy only: `current_excerpt` appears zero or multiple times on `finding.line`
+- `structural_declined` — user declined the risk warning for a `fix_strategy: "structural"` finding
+- `applicable` — passes all feasibility checks; the prompt file is modified
 
-Determine the outcome per finding from the following ordered rules:
+**Ordered feasibility rules — apply in this order:**
 
-1. If `finding.lens == "tr_phonetic"` → outcome `tr_routed`, reason `"TR phonetic findings never modify the prompt file"`.
-2. Else if `finding.suggested_fix` is `null` or an empty string → outcome `no_concrete_fix`, reason `"no concrete suggested_fix — manual author revision required"`.
-3. Else if `ACTUAL_SHA != session.json.prompt_sha256_at_audit` (which mirrors `findings.json.prompt_sha256`) → outcome `sha_mismatch`, reason `"stale audit — prompt SHA256 mismatch"`.
-4. Else read the prompt file fresh and index to `finding.line` (already an original-file line; Phase 7 translated it). Count occurrences of `current_excerpt` on that line:
-   - Zero matches → outcome `ambiguous`, reason `"ambiguous occurrence — substring matches multiple positions"` (treat zero-match identically to multi-match; the substring is no longer locatable on the named line — overlay is the safe fallback).
-   - More than one match → outcome `ambiguous`, same reason as above.
-   - Exactly one match → outcome `applicable`.
+1. **TR advisory guard:** if `finding.lens == "tr_phonetic"` AND `finding.fix_kind == "advisory"` → outcome `tr_routed`, reason `"TR foreign_word/abbreviation findings never modify the prompt file"`. (TR findings with `fix_kind: "replace"` skip this rule and continue to step 2.)
+2. **No concrete fix:** if `finding.suggested_fix` is `null` or an empty string → outcome `no_concrete_fix`, reason `"no concrete suggested_fix — manual author revision required"`.
+3. **Stale audit:** if Phase 10's pre-flight set `STALE_AUDIT == true` → outcome `sha_mismatch`, reason `"stale audit — prompt SHA256 mismatch (file changed before this audit)"`. (This check uses the pre-flight result; it is NOT recomputed per finding. Intra-pass mutations from previous applies in this pass are intended and must not trigger this outcome — see Pre-flight section above.)
+4. **Sentinel guard:** before any strategy dispatch, inspect `suggested_fix`:
+   - If it starts with `"TODO:"` → outcome `sentinel_todo`, reason `"sentinel: TODO — author must resolve by hand"`. Route to overlay.
+   - If it starts with `"Intentional —"` or `"Intentional -"` → outcome `sentinel_intentional`, reason `"sentinel: Intentional — runner judged this benign, no action"`. Dismiss (no overlay).
+   - Sentinels are structural by definition (per `lens-rules.md`); they MUST NOT fall through to the Edit dispatch.
+5. **`fix_strategy` dispatch** — at this point the finding has a non-empty, non-sentinel `suggested_fix` and the audit is fresh. Branch on `fix_strategy`:
 
-**Single-event write per finding** based on the outcome:
+   **5a. `fix_strategy: "substring"` (or absent, for backward compatibility):**
+   - Run the substring locatability check: read the prompt file fresh, index to `finding.line` (already an original-file line; Phase 7 translated it). Count occurrences of `current_excerpt` on that line:
+     - Zero matches → outcome `ambiguous`, reason `"ambiguous occurrence — substring not locatable on line N"`.
+     - More than one match → outcome `ambiguous`, reason `"ambiguous occurrence — substring matches multiple positions on line N"`.
+     - Exactly one match → outcome `applicable`. Perform the substring replacement: read the prompt file, locate `line` + `current_excerpt`, replace with `suggested_fix`, write the file back.
 
-- **`applicable`** — perform the dispatch on `fix_strategy`:
+   **5b. `fix_strategy: "structural"`:**
+   - Structural fixes may add a new clause, move a rule, or rewrite across lines. They do NOT replace a literal substring on a single line, so the `ambiguous` / `current_excerpt`-must-be-unique check from 5a is SKIPPED for structural fixes. (The sentinel guard in step 4 already filtered out TODO/Intentional sentinels.)
+   - Surface a risk warning to the user BEFORE applying: "⚠ Structural change for <finding-id>: the suggestion is an action description, not a literal substring. I will use the Edit tool to apply: <suggested_fix>. Confirm? (y/n)".
+   - If the user declines → outcome `structural_declined`. Route to overlay.
+   - If the user accepts → outcome `applicable`. Apply via the Edit tool (semantic edit reflecting the intent of `suggested_fix`).
+   - Implementation note: when the user said `hepsini düzelt` (wildcard), the risk-warning prompt is shown ONCE per structural finding, not bundled. Each structural application is its own decision point.
 
-  For each finding marked `applicable` (passed all earlier feasibility checks), dispatch on `fix_strategy`:
+**Single-event write per finding** based on the resolved outcome:
 
-  - **`fix_strategy: "substring"` (or absent, for backward compatibility):**
-    Perform the substring replacement: read the prompt file, locate `line` + `current_excerpt`, replace with `suggested_fix`. Write the file back. Log: `{"action": "applied", "target": "prompt_file", "tool": "substring_replace", "fix_strategy": "substring", "from": "<current_excerpt>", "to": "<suggested_fix>", "line": N}`.
+- **`applicable` + successful write** — append ONE `applied` line to `decisions.jsonl`.
 
-  - **`fix_strategy: "structural"`:**
-    Surface a risk warning to the user BEFORE applying: "⚠ Structural change for <finding-id>: the suggestion is an action description, not a literal substring. I will use the Edit tool to apply: <suggested_fix>. Confirm? (y/n)". If the user declines, the outcome flips to `structural_declined` — route to overlay instead with note "user declined structural apply", and append a single `routed_to_overlay` line followed by a single `overlay` line to `decisions.jsonl` (no `applied` line). If the user accepts, apply via the Edit tool (semantic edit reflecting the intent of `suggested_fix`), then log: `{"action": "applied", "target": "prompt_file", "tool": "edit", "fix_strategy": "structural", "intent": "<suggested_fix>", "line": N, "risk_acknowledged": true}`.
-
-    Implementation note: when the user said `hepsini düzelt` (wildcard), the risk-warning prompt is shown ONCE per structural finding, not bundled. Each structural application is its own decision point.
-
-  After a successful write (either substring_replace or edit), append the corresponding entry to `decisions.jsonl`. For backward-compatible substring writes the full line shape is:
+  For substring writes:
 
   ```json
-  {"ts":"<now>","finding":"<id>","lens":"<lens>","action":"applied","target":"prompt_file","tool":"substring_replace","fix_strategy":"substring","from":"<current_excerpt>","to":"<suggested_fix>","line":<N>,"source":"phase_9_decision_string","raw_segment":"<user-segment>","original_sha256":"<ACTUAL_SHA>","new_sha256":"<post-write SHA>"}
+  {"ts":"<now>","finding":"<id>","lens":"<lens>","action":"applied","target":"prompt_file","tool":"substring_replace","fix_strategy":"substring","from":"<current_excerpt>","to":"<suggested_fix>","line":<N>,"source":"phase_9_decision_string","raw_segment":"<user-segment>","original_sha256":"<ORIGINAL_PROMPT_SHA at Phase 10 entry>","new_sha256":"<post-write SHA>"}
   ```
 
   For structural writes:
 
   ```json
-  {"ts":"<now>","finding":"<id>","lens":"<lens>","action":"applied","target":"prompt_file","tool":"edit","fix_strategy":"structural","intent":"<suggested_fix>","line":<N>,"risk_acknowledged":true,"source":"phase_9_decision_string","raw_segment":"<user-segment>","original_sha256":"<ACTUAL_SHA>","new_sha256":"<post-write SHA>"}
+  {"ts":"<now>","finding":"<id>","lens":"<lens>","action":"applied","target":"prompt_file","tool":"edit","fix_strategy":"structural","intent":"<suggested_fix>","line":<N>,"risk_acknowledged":true,"source":"phase_9_decision_string","raw_segment":"<user-segment>","original_sha256":"<ORIGINAL_PROMPT_SHA at Phase 10 entry>","new_sha256":"<post-write SHA>"}
   ```
 
-  Recompute `ACTUAL_SHA` immediately after the write so the next finding in this pass sees the updated hash (otherwise subsequent applied findings within the same pass would all trip rule 3).
+  The `new_sha256` field is **archival only** — it records what the file looks like after this write so resume / audit-trail tooling can reconstruct history. It is NOT compared back to `findings.json.prompt_sha256` for the next finding in the same pass; see Pre-flight.
 
-- **`tr_routed` / `no_concrete_fix` / `sha_mismatch` / `ambiguous` / `structural_declined`** — do NOT modify the prompt file. Update `findings_state[fid].status = "overlay"` in memory. Append ONE `routed_to_overlay` line then ONE `overlay` line to `decisions.jsonl`:
+- **`sentinel_intentional`** — do NOT modify the prompt file, do NOT add to the overlay set. The runner already marked the finding as benign. Update `findings_state[fid].status = "dismissed"` in memory. Append ONE `dismissed` line:
+
+  ```json
+  {"ts":"<now>","finding":"<id>","lens":"<lens>","action":"dismissed","reason":"sentinel: Intentional — runner judged this benign, no action","source":"phase_10_sentinel_guard"}
+  ```
+
+- **`tr_routed` / `sentinel_todo` / `no_concrete_fix` / `sha_mismatch` / `ambiguous` / `structural_declined`** — do NOT modify the prompt file. Update `findings_state[fid].status = "overlay"` in memory. Append ONE `routed_to_overlay` line then ONE `overlay` line to `decisions.jsonl`:
 
   ```json
   {"ts":"<now>","finding":"<id>","lens":"<lens>","action":"routed_to_overlay","reason":"<reason from outcome>","source":"phase_9_decision_string","raw_segment":"<user-segment>"}
@@ -1032,7 +1166,7 @@ Determine the outcome per finding from the following ordered rules:
 
 **No `applied` line is ever written for a finding whose outcome was anything other than `applicable` + successful dispatch.** The feasibility check (and, for structural, the user's risk acknowledgement) precedes the log write — full stop.
 
-After the applied pass completes, recompute `current_prompt_sha256 = shasum -a 256 "$PROMPT_PATH"` and store it in memory for downstream queries. **Do not modify `findings.json.prompt_sha256`** — that field is the audit snapshot and stays frozen.
+After the applied pass completes, record `current_prompt_sha256 = shasum -a 256 "$ABS_PROMPT"` in memory for archival / downstream queries. **Do not modify `findings.json.prompt_sha256`** — that field is the audit snapshot from Phase 2 and stays frozen.
 
 If any auto-conversion happened in this sub-step (any outcome other than `applicable` + applied), re-run 10.2 once so `inline-suggestions.md` includes the newly routed overlay findings.
 
@@ -1040,6 +1174,8 @@ Track the per-outcome counts for the Phase 10.5 closing summary:
 - `applied_count` — outcome was `applicable` and the write succeeded (any `fix_strategy`)
 - `structural_applied_count` — subset of `applied_count` where `fix_strategy: "structural"` (user acknowledged the risk warning and the Edit tool fired)
 - `tr_routed_count` — outcome `tr_routed`
+- `sentinel_todo_count` — outcome `sentinel_todo` (routed to overlay)
+- `sentinel_intentional_count` — outcome `sentinel_intentional` (dismissed)
 - `no_fix_count` — outcome `no_concrete_fix`
 - `stale_audit_count` — outcome `sha_mismatch`
 - `ambiguous_count` — outcome `ambiguous`
@@ -1060,7 +1196,7 @@ Process findings whose status is `discussed` in `id` order (stable across resume
    - Append a `revised` entry to `decisions.jsonl` with `new_suggestion: <user-supplied text>`, `original_suggestion: <findings.suggested_fix>`, `at: <now>`.
    - Then ask via `AskUserQuestion` whether to apply the revised text or store it as overlay only — two options.
    - The user's chosen final action runs through the same logic as 10.3 (if `applied`) or 10.2 (if `overlay`). For `applied`, the substring being replaced is still `current_excerpt`; the replacement is the revised text from the user.
-4. **TR routing rule still applies inside 10.4:** if the finding has `lens == "tr_phonetic"` and the user picks `applied` (or `revised → applied`), auto-convert to `overlay` with a `routed_to_overlay` entry in `decisions.jsonl` preceding the `overlay` entry.
+4. **TR advisory routing rule still applies inside 10.4:** if the finding has `lens == "tr_phonetic"` AND `fix_kind == "advisory"` (foreign_word / abbreviation) and the user picks `applied` (or `revised → applied`), auto-convert to `overlay` with a `routed_to_overlay` entry in `decisions.jsonl` preceding the `overlay` entry. TR findings with `fix_kind == "replace"` (number_readability / punctuation) are NOT force-routed and follow the normal 10.3 flow.
 5. **Record the final action** in `decisions.jsonl` (`applied` / `overlay` / `dismissed`). Update `findings_state[fid].status` to that terminal status. Do not leave `discussed` or `revised` as the final status — they are transient.
 6. **Loop** until every `discussed` finding has been resolved to one of the four terminal states.
 
@@ -1074,7 +1210,8 @@ Print a single block. The counts mirror the per-outcome accounting from 10.3 and
 Interactive review complete — <run-NNN>
 
 - Applied:        <N> (each one actually wrote to <prompt-path>; of which <S> structural via Edit tool)
-- Auto-routed:    <X> (TR: <a>, no-fix: <b>, stale-audit: <c>, ambiguous: <d>, structural-declined: <e>)
+- Auto-routed:    <X> (TR: <a>, sentinel TODO: <st>, no-fix: <b>, stale-audit: <c>, ambiguous: <d>, structural-declined: <e>)
+- Sentinel Intentional: <SI> (dismissed — runner judged benign, no action)
 - Manually overlay: <Y> (user chose "yorum bırak" directly)
 - Dismissed:      <Z>
 - Revised:        <W> (of which: A applied, B overlay)
@@ -1085,7 +1222,8 @@ Session state: <relative path to $RUN_DIR/session.json>
 ```
 
 - `Applied` = `applied_count` from 10.3 (the number of `applied` lines in `decisions.jsonl` for this pass; never inflated by failed-feasibility findings). The `of which <S> structural via Edit tool` split surfaces `structural_applied_count` so the user can see how many writes went through the risk-warned Edit path versus plain substring replacement.
-- `Auto-routed` = `tr_routed_count + no_fix_count + stale_audit_count + ambiguous_count + structural_declined_count` from 10.3. Always break down by the five reasons so the user knows why each one was redirected.
+- `Auto-routed` = `tr_routed_count + sentinel_todo_count + no_fix_count + stale_audit_count + ambiguous_count + structural_declined_count` from 10.3. Always break down by the six reasons so the user knows why each one was redirected. (Sentinel TODO is broken out separately because it has a distinct semantic — author must resolve by hand.)
+- `Sentinel Intentional` = `sentinel_intentional_count` from 10.3 (findings the runner pre-marked as benign, dismissed without overlay).
 - `Manually overlay` = findings whose Phase 9 decision was `overlay` (or `konuşalım → overlay`). Does NOT include the auto-routed bucket — those are reported separately to avoid double-counting.
 - `Revised` = findings that went through the `konuşalım → revised` path in 10.4. The `A applied, B overlay` split reflects the terminal action chosen for each revised entry.
 
@@ -1112,3 +1250,8 @@ Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. 
 - Don't write an `applied` line to `decisions.jsonl` for a finding that didn't actually modify the prompt file. The feasibility check must precede the log write — single event per finding outcome. A failed-feasibility finding produces exactly one `routed_to_overlay` line followed by exactly one `overlay` line; an applicable finding produces exactly one `applied` line. Never two events that imply a prompt-file mutation when none occurred.
 - Don't sort findings by line number alone — severity-first grouping is mandatory for both findings.json and report.md.
 - Don't enable PROMPTCHECKER_TIMING in production runs unless debugging. The overhead is small but the timing.log file grows on every run and clutters the run dir.
+- Don't re-compare the prompt file's SHA to `findings.json.prompt_sha256` after the first apply in a Phase 10 pass. The stale-audit guard is computed ONCE in Phase 10's Pre-flight and checks for *pre-audit* drift; intra-pass mutations from successful applies are intended and must not feed back into the comparison. The `new_sha256` field in `decisions.jsonl` is archival only.
+- Don't write to `decisions.jsonl` or `session.json` during Phase 9.4 parsing — those writes are gated on explicit user confirmation in Phase 9.6 (Stage 2). The parser emits an in-memory plan only; the commit block runs after `evet`/`yes`/`onayla`/`ok`/`tamam`/`confirm`.
+- Don't emit JSONL decision records missing the spec-required keys `ts`, `finding`, `lens`, `action`. The commit block self-checks every record and refuses to write incomplete lines (see `references/overlay-format.md` Section 2).
+- Don't force-route every TR finding to overlay. Only TR findings with `fix_kind: "advisory"` (categories `foreign_word` and `abbreviation`) bypass the prompt file. TR findings with `fix_kind: "replace"` (categories `number_readability` and `punctuation`) follow the normal apply flow in Phase 10.3.
+- Don't apply a TODO/Intentional sentinel as if it were a regular structural fix. The sentinel guard in Phase 10.3 (step 4) intercepts them: `TODO:` routes to overlay (`sentinel_todo`), `Intentional —` is dismissed (`sentinel_intentional`). Neither ever reaches the Edit tool.
