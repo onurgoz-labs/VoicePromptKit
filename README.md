@@ -325,4 +325,4 @@ All cross-phase state is exchanged via JSON files under `.promptcheck/<basename>
 
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE) for the full text.
