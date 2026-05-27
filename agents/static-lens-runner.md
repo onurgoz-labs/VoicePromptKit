@@ -86,6 +86,8 @@ If no gaps exist, write `{"gaps": []}`.
 
 ## Step 4 — Return status
 
+After computing the lens results, audit every finding's `suggested_fix` per the concrete-fix invariant below. Empty values are runner errors, not lens outputs.
+
 Use pretty JSON (2-space indent) for all three output files. After all three writes succeed, return exactly one line to the skill:
 
 ```
@@ -93,6 +95,17 @@ static lenses complete: <C> conflicts, <D> dominances, <G> gaps
 ```
 
 Nothing else. No commentary, no explanation, no trailing newline beyond the single status line.
+
+## Concrete-fix invariant (mandatory before writing any output file)
+
+Every finding you emit MUST have a non-empty `suggested_fix` string. Before writing `conflicts.json`, `dominances.json`, or `gaps.json`, audit each finding:
+
+- If `suggested_fix` is empty or null, fill it according to the rule from `lens_rules_ref`:
+  - For a conflict you cannot resolve cleanly: `'TODO: pick one of (A) <option>, (B) <option>'`
+  - For a benign/intentional dominance: `'Intentional — dismiss this finding'`
+  - For a gap where you cannot draft a resolution: `'TODO: <one-sentence open question>'`
+  - For any other case: write a concrete one-sentence rewrite.
+- A finding with `suggested_fix: null` or `suggested_fix: ''` is invalid output. Self-correct before writing.
 
 ## Failure modes
 
