@@ -2,7 +2,7 @@
 
 A Claude Code plugin that audits your prompts the way a strict reviewer would: it finds rules that **contradict each other**, rules that **silently override others**, **gaps** the prompt itself raises but never resolves, **behavioural drift** between what the prompt asks and what the model actually does, and — for Turkish voice agents — **phonetic problems** that break text-to-speech.
 
-You run it on any prompt file (system prompt, Claude Code subagent definition, Vapi voice script, chained workflow) and get back two artefacts per audit run: a human-readable `report.md` and a structured `findings.json` that Claude can apply back as edits when you say "fix these".
+You run it on any prompt file (system prompt, Claude Code subagent definition, Vapi voice script, chained workflow) and step through an interactive session: pick the lenses you want, review the findings in one summary table, then decide finding-by-finding which to apply, route to an overlay, dismiss, or discuss. Each run leaves behind a human-readable `report.md`, a structured `findings.json`, and a per-decision audit trail.
 
 The original prompt file is **never modified**. Every run lives in its own numbered directory so you can compare audits across edits.
 
@@ -21,9 +21,42 @@ The plugin auto-loads in every Claude Code session after that. No API keys, no S
 /prompt-check path/to/your/prompt.md
 ```
 
-That's it. No frontmatter required, no flags. The plugin uses sensible defaults: tests against `claude-opus-4-7`, writes a markdown report and a findings JSON to `.promptcheck/<basename>/run-NNN/`. The drift lens generates as many adversarial scenarios as `expand_count + anchor_count + min(2, conflicts + gaps)` (default `expand_count` is 3, so a prompt with no anchors and a handful of conflicts ends up with ~5).
+PromptChecker opens an interactive session. First it asks which lenses you want to apply (multi-select: conflict, dominance, gap, drift, TR phonetic — pre-checked based on your repo defaults). For `drift`, it asks `expand_count`. Then it dispatches the selected lenses as parallel subagents and shows you a single summary table:
 
-After the run, either say **"fix these"** / **"düzelt bunları"** in the same Claude session, or run **`/prompt-check-apply [run-id]`** explicitly. Claude reads the findings, verifies the prompt's SHA256 still matches the snapshot taken at audit time, then applies the fixes line-by-line. If the prompt has been edited since the audit, apply-mode refuses and asks you to re-run `/prompt-check`.
+| id | lens | severity | line | excerpt | suggestion |
+|----|------|----------|------|---------|------------|
+| C1 | conflict | high | 15 | Always be formal... | Maintain a professional but warm register. |
+| ...
+
+Then it asks: **"Hangilerini ne yapayım?"** You answer free-form:
+
+```
+C1, C3 düzelt; G2 yorum bırak; T1..T5 konuşalım; gerisini atla
+```
+
+The grammar accepts Turkish and English keywords:
+
+| Keyword | Meaning |
+|---|---|
+| `düzelt` / `apply` / `fix` | apply the suggestion to the prompt file |
+| `yorum bırak` / `overlay` / `comment` | write the suggestion to `inline-suggestions.md` (prompt file untouched) |
+| `atla` / `skip` / `dismiss` | log only; no action |
+| `konuşalım` / `discuss` / `talk` | open per-finding sub-dialogue |
+| `gerisini atla` / `gerisini yorum` / `gerisini düzelt` | wildcard for all unmarked findings |
+| `iptal` / `cancel` | exit and leave session at pending (resume later with `/prompt-check-resume`) |
+
+For findings you say "konuşalım" to, PromptChecker enters a per-finding dialogue: you see the full finding, then choose: accept the default suggestion / revise it yourself / route to overlay / dismiss. The dialogue terminates when every discussed finding has a final status.
+
+**TR phonetic exception:** even if you say `düzelt` for a TR finding, PromptChecker routes it to the overlay instead. Phonetic adjustments and pronunciation choices are voice-design decisions the author owns; false positives are common, and a silent prompt edit can poison a Vapi / ElevenLabs script.
+
+Every decision lands in three places under `.promptcheck/<basename>/run-NNN/`:
+- `session.json` — current snapshot (what's pending, what's applied, what's overlay, what's dismissed)
+- `decisions.jsonl` — append-only audit log (every action ever taken, with timestamps)
+- `inline-suggestions.md` — human-readable overlay of every finding routed to overlay
+
+The original prompt file is **only** modified when you explicitly say `düzelt` on a non-TR finding. Even then, a SHA256 stale-audit guard refuses to apply if the prompt was edited between audit and decision — re-run `/prompt-check <prompt>` to refresh.
+
+Mid-session interruption is fine. Run `/prompt-check-resume` later and it re-enters the summary view filtered to findings with status: pending.
 
 ## What it looks for — the five lenses
 
@@ -33,13 +66,13 @@ After the run, either say **"fix these"** / **"düzelt bunları"** in the same C
 | **Dominance** | Rules that silently override others through position, length, specificity, recency, or role-override patterns ("ignore previous instructions…") | yes |
 | **Gap** | Undefined edge cases (incomplete conditionals) and ambiguous terms ("appropriate", "reasonable") that the prompt's own rules raise | yes |
 | **Drift** | Behavioural mismatch between the prompt's stated rules and the model's actual output, surfaced by adversarial scenarios | only when anchors / conflicts / role-overrides exist (skipped otherwise) |
-| **TR phonetic** | Numbers, abbreviations, foreign words, and pacing problems that break Turkish text-to-speech | opt-in via `tr_phonetic: true` frontmatter or project config |
+| **TR phonetic** | Numbers, abbreviations, foreign words, and pacing problems that break Turkish text-to-speech. TR phonetic findings are advisory-only — always routed to overlay, even on `düzelt`. The original prompt file is never modified by them. | opt-in via `tr_phonetic: true` frontmatter or project config |
 
 ### TR phonetic — how fixes are applied
 
 The TR lens produces **three kinds of finding**: `replace` (real typos / punctuation errors that get substituted in place), `pronunciation_hint` (foreign words and risky abbreviations whose **written text stays** — the entry goes into a pronunciation guide block instead), and `advisory` (judgement calls; reported only). The lens never translates: `pound → paund` is a phonetic hint; `pound → İngiliz lirası` is forbidden semantic substitution.
 
-When you say "fix these", apply-mode runs two passes: replace pass for line-level substitutions, then a pronunciation-guide injection that updates an idempotent block in your prompt (between `<!-- promptchecker:pronunciation-guide:start -->` and `<!-- end -->`). Re-runs update the same block instead of duplicating it. If your prompt already has a `TTS PRONUNCIATION NOTES` / `Okunuş rehberi` / `Telaffuz` section, the block extends that section rather than creating a new one.
+TR phonetic findings are advisory-only — even if you say `düzelt` for one in the interactive session, PromptChecker routes it to the overlay (`inline-suggestions.md`) instead of editing the prompt. Phonetic adjustments and pronunciation choices are voice-design decisions the author owns; false positives are common, and a silent prompt edit can poison a Vapi / ElevenLabs script. The suggested `replace` text and the `pronunciation_entry` are both written into the overlay so you can hand-merge them on your terms.
 
 All five lenses live in `skills/prompt-check/SKILL.md` and its `references/`.
 
@@ -54,13 +87,16 @@ Every run gets its own directory. Older runs are preserved so you can diff audit
     │   ├── frontmatter.json
     │   ├── body.txt
     │   ├── rules.json
-    │   ├── conflicts.json
-    │   ├── dominances.json
-    │   ├── gaps.json
-    │   ├── drift.json          (or {"skipped_reason": ...})
-    │   ├── tr_phonetic.json    (only when tr_phonetic enabled)
-    │   ├── findings.json       ← merged, line-anchored, used by "fix these"
-    │   └── report.md           ← human-readable summary
+    │   ├── conflicts.json     (if conflict lens selected)
+    │   ├── dominances.json    (if dominance lens selected)
+    │   ├── gaps.json          (if gap lens selected)
+    │   ├── drift.json         (if drift lens selected, or skip reason)
+    │   ├── tr_phonetic.json   (if TR lens selected)
+    │   ├── findings.json
+    │   ├── report.md
+    │   ├── session.json            ← NEW: current decision snapshot
+    │   ├── decisions.jsonl         ← NEW: append-only audit log
+    │   └── inline-suggestions.md   ← NEW: overlay (re-rendered each pass)
     ├── run-002/
     ├── run-003/
     └── latest -> run-003/
@@ -95,7 +131,7 @@ Every run gets its own directory. Older runs are preserved so you can diff audit
 …
 ```
 
-### `findings.json` — what Claude applies
+### `findings.json` — what the interactive flow reads
 
 ```json
 {
@@ -149,7 +185,7 @@ Each finding declares one of three `fix_kind` values:
 - `pronunciation_hint` — written text untouched; `pronunciation_entry` (with `strategy: pronounce | rephrase | follow_with_translation`) is added to the managed pronunciation guide block in the prompt.
 - `advisory` — judgement call; reported only, never auto-applied.
 
-When you say "fix these", Claude runs **two passes**: Pass 1 applies every `replace` finding (line + excerpt must agree; ambiguous occurrences are skipped); Pass 2 writes or updates a single marker-delimited pronunciation block at the top of the prompt (or migrates an existing legacy `TTS PRONUNCIATION NOTES` / `Okunuş rehberi` block into managed format, preserving every entry). Findings with empty `suggested_fix` and `fix_kind: advisory` are never auto-applied.
+After the summary, you make per-finding decisions in free-form text (see Usage above). The skill carries out each decision in Phase 10.
 
 ## Customizing defaults
 
@@ -234,6 +270,8 @@ Every field is optional. Most users only override `anchors` (per-prompt regressi
 
 The plugin runs one skill end-to-end inside a single Claude context — no chain of round-tripping subagents. Only the drift lens dispatches a subagent (`drift-runner`), and only when there are anchors, conflicts, or role-override dominances; otherwise drift is skipped entirely.
 
+Phase 9 and Phase 10 are the interactive layer — they run automatically after Phase 8 in `/prompt-check` and re-enter from `/prompt-check-resume`.
+
 1. **Phase 0** — First-run wizard or load existing `.promptchecker.json`.
 2. **Phase 1** — Allocate a fresh `run-NNN` directory (atomic; `latest` symlink is updated only on success).
 3. **Phase 2** — Parse frontmatter deterministically and split body. Stores `body_line_offset` and `prompt_sha256` for line-mapping and stale-audit checks.
@@ -243,26 +281,33 @@ The plugin runs one skill end-to-end inside a single Claude context — no chain
 7. **Phase 6** — If `tr_phonetic: true`, seed `pronunciation_map` from existing pronunciation blocks, then scan body for new TR findings.
 8. **Phase 7** — Render `report.md` + `findings.json` (line numbers translated back to the original prompt file; `prompt_sha256` carried through).
 9. **Phase 8** — Update `latest` symlink (commit point), print terminal summary.
+10. **Phase 9** — Render summary table from `findings.json`. Bootstrap `session.json` (all findings start `pending`). Accept free-form decision string from the user, parse it, apply TR routing rule, append each decision to `decisions.jsonl`.
+11. **Phase 10** — Process decisions: dismissed (log only), overlay (rebuild `inline-suggestions.md`), applied (SHA256-guarded prompt edits, with auto-conversion to overlay on stale audit or ambiguous occurrences), discussed (per-finding sub-dialogue with accept / revise / overlay / dismiss). Re-render `session.json` snapshot. Print Phase 10 summary.
 
 ## Architecture
 
-The plugin is pure Claude Code skill orchestration. No Node, no TypeScript, no `npm install`, no `node_modules`, no `package.json` — just one skill file, three references, and one optional subagent definition.
+The plugin is pure Claude Code skill orchestration. No Node, no TypeScript, no `npm install`, no `node_modules`, no `package.json` — one skill file, five references, two commands, and three subagent definitions.
 
 ```
 .claude-plugin/
 ├── plugin.json
 └── marketplace.json
-commands/
-└── prompt-check.md
 skills/
 └── prompt-check/
     ├── SKILL.md
     └── references/
         ├── lens-rules.md       (conflict/dominance/gap/drift criteria)
         ├── tr-phonetic.md      (Turkish TTS rules)
-        └── probes.md           (drift probe templates)
+        ├── probes.md           (drift probe templates)
+        ├── dialog-flow.md      (NEW — Phase 9 templates + decision grammar)
+        └── overlay-format.md   (NEW — inline-suggestions.md + decisions.jsonl spec)
+commands/
+├── prompt-check.md
+└── prompt-check-resume.md      (NEW — `/prompt-check-apply` retired)
 agents/
-└── drift-runner.md             (only subagent; only dispatched when needed)
+├── drift-runner.md
+├── static-lens-runner.md
+└── tr-phonetic-runner.md
 examples/
 ├── sample-system.md
 ├── sample-agent.md
