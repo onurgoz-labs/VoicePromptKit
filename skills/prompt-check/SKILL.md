@@ -738,6 +738,7 @@ PromptChecker complete — <run-NNN>
 - Rules: <N> | Conflicts: <N> (<H> high) | Dominances: <N> | Gaps: <N>
 - Drift: <skipped|<N> scenarios, <P> passed, <F> failed>
 - TR phonetic: <disabled|<N> findings>
+- <K> TR pronunciation findings auto-filed to overlay's pronunciation_map (foreign_word: <a>, abbreviation: <b>)
 
 Report:   <relative path to $RUN_DIR/report.md>
 Findings: <relative path to $RUN_DIR/findings.json>
@@ -749,6 +750,8 @@ Entering interactive review (Phase 9). Use a compact decision string such as
 to choose what to do with each finding. Type "iptal" to leave the session as
 pending and resume later with /prompt-check-resume.
 ```
+
+The auto-filed line is shown ONLY when the count is non-zero. It sits alongside the existing rules / conflicts / dominances / gaps / drift / TR phonetic counts. **The TR phonetic count line still shows the TOTAL TR findings (advisory + replace) — the auto-filed line is an additional drill-down, not a replacement.** Compute `K` as the number of TR findings with `lens == "tr_phonetic" AND fix_kind == "advisory"`; `a` = count where `kind == "foreign_word"`; `b` = count where `kind == "abbreviation"`. These are the same findings that Phase 9.2's partition will assign to AUTO_FILED_SET.
 
 When `PROMPTCHECKER_TIMING=true`, append one extra line to the summary block above (between `Repo defaults:` and the blank line before "Entering interactive review"):
 
@@ -804,9 +807,22 @@ All timestamps are ISO 8601 UTC with millisecond precision, e.g. `2026-05-27T14:
 
 ### 9.2 — Render the summary view
 
-Print a single markdown table containing every finding. Columns: `id | lens | severity | line | excerpt | suggestion`. Sort by `line` ascending, then by `severity` descending (`high > medium > low`; drift findings are surfaced with their `kind` instead of severity — treat `fail` as `high`, `pass` as `low`).
+**Partition findings first.** Before constructing the summary table, split `findings.json.findings[]` into two disjoint sets:
 
-Truncate `excerpt` and `suggestion` to 60 chars each, appending `…` if cut. For TR phonetic findings, show `pronunciation_entry.phonetic` (or `.alt_translation`) as the suggestion column when `suggested_fix` is null.
+- **DECISION_SET** — every finding EXCEPT TR advisory findings. These are the findings the user sees and decides about.
+- **AUTO_FILED_SET** — every TR finding with `lens == "tr_phonetic"` AND `fix_kind == "advisory"` (i.e. `kind: foreign_word` or `kind: abbreviation`). These are auto-filed to the overlay's Pronunciation map without a user decision — the user never sees them in the summary table and is never asked about them.
+
+The summary table renders **DECISION_SET only**. The auto_filed processing (see Phase 9.4 stage 1) operates on **AUTO_FILED_SET**.
+
+Print a single markdown table containing every finding in DECISION_SET. Columns: `id | lens | severity | line | excerpt | suggestion`. Sort by `line` ascending, then by `severity` descending (`high > medium > low`; drift findings are surfaced with their `kind` instead of severity — treat `fail` as `high`, `pass` as `low`).
+
+Truncate `excerpt` and `suggestion` to 60 chars each, appending `…` if cut. For TR phonetic findings still in DECISION_SET (i.e. `number_readability` / `punctuation`), show `suggested_fix` as the suggestion column — `pronunciation_entry` rendering is no longer needed in the table because TR advisory findings are filtered out by the partition.
+
+If `AUTO_FILED_SET` is non-empty, append a single line directly below the summary table (before the decision prompt):
+
+```
+_Note: <N> TR pronunciation findings (foreign_word + abbreviation) will be auto-filed to the overlay's Pronunciation map. They are not in the table — no decision needed._
+```
 
 The exact table header / footer wording lives in `references/dialog-flow.md`.
 
@@ -918,6 +934,12 @@ for segment in user_input.split(';'):
 # TR routing rule: tr_phonetic + applied + fix_kind == "advisory" → overlay.
 # Only foreign_word / abbreviation (fix_kind: advisory) are force-routed.
 # number_readability / punctuation (fix_kind: replace) follow the normal apply flow.
+#
+# Note: with auto_filed (below), this routed[] branch should rarely fire in
+# practice — TR advisory findings are never in DECISION_SET and so the user
+# cannot explicitly target them. The branch survives as a defensive guard in
+# case a caller bypasses the partition (e.g. a future API entry point) and
+# tries to apply a TR advisory finding directly.
 routed = []
 for i, (fid, status, raw) in enumerate(decisions_resolved):
     if status != 'applied' or findings_state[fid]['lens'] != 'tr_phonetic':
@@ -926,6 +948,29 @@ for i, (fid, status, raw) in enumerate(decisions_resolved):
     if finding.get('fix_kind') == 'advisory':
         routed.append(fid)
         decisions_resolved[i] = (fid, 'overlay', raw)
+
+# AUTO_FILED_SET — TR advisory findings (foreign_word + abbreviation) that the
+# user never sees in the summary table. They are silently routed to overlay
+# without a user decision. The plan records them as auto_filed so Stage 2
+# (Phase 9.6 commit) can log a distinct `action: "auto_filed"` line.
+#
+# These do NOT count toward parse errors / unrecognised segments — the user
+# didn't type anything for them; they are background routing.
+auto_filed_ids = []
+auto_filed_kinds = {'foreign_word': 0, 'abbreviation': 0}
+for fid, fmeta in findings_by_id.items():
+    if fmeta.get('lens') != 'tr_phonetic':
+        continue
+    if fmeta.get('fix_kind') != 'advisory':
+        continue
+    if fid in seen_ids:
+        # The user explicitly targeted this id — already handled by the
+        # routed[] branch above. Don't double-count.
+        continue
+    auto_filed_ids.append(fid)
+    k = fmeta.get('kind')
+    if k in auto_filed_kinds:
+        auto_filed_kinds[k] += 1
 
 # Outcome counters for the plan
 buckets = {'applied':0,'overlay':0,'dismissed':0,'discussed':0}
@@ -942,6 +987,9 @@ plan = {
     'discussed': buckets['discussed'],
     'tr_routed': len(routed),
     'tr_routed_ids': routed,
+    'auto_filed': len(auto_filed_ids),
+    'auto_filed_ids': auto_filed_ids,
+    'auto_filed_kinds': auto_filed_kinds,
     'unrecognised': unrecognised,
     'decisions': [
         {'finding': fid, 'lens': findings_state[fid]['lens'], 'action': status, 'raw_segment': raw}
@@ -952,6 +1000,23 @@ print(json.dumps(plan, ensure_ascii=False))
 PY
 ```
 
+**Auto-fill contract (in-memory, pseudo-code summarising the heredoc above):**
+
+```
+After parsing the user's decision string into a plan for DECISION_SET findings,
+add automatic decisions for AUTO_FILED_SET:
+
+for finding in AUTO_FILED_SET:
+    plan[finding.id] = {
+        "status": "overlay",
+        "reason": "auto_filed_tr_advisory",
+        "raw_segment": None  // user didn't type anything for this
+    }
+
+These do NOT count toward the parse error / unrecognised segment counts.
+They are not user decisions; they are background routing.
+```
+
 Pass the user's reply as `PROMPTCHECKER_DECISION_INPUT` (or stdin — whichever is cleaner in the harness). The block above is illustrative; trust `references/dialog-flow.md` as the source of truth for the verb table and grammar edge cases.
 
 ### 9.5 — Surface the plan and request confirmation (Stage 1.5)
@@ -959,12 +1024,20 @@ Pass the user's reply as `PROMPTCHECKER_DECISION_INPUT` (or stdin — whichever 
 Render the parsed plan back to the user as a clear prose message and ask for confirmation. Do NOT write anything to disk yet.
 
 ```
-Plan: <N> kararı çözümledim — <A> applied, <B> overlay, <C> dismissed, <D> discussed.
-TR auto-redirect: <E> bulgu (<id list>) overlay'e yönlendirilecek (TR findings never modify the prompt).
-Parse errors: <F> segmenti çözemedim (<list>).
+Plan:
+  Applied:    <N1>   (user said `düzelt`)
+  Overlay:    <N2>   (user said `yorum bırak`)
+  Discussed:  <N3>   (user said `konuşalım`)
+  Dismissed:  <N4>   (user said `atla`)
+  Auto-filed: <N5>   (TR pronunciation findings — no decision needed)
+  Parse errors: <N6> (re-prompt if non-zero)
 
-Onaylıyor musun? Onay için `evet` yaz; iptal için `iptal` yaz; değiştirmek için yeni karar dizesi yaz.
+TR auto-redirect: <E> bulgu (<id list>) overlay'e yönlendirilecek (TR findings never modify the prompt).
+
+Onaylıyor musun? (`evet` / `iptal` / yeni karar dizesi)
 ```
+
+The `Auto-filed` line is shown ONLY when `plan.auto_filed > 0`. It surfaces the count and the per-kind breakdown (`foreign_word: <a>, abbreviation: <b>`) so the user can verify the auto-file scope matches their expectation. The `TR auto-redirect` line above it stays — it covers the rare case where the user explicitly typed a TR advisory id (which the defensive `routed[]` branch handled). Auto-filed findings are NOT user decisions, so they live on their own line.
 
 If `unrecognised` is non-empty, surface the unparsed segments in the same block and remind the user they can type a corrected decision string to retry. If after parsing every pending finding still has `status: "pending"`, mention this and remind the user that `gerisini atla` is the explicit way to dismiss the remainder.
 
@@ -1006,8 +1079,34 @@ def emit(f, record):
     f.write(json.dumps(record, ensure_ascii=False) + '\n')
 
 out_path = os.path.join(run_dir, 'decisions.jsonl')
+
+# Look up per-finding kind for the auto_filed log lines.
+findings_path = os.path.join(run_dir, 'findings.json')
+findings_by_id = {}
+if os.path.exists(findings_path):
+    try:
+        fj = json.load(open(findings_path, encoding='utf-8'))
+        for f in fj.get('findings', []):
+            findings_by_id[f['id']] = f
+    except Exception:
+        pass
+
 with open(out_path, 'a', encoding='utf-8') as f:
-    # Routed entries first (one per TR-routed id)
+    # Auto-filed TR advisory findings — one `auto_filed` line per id. The
+    # session.json status for these is "overlay" (same as a user-initiated
+    # overlay decision); the distinction lives only in this JSONL action field.
+    for fid in plan.get('auto_filed_ids', []):
+        fmeta = findings_by_id.get(fid, {})
+        emit(f, {
+            'ts': now(),
+            'finding': fid,
+            'lens': 'tr_phonetic',
+            'action': 'auto_filed',
+            'reason': 'TR advisory finding — pronunciation hints are filed to inline-suggestions.md without user decision',
+            'fix_kind': 'advisory',
+            'kind': fmeta.get('kind'),
+        })
+    # Routed entries (one per TR-routed id — the defensive branch in 9.4)
     for fid in plan.get('tr_routed_ids', []):
         emit(f, {
             'ts': now(),
@@ -1016,7 +1115,7 @@ with open(out_path, 'a', encoding='utf-8') as f:
             'action': 'routed_to_overlay',
             'reason': 'TR phonetic findings never modify the prompt file',
         })
-    # Then the actual decisions
+    # Then the actual user decisions
     for d in plan.get('decisions', []):
         emit(f, {
             'ts': now(),
@@ -1027,7 +1126,13 @@ with open(out_path, 'a', encoding='utf-8') as f:
             'raw_segment': d.get('raw_segment', ''),
         })
 
-# Update session.json
+# Update session.json — auto_filed findings collapse to status: "overlay"
+# (same persistent status as user-overlay decisions; only decisions.jsonl
+# distinguishes them via the action field).
+for fid in plan.get('auto_filed_ids', []):
+    if fid in findings_state:
+        findings_state[fid]['status'] = 'overlay'
+        findings_state[fid]['updated_at'] = now()
 for d in plan.get('decisions', []):
     findings_state[d['finding']]['status'] = d['action']
     findings_state[d['finding']]['updated_at'] = now()
@@ -1039,13 +1144,25 @@ PY
 
 Pass the in-memory plan from 9.4 as `PROMPTCHECKER_DECISION_PLAN` (JSON-encoded). The self-check refuses to write any record missing `ts`, `finding`, `lens`, or `action` — these are the spec minimum from `references/overlay-format.md` Section 2.
 
+**Auto-filed contract (commit block above, summarising the JSONL writes):**
+
+```
+For each AUTO_FILED_SET finding, append ONE line to decisions.jsonl:
+  {"ts": "...", "finding": "<id>", "lens": "tr_phonetic", "action": "auto_filed",
+   "reason": "TR advisory finding — pronunciation hints are filed to inline-suggestions.md without user decision",
+   "fix_kind": "advisory", "kind": "<foreign_word|abbreviation>"}
+
+session.json.findings_state[<id>].status = "overlay" (same as user-overlay
+decisions; the distinction lives in decisions.jsonl audit log only).
+```
+
 After the commit succeeds, print a single line:
 
 ```
-Parsed N decisions: A applied, B overlay, C dismissed, D discussed, E TR-routed to overlay.
+Parsed N decisions: A applied, B overlay, C dismissed, D discussed, E TR-routed to overlay, F auto-filed.
 ```
 
-Then hand off to Phase 10 in the same turn. Do not wait for further confirmation — the user already confirmed at Stage 1.5.
+The `F auto-filed` segment is appended only when `plan.auto_filed > 0`. Then hand off to Phase 10 in the same turn. Do not wait for further confirmation — the user already confirmed at Stage 1.5.
 
 ```bash
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_9_end" >> "$TIMING_LOG"
@@ -1085,9 +1202,15 @@ For each finding with `findings_state[fid].status == "dismissed"`: log only, no 
 
 ### 10.2 — Overlay
 
-Collect every finding whose status is `overlay` (this includes the TR-routed findings from Phase 9.6's commit). Rebuild `$RUN_DIR/inline-suggestions.md` in full per the layout in `references/overlay-format.md`. The file is **rewritten from scratch on every Phase 10 pass** — idempotent regeneration ensures resumed sessions produce consistent overlays.
+Collect every finding whose status is `overlay` (this includes the TR-routed findings from Phase 9.6's commit and the auto-filed TR advisory findings). Rebuild `$RUN_DIR/inline-suggestions.md` in full per the layout in `references/overlay-format.md`. The file is **rewritten from scratch on every Phase 10 pass** — idempotent regeneration ensures resumed sessions produce consistent overlays.
 
-Do not append per-finding entries to `decisions.jsonl` for this step — the `overlay` decision was already logged in Phase 9.6's commit (or 10.3 if auto-converted from `applied`).
+**Per-finding entries vs. Pronunciation map — exclusion rule for auto-filed findings.** When iterating findings for the "Findings with overlay status" section, check the most recent entry in `decisions.jsonl` for each finding. If the most recent action for that finding is `auto_filed`, **skip the per-finding entry** — the finding appears ONLY in the bottom "Pronunciation map" section. Findings whose most recent action is `overlay` or `revised` (user-initiated overlay) DO render as per-finding entries. Rationale: auto-filed findings represent background routing, not user decisions; surfacing them as per-finding entries forces the reader to scan past noise the user never asked about.
+
+For backward compatibility with sessions produced before this rule existed: treat any TR finding with `lens == "tr_phonetic"` AND `fix_kind == "advisory"` AND `status == "overlay"` as auto-filed for rendering purposes (per-finding entry skip), even when its decisions.jsonl history lacks an `auto_filed` line.
+
+The bottom "Pronunciation map" section still picks up every TR advisory finding via `findings.json.pronunciation_map` — that union is unaffected by the per-finding skip rule. See `references/overlay-format.md` Section 1 for the layout.
+
+Do not append per-finding entries to `decisions.jsonl` for this step — the `overlay` / `auto_filed` decision was already logged in Phase 9.6's commit (or 10.3 if auto-converted from `applied`).
 
 ### 10.3 — Applied (feasibility-first, single-event logging)
 
@@ -1254,4 +1377,5 @@ Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. 
 - Don't write to `decisions.jsonl` or `session.json` during Phase 9.4 parsing — those writes are gated on explicit user confirmation in Phase 9.6 (Stage 2). The parser emits an in-memory plan only; the commit block runs after `evet`/`yes`/`onayla`/`ok`/`tamam`/`confirm`.
 - Don't emit JSONL decision records missing the spec-required keys `ts`, `finding`, `lens`, `action`. The commit block self-checks every record and refuses to write incomplete lines (see `references/overlay-format.md` Section 2).
 - Don't force-route every TR finding to overlay. Only TR findings with `fix_kind: "advisory"` (categories `foreign_word` and `abbreviation`) bypass the prompt file. TR findings with `fix_kind: "replace"` (categories `number_readability` and `punctuation`) follow the normal apply flow in Phase 10.3.
+- Don't ask the user about TR pronunciation findings (foreign_word + abbreviation) in Phase 9. They auto-file to the overlay's Pronunciation map. Showing them in the summary table or decision prompt is a UX regression — the pronunciation hint is never going to be applied (advisory rule), so surfacing it as a decision wastes the user's attention. They appear ONLY in Phase 8's auto-filed count line and in `inline-suggestions.md`'s bottom Pronunciation map section.
 - Don't apply a TODO/Intentional sentinel as if it were a regular structural fix. The sentinel guard in Phase 10.3 (step 4) intercepts them: `TODO:` routes to overlay (`sentinel_todo`), `Intentional —` is dismissed (`sentinel_intentional`). Neither ever reaches the Edit tool.
