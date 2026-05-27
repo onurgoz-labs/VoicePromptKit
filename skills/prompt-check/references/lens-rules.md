@@ -2,6 +2,8 @@
 
 Read this on first use during a `prompt-check` run. It is the canonical specification for every analysis lens. Where the SKILL.md outline says "apply the criteria in lens-rules.md", look here.
 
+> **Output invariant — every finding must carry a concrete suggested_fix.** Conflict, Dominance, and Gap lenses MUST populate `suggested_fix` with either: (a) a one-sentence rewrite ready to apply, (b) a one-sentence structural action ("Move R3 below R12"), (c) the literal string `TODO: <open question>` when no clean resolution exists, or (d) the literal string `Intentional — dismiss this finding` when the runner judged the situation benign. Null / empty `suggested_fix` is invalid output.
+
 ## Rule extraction
 
 You analyse the body text and extract every rule, instruction, constraint, or directive into a flat list of atomic rules.
@@ -48,7 +50,7 @@ Schema:
 { "conflicts": [{ "id": "C1", "rule_ids": ["R3","R8"], "severity": "low|medium|high", "reasoning": "<≤ 400 chars>" }] }
 ```
 
-For the `suggested_fix` in the merged findings.json: propose a concrete rewrite that resolves the contradiction (e.g. "Replace R8 with: 'Stay warm and approachable while preserving professional language.'"). If no clean resolution exists, leave empty.
+For the `suggested_fix` in the merged findings.json: propose a concrete rewrite that resolves the contradiction (e.g. "Replace R8 with: 'Stay warm and approachable while preserving professional language.'"). If no clean resolution exists, write `suggested_fix: 'TODO: pick one of (A) <option>, (B) <option>'` so the author has a starting point. Empty `suggested_fix` is no longer allowed.
 
 ## Dominance lens
 
@@ -75,7 +77,7 @@ Severity heuristic for dominance:
 - **medium** — `position` / `length` where the dominated rule is consequential, or `specificity` where the specific rule is too narrow.
 - **low** — `specificity` where the dominant rule is a benign intentional exception.
 
-For `suggested_fix`: name the action the prompt author should take (e.g. "Move R3 below R12, or merge them"). Empty if the dominance is intentional and benign.
+For `suggested_fix`: **always populate `suggested_fix` with a concrete one-sentence action** — e.g. "Move R3 below R12 and merge their content", "Remove R6 (subsumed by R8)", or "Replace R12 with: \"After the announcement completes, immediately trigger end-call-tool unless an interruption is in progress; in that case, finish the remainder first.\"". If the dominance is intentional/benign, write `suggested_fix: 'Intentional — dismiss this finding'` so the author can see the runner reached that conclusion. Empty `suggested_fix` is no longer allowed.
 
 ## Gap lens (strict scope)
 
@@ -118,7 +120,7 @@ Schema:
 { "gaps": [{ "id": "G1", "kind": "undefined_edge_case|ambiguous_term", "description": "<one sentence: the conditional that is incomplete, or the term that is undefined>", "related_rule_ids": ["R5"], "severity": "low|medium|high" }] }
 ```
 
-For `suggested_fix`: either define the missing branch (`"Add: 'If the customer is not upset and policy applies, follow the policy.'"`) or anchor the ambiguous term (`"Replace 'appropriately formal' with 'address callers by surname and use the formal pronoun form.'"`). Empty if the gap is advisory only.
+For `suggested_fix`: **always populate `suggested_fix` with a concrete one-sentence resolution** — for `undefined_edge_case`, write the missing branch verbatim (e.g. `"Add: 'If the user keeps interrupting after 3 attempts, trigger end-call-tool with a brief apology.'"`). For `ambiguous_term`, anchor the vague word with a specific replacement (e.g. `"Replace 'appropriately formal' with 'address callers by surname and use the formal pronoun form throughout.'"`). Empty `suggested_fix` is no longer allowed — if the runner cannot draft a resolution, it must write `suggested_fix: 'TODO: <one-sentence open question for the author>'` and the human handles it in the konuşalım sub-flow.
 
 ## Drift lens (handled by `drift-runner` subagent)
 
