@@ -345,3 +345,60 @@ When `section_ref` is null:
 - EN: `L284`
 
 Section title is NOT included in the inline header (would make the line too long); it appears once in the section-level summary at the top of report.md / inline-suggestions.md.
+
+## Render contract — compact one-line summary
+
+Every finding emitted by every lens — conflict, dominance, gap, schema,
+drift, tr_phonetic — is rendered downstream as a ONE-LINE summary in
+report.md, inline-suggestions.md, and Phase 9's summary table. Lens
+runners produce the full rationale + suggested_fix; the render layer
+truncates for display.
+
+### Truncation algorithm (deterministic, applied by Phase 7)
+
+For `short_rationale`:
+1. Split the rationale on sentence boundaries (`. ` / `! ` / `? `).
+2. Take the first sentence.
+3. If length ≤ 120 chars: use as-is.
+4. If length > 120: truncate to 117 chars + `...`.
+
+For `short_fix`:
+1. For substring fix_strategy: take the full suggested_fix if ≤ 100 chars,
+   else truncate to 97 + `...`.
+2. For structural fix_strategy: extract the first imperative sentence
+   (Rewrite / Add / Move / Remove / Reword / Replace ...). If the
+   imperative + first object is ≤ 100 chars, use it; else truncate.
+3. For TODO sentinel (`TODO: ...`): use the TODO text verbatim (max 100 chars).
+4. For Intentional sentinel: render as `Intentional — dismiss this finding`.
+
+### Lens runner responsibilities
+
+Lens runners produce ONLY the full unabridged fields. They do NOT
+pre-truncate, pre-summarize, or generate "short" variants. Render-side
+truncation is the render layer's job (Phase 7).
+
+This separation lets the same findings.json drive multiple output
+formats: compact one-line summary for humans, full structured payload
+for tools that consume findings.json directly (LSP plugins, CI gates,
+external dashboards).
+
+### Severity / lens / line-marker rendering
+
+The render layer translates severity and lens names per `report_language`:
+- TR: yüksek / orta / düşük (severity); çelişki / baskınlık / boşluk / şema / davranışsal sapma / türkçe fonetik (lens).
+- EN: high / medium / low; conflict / dominance / gap / schema / drift / tr phonetic.
+
+Section marker uses `section_ref`:
+- subsection set: `Section 7.2 — L284` / `Bölüm 7.2 / Satır 284`
+- section only: `Section 7 — L284` / `Bölüm 7 / Satır 284`
+- null: `L284` / `Satır 284`
+
+### Final rendered finding (canonical example)
+
+TR mode:
+> - **Bölüm 7.2 / Satır 284** [C1 çelişki, yüksek] — Tonla ilgili çelişki (R3↔R2): "always formal" ile "casual ve friendly" birlikte uygulanabilir değil → **Maintain a professional but warm register.**
+
+EN mode:
+> - **Section 7.2 — L284** [C1 conflict, high] — Tone contradiction (R3↔R2): "always formal" and "casual and friendly" cannot coexist → **Maintain a professional but warm register.**
+
+The `**...**` bold wraps the section marker AND the suggested fix to anchor visual scanning. The `→` separator marks the transition from "what's wrong" to "what to do".

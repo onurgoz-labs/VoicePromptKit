@@ -23,10 +23,13 @@ The plugin auto-loads in every Claude Code session after that. No API keys, no S
 
 PromptChecker opens an interactive session. First it asks which lenses you want to apply (multi-select: conflict, dominance, gap, drift, TR phonetic — pre-checked based on your repo defaults). For `drift`, it asks `expand_count`. Then it dispatches the selected lenses as parallel subagents and shows you a single summary table:
 
-| id | lens | severity | line | excerpt | suggestion |
-|----|------|----------|------|---------|------------|
-| C1 | conflict | high | 15 | Always be formal... | Maintain a professional but warm register. |
+| id | lens | sev | section | line | summary |
+|---|---|---|---|---|---|
+| C1 | conflict | high | 7.2 | 284 | Tone contradiction (R3↔R2) → **Maintain a professional but warm register.** |
+| S1 | schema | high | 7 | 280 | Section 5 → 7: Section 6 missing → **Insert Section 6 — Placeholder, OR renumber.** |
 | ...
+
+The `summary` column combines short_rationale + short_fix in one line for fast scanning. The full text is in findings.json — Phase 10's konuşalım sub-flow shows it unabridged.
 
 Then it asks: **"Hangilerini ne yapayım?"** You answer free-form:
 
@@ -321,7 +324,7 @@ Every field is optional. Most users only override `anchors` (per-prompt regressi
 
 The plugin runs one orchestrating skill that fans out to three subagents for the lens work. `static-lens-runner` is dispatched on every run; `drift-runner` and `tr-phonetic-runner` are conditional (drift only when anchors / conflicts / role-overrides exist AND `expand_count > 0`; TR only when `tr_phonetic: true`).
 
-**Parallel topology:** Phase 4 (static lenses) and Phase 6 (TR phonetic) are independent — the skill dispatches both subagents in a single message with two concurrent `Agent` calls. Phase 5 (drift) is **downstream of Phase 4** because drift-runner reads `conflicts.json`, `gaps.json`, and `dominances.json` as inputs; it runs after Phase 4 lands.
+**Parallel topology:** Phase 4 fans out FIVE concurrent `Agent` calls in a single assistant turn: conflict, dominance, gap, schema (each via static-lens-runner with `selected_lenses` singleton), and tr-phonetic (via tr-phonetic-runner). Phase 5 (drift) is downstream of conflict + dominance + gap — drift-runner reads those three artefacts as inputs, so it starts as soon as those three land (doesn't wait for schema or tr-phonetic). Phase 7 waits for all six lens outputs before rendering.
 
 Phase 9 and Phase 10 are the interactive layer — they run automatically after Phase 8 in `/prompt-check` and re-enter from `/prompt-check-resume`.
 
@@ -329,13 +332,16 @@ Phase 9 and Phase 10 are the interactive layer — they run automatically after 
 2. **Phase 1** — Allocate a fresh `run-NNN` directory (atomic; `latest` symlink is updated only on success).
 3. **Phase 2** — Parse frontmatter deterministically and split body. Stores `body_line_offset`, `prompt_sha256`, `body_char_count`, and `compact_mode` (true when body_char_count > max_char_limit AND max_char_limit > 0). Phase 4-6 dispatches propagate these to each runner.
 4. **Phase 3** — Extract atomic, line-anchored rules from `body.txt`.
-5. **Phase 4** — Dispatch `static-lens-runner` (subagent) which applies conflict + dominance + gap + schema lenses and writes the four JSON outputs (`conflicts.json`, `dominances.json`, `gaps.json`, `schema.json`). The schema lens auto-skips when the body has no numbered section headings. Dispatched **in parallel with Phase 6**.
-6. **Phase 6** — In parallel with Phase 4, if `tr_phonetic: true`, dispatch `tr-phonetic-runner` (subagent) which seeds from existing pronunciation blocks and scans the body for new advisory findings.
-7. **Phase 5** — After Phase 4 completes, if warranted (anchors / conflicts / role-overrides present AND `expand_count > 0`), dispatch `drift-runner` (subagent) for adversarial scenarios + judging.
-8. **Phase 7** — Render `report.md` + `findings.json` (line numbers translated back to the original prompt file; `prompt_sha256` carried through).
-9. **Phase 8** — Update `latest` symlink (commit point), print terminal summary.
-10. **Phase 9** — Render summary table from `findings.json`. Bootstrap `session.json` (all findings start `pending`). Accept free-form decision string from the user, parse it, apply TR routing rule, append each decision to `decisions.jsonl`.
-11. **Phase 10** — Process decisions: dismissed (log only), overlay (rebuild `inline-suggestions.md`), applied (SHA256-guarded prompt edits, with auto-conversion to overlay on stale audit or ambiguous occurrences), discussed (per-finding sub-dialogue with accept / revise / overlay / dismiss). Re-render `session.json` snapshot. Print Phase 10 summary.
+   - **Phase 3.5 — Per-run lens-selection wizard.** PromptChecker emits an `AskUserQuestion` widget asking which of the six lenses to apply. Repo defaults from `.promptchecker.json` seed which options are pre-checked, but the question itself is MANDATORY — prose substitutes are a contract violation. If the user is in a headless context where AskUserQuestion is unavailable, the audit aborts with a clear error rather than proceeding silently.
+5. **Phase 4 — Parallel lens dispatch (5 concurrent Agent calls).** Emits five Agent calls in one turn:
+   - `static-lens-runner` × 4 (conflict / dominance / gap / schema, each with singleton `selected_lenses`)
+   - `tr-phonetic-runner` × 1 (conditional on user_intent.tr_phonetic_enabled)
+   The skill awaits all five before proceeding. Schema lens auto-skips on flat prompts with no numbered headings.
+6. **Phase 5 — Drift (downstream of static lenses).** Triggered as soon as conflicts.json + gaps.json + dominances.json land. Runs in parallel with schema and tr-phonetic if those are still working. Conditional: skipped when expand_count == 0 or no anchors/conflicts/role-overrides.
+7. **Phase 7 — Render.** Awaits all six lens outputs. Builds findings.json + report.md (line numbers translated back to the original prompt file; `prompt_sha256` carried through). Each finding renders as ONE LINE in report.md / inline-suggestions.md / Phase 9 summary table: `**Section 7.2 — L284** [C1 conflict, high] — short rationale → **short fix**`. The full rationale + suggested_fix stay verbatim in findings.json — truncation is render-only.
+8. **Phase 8** — Update `latest` symlink (commit point), print terminal summary.
+9. **Phase 9** — Render summary table from `findings.json`. Bootstrap `session.json` (all findings start `pending`). Accept free-form decision string from the user, parse it, apply TR routing rule, append each decision to `decisions.jsonl`.
+10. **Phase 10** — Process decisions: dismissed (log only), overlay (rebuild `inline-suggestions.md`), applied (SHA256-guarded prompt edits, with auto-conversion to overlay on stale audit or ambiguous occurrences), discussed (per-finding sub-dialogue with accept / revise / overlay / dismiss). Re-render `session.json` snapshot. Print Phase 10 summary. Phase 10's konuşalım sub-flow (per-finding deep dialogue) MANDATES `AskUserQuestion` for the four-option choice (kabul / revize / overlay / atla). Free-text follow-ups (revised suggestion text) use plain conversational input — that's intentional. The four-option choice itself is always AskUserQuestion.
 
 ## Architecture
 
