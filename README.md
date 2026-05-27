@@ -58,7 +58,7 @@ The original prompt file is **only** modified when you explicitly say `düzelt` 
 
 Mid-session interruption is fine. Run `/prompt-check-resume` later and it re-enters the summary view filtered to findings with status: pending.
 
-## What it looks for — the five lenses
+## What it looks for — the six lenses
 
 | Lens | Looks for | Always on? |
 |---|---|---|
@@ -67,6 +67,7 @@ Mid-session interruption is fine. Run `/prompt-check-resume` later and it re-ent
 | **Gap** | Undefined edge cases (incomplete conditionals) and ambiguous terms ("appropriate", "reasonable") that the prompt's own rules raise | yes |
 | **Drift** | Behavioural mismatch between the prompt's stated rules and the model's actual output, surfaced by adversarial scenarios | only when anchors / conflicts / role-overrides exist (skipped otherwise) |
 | **TR phonetic** | Numbers, abbreviations, foreign words, and pacing problems that break Turkish text-to-speech. Split by category: `foreign_word` + `abbreviation` routed to overlay (voice-design — prompt text never modified); `number_readability` + `punctuation` follow normal apply flow (`düzelt` modifies the prompt). | opt-in via `tr_phonetic: true` frontmatter or project config |
+| **Schema** | Section numbering / ordering / heading consistency. Detects gaps (Section 5 → 7), out-of-order subsections (3.3 then 3.2), orphan subsections (5.1 under Section 4), inconsistent heading styles, missing parent sections, and STEP-numbering gaps. | only when the prompt has numbered section headings (auto-skipped on flat prompts) |
 
 ### TR phonetic — split by category
 
@@ -78,7 +79,7 @@ The TR lens splits its four detection categories into two routing buckets, so vo
 
 The lens never translates: `pound → paund` is a phonetic hint; `pound → İngiliz lirası` is forbidden semantic substitution.
 
-All five lenses live in `skills/prompt-check/SKILL.md` and its `references/`.
+All six lenses live in `skills/prompt-check/SKILL.md` and its `references/`.
 
 ## Output layout
 
@@ -94,6 +95,7 @@ Every run gets its own directory. Older runs are preserved so you can diff audit
     │   ├── conflicts.json     (if conflict lens selected)
     │   ├── dominances.json    (if dominance lens selected)
     │   ├── gaps.json          (if gap lens selected)
+    │   ├── schema.json        (if schema lens selected, with applicability flag)
     │   ├── drift.json         (if drift lens selected, or skip reason)
     │   ├── tr_phonetic.json   (if TR lens selected)
     │   ├── findings.json
@@ -187,6 +189,7 @@ Each finding declares one of two `fix_kind` values:
 
 - `replace` — substring replacement (`current_excerpt` → `suggested_fix`). Emitted by `conflict`, `dominance`, `gap`, `drift` lenses, and TR phonetic findings with `kind: "number_readability"` or `kind: "punctuation"`.
 - `advisory` — reported only, never auto-applied. Emitted by TR phonetic findings with `kind: "foreign_word"` or `kind: "abbreviation"` (the `pronunciation_entry` lands in the overlay for the author to hand-merge into a TTS pronunciation guide).
+- `schema` lens emits `fix_kind: "replace"` for every finding (just like conflict / dominance / gap). Most schema findings have `fix_strategy: "structural"` (insert/renumber/reorder requires the Edit tool); `heading_style_inconsistent` is `fix_strategy: "substring"` (clean text replacement of one heading).
 
 After the summary, you make per-finding decisions in free-form text (see Usage above). The skill carries out each decision in Phase 10.
 
@@ -283,7 +286,7 @@ Phase 9 and Phase 10 are the interactive layer — they run automatically after 
 2. **Phase 1** — Allocate a fresh `run-NNN` directory (atomic; `latest` symlink is updated only on success).
 3. **Phase 2** — Parse frontmatter deterministically and split body. Stores `body_line_offset` and `prompt_sha256` for line-mapping and stale-audit checks.
 4. **Phase 3** — Extract atomic, line-anchored rules from `body.txt`.
-5. **Phase 4** — Dispatch `static-lens-runner` (subagent) which applies conflict + dominance + gap lenses and writes the three JSON outputs (`conflicts.json`, `dominances.json`, `gaps.json`). Dispatched **in parallel with Phase 6**.
+5. **Phase 4** — Dispatch `static-lens-runner` (subagent) which applies conflict + dominance + gap + schema lenses and writes the four JSON outputs (`conflicts.json`, `dominances.json`, `gaps.json`, `schema.json`). The schema lens auto-skips when the body has no numbered section headings. Dispatched **in parallel with Phase 6**.
 6. **Phase 6** — In parallel with Phase 4, if `tr_phonetic: true`, dispatch `tr-phonetic-runner` (subagent) which seeds from existing pronunciation blocks and scans the body for new advisory findings.
 7. **Phase 5** — After Phase 4 completes, if warranted (anchors / conflicts / role-overrides present AND `expand_count > 0`), dispatch `drift-runner` (subagent) for adversarial scenarios + judging.
 8. **Phase 7** — Render `report.md` + `findings.json` (line numbers translated back to the original prompt file; `prompt_sha256` carried through).
@@ -313,7 +316,7 @@ commands/
 └── prompt-check-resume.md      (NEW — `/prompt-check-apply` retired)
 agents/
 ├── drift-runner.md             (conditional — adversarial scenarios + judging)
-├── static-lens-runner.md       (always dispatched — conflict + dominance + gap)
+├── static-lens-runner.md       (always dispatched — conflict + dominance + gap + schema)
 └── tr-phonetic-runner.md       (conditional — advisory-only TR lens)
 examples/
 ├── sample-system.md
