@@ -20,7 +20,14 @@ options:
   - label: "gap"          description: "Undefined edge cases and ambiguous terms"
   - label: "drift"        description: "Adversarial scenarios run through drift-runner subagent"
   - label: "tr_phonetic"  description: "Turkish phonetic readability — voice/TTS only"
+  - label: "schema"       description: "section numbering / ordering / heading consistency"
 ```
+
+The `schema` lens auto-skips on prompts with no numbered section headings (flat
+instruction sets). If you select it and the prompt is flat, the Phase 8
+summary reports `Schema: 0 (no numbered section headings detected)` —
+no false positives. Useful for structured Vapi flows or system prompts
+that use `## SECTION N` / `### N.M` ATX headings.
 
 **Follow-up — drift only.** If `drift` was selected, ask:
 
@@ -76,6 +83,7 @@ After Phase 7 produces `findings.json`, the skill renders a single markdown tabl
 | id | lens | sev | line | excerpt | suggestion |
 |----|------|-----|------|---------|------------|
 | C1 | conflict | high | 12 | always answer in English | rephrase rule R3 to scope to non-TR users… |
+| S1 | schema | high | 280 | ## SECTION 7 — VALUE FRAMING | Insert Section 6 — <Placeholder> between line 220 and 280, OR renumber Section 7 → 6 and shift subsequent sections down. |
 | G2 | gap | medium | 27 | … | … |
 | T1 | tr_phonetic | high | 42 | 100 TL | yüz lira |
 
@@ -91,6 +99,8 @@ Special: gerisini atla | gerisini yorum | hepsini düzelt | hepsini yorum bırak
 > **Note:** TR findings with `kind == "foreign_word"` or `"abbreviation"` (`fix_kind: "advisory"`) are NOT in this table — they auto-file to the overlay's Pronunciation map without a user decision. Only TR findings with `kind == "number_readability"` or `"punctuation"` (`fix_kind: "replace"`) appear here. The `T1` row above is an example of a TR `number_readability` finding (`100 TL` → `yüz lira`), which is `fix_kind: "replace"` and therefore still in the table.
 >
 > The auto-filed banner directly below the table is rendered ONLY when the AUTO_FILED_SET is non-empty (i.e. the audit found one or more TR `foreign_word` / `abbreviation` findings). Otherwise it is omitted.
+
+> The `S`-prefix on schema finding ids (`S1`, `S2`, …) is intentional — distinct from `C` / `D` / `G` / `T` to make grep / filter easy.
 
 After the table, render the prompt verbatim and accept free-form text on the next user turn.
 
@@ -171,6 +181,8 @@ Proceed? (yes/no)
 
 Wait for explicit confirmation before any side-effect. If the user says no, return to the free-form decision prompt with the same findings table.
 
+Schema findings (`S1`, `S2`, ...) follow the normal apply / overlay / dismiss / discuss flow — no special routing. Most schema fixes are structural (renumber / reorder / insert), so when the user picks `düzelt`, Phase 10 surfaces the risk warning before using the Edit tool. The exception is `heading_style_inconsistent` which is substring-style and applies cleanly.
+
 ## 4 — TR routing rule (per-category)
 
 TR phonetic findings split into two routing buckets based on `kind`:
@@ -188,6 +200,16 @@ The auto-file rule for `foreign_word` / `abbreviation` is non-negotiable. There 
 - `number_readability` / `punctuation` (`fix_kind: "replace"`) → normal flow. The verb is applied just like to any non-TR finding (apply / overlay / dismiss / discuss).
 
 This split is mandatory — the previous "silent redirect" behaviour caused user confusion (cf. real runtime: user said `hepsini düzelt`, plugin applied 0, user surprised). With auto-file, TR advisory findings never enter the decision set, so wildcards no longer need a special-case redirect message for them; the auto-filed banner is the single explicit surface.
+
+**Per-lens routing summary.**
+
+| Lens | Routing |
+|---|---|
+| conflict / dominance / gap | normal apply flow |
+| drift | findings are read-only (no apply); user routes to overlay or dismiss |
+| tr_phonetic foreign_word / abbreviation | auto-filed (hidden from summary) |
+| tr_phonetic number_readability / punctuation | normal apply flow |
+| schema | normal apply flow; most fixes structural (Edit tool with risk warning) |
 
 ## 5 — "Konuşalım" sub-flow (Phase 10, for `status: discussed`)
 
