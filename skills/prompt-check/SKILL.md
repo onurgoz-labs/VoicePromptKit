@@ -482,7 +482,26 @@ Apply this to every `findings[].line` and `findings[].related_lines[]`. After tr
 
 `pronunciation_map` is the union of `tr_phonetic.json.seed_entries` (entries the prompt already had — `source: "seed"`) and the `pronunciation_entry` payload of TR findings (`source: "finding"`). Dedupe by `term` (case-insensitive); if a seed entry and a finding entry collide, **seed wins** (the author's curated text is the source of truth). It is a flat reference list rendered in `report.md` and surfaced in `findings.json` for downstream tooling — Phase 10 never injects it back into the prompt.
 
-`findings[]` is sorted by `line` ascending, then by severity descending. For each finding:
+**Sort order for findings[] and rendered output:**
+
+1. **Severity descending** — high (h) → medium (m) → low (l). High-severity findings appear first regardless of where they are in the file.
+2. **Lens group within severity bucket** — within each severity bucket, group by lens in this fixed order: conflict, dominance, gap, drift, tr_phonetic.
+3. **Line ascending within (severity, lens) group** — within the same severity AND lens, sort by line number ascending.
+
+In Python:
+```python
+LENS_ORDER = {"conflict": 0, "dominance": 1, "gap": 2, "drift": 3, "tr_phonetic": 4}
+SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+findings.sort(key=lambda f: (
+    SEVERITY_ORDER.get(f.get("severity", "low"), 2),
+    LENS_ORDER.get(f["lens"], 99),
+    f.get("line", 0)
+))
+```
+
+Apply this sort BOTH to `findings.json.findings[]` AND to the visual rendering in report.md.
+
+For each finding:
 - `fix_kind: "replace"` → Phase 10's applied step rewrites the line so it produces `suggested_fix` instead of `current_excerpt`. Only emitted by `conflict`, `dominance`, `gap`, `drift` lenses (never TR phonetic).
 - `fix_kind: "advisory"` → no automatic apply. **Every TR phonetic finding uses this**, regardless of whether `suggested_fix` or `pronunciation_entry` is populated.
 
@@ -510,34 +529,97 @@ The TR lens never produces `replace` findings — TR suggestions are always repo
 
 ## Findings
 
-(One section per lens. Inside each section, one bullet per finding in line order.)
+(Grouped by severity, then by lens. Within each (severity, lens) group, findings are line-ordered.)
 
-### Conflicts
-- **L<line>** [C1 severity=high, R3↔R8] — <rationale>
-  - **Current:** `<current_excerpt>`
-  - **Fix:** `<suggested_fix or "(see rationale)">`
+### HIGH severity
 
-### Dominances
-- **L<line>** [D1 mechanism=role-override, R12 > R3] — <rationale>
-  - …
+#### Conflicts
+- **L<line>** [<id> severity=high, R<a>↔R<b>] — <rationale>
+  - <diff-aware body — see render rules below>
+- (or "_None._" if no high-severity conflicts)
 
-### Gaps
-- **L<line>** [G1 severity=medium, ambiguous_term, related R5] — <rationale>
-  - …
+#### Dominances
+- ...
 
-### Drift
-(If skipped:) _Skipped — <skipped_reason>._
-(Otherwise per scenario:)
+#### Gaps
+- ...
+
+#### Drift
+- ...
+
+#### TR phonetic
+- ...
+
+### MEDIUM severity
+
+#### Conflicts
+- ...
+
+(etc.)
+
+### LOW severity
+
+(etc.)
+```
+
+If an entire severity bucket has zero findings across all lenses, omit that bucket entirely (don't render "### HIGH severity\n_None._"). If a (severity, lens) pair has zero findings, render the section heading with "_None._" so the structure stays consistent.
+
+**Drift section special-case:** when drift was skipped at the run level (`drift.json.skipped_reason` is set), render a single `_Skipped — <skipped_reason>._` line under whichever severity bucket the drift scenarios would have landed in, OR under HIGH if no severity context exists. Per-scenario rendering still uses:
+
+```
 - **S1** [<kind>] <pass|fail> score=<0.00–1.00>
   - Input: `<scenario.input truncated to 120 chars>`
   - Reasons: <reasons joined>
-
-### TR phonetic
-(Only if enabled.)
-- **L<line>** [T1 number_readability severity=high] — <rationale>
-  - **Current:** `100 TL`
-  - **Fix:** `yüz lira`
 ```
+
+Treat drift `fail` as high severity, `pass` as low severity for bucketing purposes.
+
+### Diff rendering for findings
+
+For each finding, determine the render mode:
+
+- If `current_excerpt` and `suggested_fix` look like a substring substitution
+  (suggested_fix is similar to current_excerpt with localised character / word changes),
+  render a unified diff block:
+
+  ```diff
+  - <current_excerpt>
+  + <suggested_fix>
+  ```
+
+- If `suggested_fix` looks like a structural command
+  (starts with "Add ", "Rewrite ", "Move ", "Replace R", "Remove ", "Reword ", or is a
+  TODO sentinel like "TODO: ...", or is "Intentional — dismiss this finding"),
+  render as-is:
+
+  **Action:** <suggested_fix>
+
+Heuristic for "substring-style":
+- Compute a simple longest-common-subsequence ratio between current_excerpt and suggested_fix.
+- If ratio > 0.6 AND suggested_fix does not start with one of the structural keywords above,
+  it's substring-style → diff render.
+- Otherwise → action render.
+
+In Python (use difflib in the render heredoc):
+
+```python
+import difflib
+
+STRUCTURAL_PREFIXES = ("Add ", "Add: ", "Rewrite ", "Move ", "Replace R", "Remove ",
+                       "Reword ", "TODO:", "Intentional —", "Intentional -")
+
+def render_finding_body(current, suggested):
+    if not suggested or suggested.strip() == "":
+        return "**Action:** _(see rationale)_"
+    if any(suggested.startswith(p) for p in STRUCTURAL_PREFIXES):
+        return f"**Action:** {suggested}"
+    ratio = difflib.SequenceMatcher(None, current, suggested).ratio()
+    if ratio > 0.6:
+        return f"```diff\n- {current}\n+ {suggested}\n```"
+    return f"**Action:** {suggested}"
+```
+
+Drift findings still render with `Input:` and `Reasons:` per the per-scenario template above — the diff rule applies to conflict / dominance / gap / tr_phonetic findings.
 
 `report.md` is the canonical user-facing artefact. If `frontmatter.output` contains `findings_json` but not `markdown`, still write `report.md` — it costs nothing and is the doc humans read. If `output` contains `json`, write the merged report as `$RUN_DIR/report.json` (same shape as findings.json plus a `body_lines` field with the numbered body).
 
@@ -902,3 +984,4 @@ Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. 
 - Don't keep `findings_state[*].status` at `"discussed"` or `"revised"` as a terminal state — both are transient. Every finding must end at `pending` (only if the run is paused), `applied`, `overlay`, or `dismissed`.
 - Don't use `AskUserQuestion` for the free-form decision string in Phase 9.3 — it must be conversational so the user can express ranges, wildcards, and verb aliases in one line. Use `AskUserQuestion` only for the four-option choice inside the Phase 10.4 sub-flow.
 - Don't write an `applied` line to `decisions.jsonl` for a finding that didn't actually modify the prompt file. The feasibility check must precede the log write — single event per finding outcome. A failed-feasibility finding produces exactly one `routed_to_overlay` line followed by exactly one `overlay` line; an applicable finding produces exactly one `applied` line. Never two events that imply a prompt-file mutation when none occurred.
+- Don't sort findings by line number alone — severity-first grouping is mandatory for both findings.json and report.md.
