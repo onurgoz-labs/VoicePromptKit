@@ -19,7 +19,9 @@ Your user message is a JSON object split into **read-only inputs** and four **ou
     "frontmatter":     "<$RUN_DIR/frontmatter.json>",
     "rules":           "<$RUN_DIR/rules.json>",
     "lens_rules_ref":  "<skills/prompt-check/references/lens-rules.md>",
-    "selected_lenses": ["conflict", "dominance", "gap", "schema"]
+    "selected_lenses": ["conflict", "dominance", "gap", "schema"],
+    "compact_mode":    false,
+    "max_char_limit":  50000
   },
   "output_paths": {
     "conflicts":  "<$RUN_DIR/conflicts.json>",
@@ -33,6 +35,8 @@ Your user message is a JSON object split into **read-only inputs** and four **ou
 Read every file under `inputs` exactly once. **Never read any path under `output_paths`** — those files do not exist yet and reading them would burn a tool call. Write to each output path only at the end of the corresponding step.
 
 `selected_lenses` is the subset of the four static lenses (`["conflict", "dominance", "gap", "schema"]`) that the user kept enabled in the per-run wizard. Possible values: any non-empty subset. **For backward compatibility, if the input field is absent OR null OR empty, treat it as `["conflict", "dominance", "gap", "schema"]` (all four) — the existing behaviour, now including the schema lens.** See the "Selected-lenses dispatch" section below for the per-lens skip protocol.
+
+`compact_mode` is `true` when the prompt body exceeds `max_char_limit` (as measured in Phase 2 of the skill). When `true`, the runner applies cheaper analysis policies — see the "Compact mode policy" section below. When absent / null / false, the runner runs full-depth analysis (backward compat).
 
 The `lens_rules_ref` file is the canonical specification for every lens criterion below. Do not internalise those rules from memory — read the document at runtime so the criteria stay in one source of truth.
 
@@ -125,8 +129,10 @@ Audit every finding's `suggested_fix` per the concrete-fix invariant below. Empt
 Use pretty JSON (2-space indent) for all four output files. After all four writes succeed, return exactly one line to the skill:
 
 ```
-static lenses complete: <C> conflicts, <D> dominances, <G> gaps, <SCH> schema [<S>/4 skipped] (schema applicability: <APPLICABLE | NOT APPLICABLE | SKIPPED>)
+static lenses complete: <C> conflicts, <D> dominances, <G> gaps, <SCH> schema [<S>/4 skipped] (schema applicability: <APPLICABLE | NOT APPLICABLE | SKIPPED>) [compact mode: <ACTIVE | inactive>]
 ```
+
+When compact mode is active, the status surfaces it so the skill (and any downstream tooling) knows the cheaper policies fired.
 
 `<S>` is the count of lenses skipped because they were not in `selected_lenses` (0, 1, 2, 3, or 4). Always emit the `[<S>/4 skipped]` suffix, even when `<S>` is 0 — the skill parses it as part of the contract. Skipped lenses contribute 0 to `<C>` / `<D>` / `<G>` / `<SCH>` (their output files contain empty arrays plus `"skipped": true`).
 
@@ -145,6 +151,8 @@ Every finding emitted by the conflict, dominance, gap, OR schema lens MUST carry
   - For a schema finding: use the per-category templates documented in `lens_rules_ref` (e.g. `"Insert a 'Section N+1 — <Placeholder Title>' heading..."` for `section_gap`). If no concrete template applies, fall back to `'TODO: <one-sentence open question>'`.
   - For any other case: write a concrete one-sentence rewrite.
 - A finding with `suggested_fix: null` or `suggested_fix: ''` is invalid output for every static lens including schema. Self-correct before writing.
+
+Compact mode does NOT relax the concrete-fix invariant — every finding still requires a non-empty `suggested_fix`. The mode trims WHICH findings are emitted, not their structure.
 
 ## fix_strategy invariant (mandatory)
 
@@ -177,6 +185,37 @@ Before running each of the four static lenses, check membership in `inputs.selec
 If `selected_lenses` is absent / null / empty in the input contract (legacy callers, missing field), treat it as `["conflict", "dominance", "gap", "schema"]` — run all four lenses. This is the backward-compatible default.
 
 Self-correction: if a lens is NOT in `selected_lenses` but you ran it anyway, that's a runner bug — your output file's `skipped: false` (or absence of the field) signals the bug, but the spec mandates `skipped: true` for any unselected lens.
+
+## Compact mode policy (mandatory when compact_mode == true)
+
+When `inputs.compact_mode == true`, every static lens applies the cheaper policies below. The policies trim audit depth, not correctness — every kind of finding is still possible, but low-severity / low-impact ones are skipped.
+
+### Conflict lens (Step 1)
+- **Severity floor: medium.** Emit only findings with `severity: "high"` or `"medium"`. Skip all `low` severity conflicts (they nudge in opposite directions but are satisfiable).
+- **Pair budget.** Instead of comparing every rule pair (O(N²)), pick the 50 most-impactful rules first (by absolute language: "always", "never", "must", "only", "ignore") and compare only within that set. If fewer than 50 such rules exist, compare all of them. This caps conflict-lens work at ~1250 comparisons regardless of prompt size.
+
+### Dominance lens (Step 2)
+- **Mechanism restriction:** emit findings ONLY for `mechanism == "role-override"` or `mechanism == "recency"`. Skip `position`, `length`, `specificity` — those are subtle effects and require pair-comparison cost that compact mode trims.
+- **Severity floor: medium.** Skip `low` severity dominance findings.
+
+### Gap lens (Step 3)
+- **Severity floor: medium.** Skip `low` severity gaps (corner cases). Keep `undefined_edge_case` and `ambiguous_term` high/medium findings.
+
+### Schema lens (Step 4)
+- No change. Schema parsing is heading-level, cheap regardless of body size. Run normally.
+
+### Output annotation
+Every output file (conflicts.json, dominances.json, gaps.json, schema.json) gains a top-level `compact_mode: true` field when this policy was applied, plus a `compact_policy` array listing which trim policies fired:
+
+```json
+{
+  "conflicts": [...],
+  "compact_mode": true,
+  "compact_policy": ["severity_floor_medium", "pair_budget_50"]
+}
+```
+
+When `compact_mode == false`, neither field appears (or both are emitted as `compact_mode: false, compact_policy: []` — consumer-friendly).
 
 ## Failure modes
 
