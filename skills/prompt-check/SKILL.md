@@ -455,6 +455,45 @@ If you extract zero rules, abort with an error written to `$RUN_DIR/error.txt` a
 
 This wizard runs **once per `/prompt-check` invocation**, after rule extraction and before lens dispatch. It is separate from the Phase 0 repo-level wizard (which governs `.promptchecker.json` defaults). Phase 3.5 captures per-run intent.
 
+**CRITICAL — AskUserQuestion is MANDATORY here.**
+
+Phase 3.5 MUST emit an `AskUserQuestion` tool call. Do NOT substitute prose
+"which lenses?" questions. Do NOT default to "all six selected" silently.
+Do NOT skip Phase 3.5 even if it seems like the user has implied
+preferences. The wizard is an interactive contract — the user must see and
+respond to the multi-select widget.
+
+Failure modes that bypass this rule:
+- Emitting a free-text "Which lenses do you want? (list them)" prose
+  question instead of AskUserQuestion → WRONG. Always use the tool.
+- Inferring lens selection from `.promptchecker.json` repo defaults
+  without asking → WRONG. Repo defaults SEED the AskUserQuestion option
+  states (pre-checked), they don't replace the question.
+- Proceeding silently when "all defaults are obvious" → WRONG. The user
+  may want to deselect specific lenses for THIS audit.
+- Combining lens selection with other questions into one prose block →
+  WRONG. AskUserQuestion handles its own UI.
+
+If for any reason AskUserQuestion is unavailable in the current execution
+context (e.g. headless / batch invocation), abort Phase 3.5 with an
+explicit error: "Phase 3.5 requires AskUserQuestion. Re-invoke
+/prompt-check from an interactive Claude Code session." Do not proceed
+with silent defaults.
+
+The AskUserQuestion shape:
+- Question text: "Bu prompt için hangi mercekleri çalıştırayım?" (when
+  `report_language == "tr"`) or "Which lenses should I run for this prompt?"
+  (when `report_language == "en"`)
+- `multiSelect: true`
+- Options: the six lenses (conflict, dominance, gap, drift, tr_phonetic, schema)
+- Each option's selected state seeds from `.promptchecker.json` /
+  user_intent computed defaults.
+
+After the user submits, IF `expand_count` needs adjusting (drift selected)
+or anchors discussion is warranted, emit a SECOND AskUserQuestion or a
+direct prose follow-up. These follow-ups are also mandatory when
+applicable; do not silently default.
+
 Ask the user via `AskUserQuestion`:
 
 1. **"Bu prompt için hangi mercekleri çalıştırayım?"** — multi-select. Options:
@@ -509,33 +548,37 @@ Phase 7 already handles missing per-lens JSON files as "lens disabled" — no ch
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_5_end" >> "$TIMING_LOG"
 ```
 
-## Phases 4 + 5 + 6 — Parallel lens dispatch (drift fans out as soon as Phase 4 lands)
+## Phases 4 + 6 — Parallel lens dispatch (5 concurrent Agent calls)
 
-Phase 4 (static lenses) and Phase 6 (TR phonetic, when its gate passes) are **independent** — they read different inputs and write different outputs. Dispatch both subagents in a **single message with two concurrent `Agent` calls** so they execute in parallel. Phase 5 (drift) is **downstream of Phase 4 only** — drift-runner reads `conflicts.json`, `gaps.json`, and `dominances.json` as inputs, so it MUST run after Phase 4's outputs land, but it does NOT depend on Phase 6. The correct order is:
+Five lens runs fan out in ONE assistant turn, in five parallel `Agent` calls:
 
 ```
-   ┌─ static-lens-runner ──┬─→ drift-runner (Phase 5 — needs Phase 4 outputs)
-   │                       │
-   └─ tr-phonetic-runner ──┘
-   (Phase 4 + Phase 6 fan out together;
-    Phase 5 starts as soon as Phase 4 lands,
-    in parallel with Phase 6 — does not wait for TR)
+  ┌─ conflict   (static-lens-runner, selected_lenses=["conflict"])
+  ├─ dominance  (static-lens-runner, selected_lenses=["dominance"])
+  ├─ gap        (static-lens-runner, selected_lenses=["gap"])         ├─→ drift-runner (Phase 5; needs conflicts/gaps/dominances)
+  ├─ schema     (static-lens-runner, selected_lenses=["schema"])
+  └─ tr_phonetic (tr-phonetic-runner; conditional on user_intent.tr_phonetic_enabled)
 ```
 
-Concretely: in one assistant turn, emit both Phase 4 and Phase 6 `Agent` tool calls. As soon as Phase 4's outputs land, evaluate Phase 5's gate and dispatch drift-runner — do NOT wait for Phase 6 to finish first. Phase 7 awaits all three (Phase 4 + Phase 5 + Phase 6) before rendering.
+CRITICAL: emit ALL FIVE Agent tool calls in a single assistant turn so they
+run concurrently — NOT in five separate turns. Concurrent calls land at the
+same time; await all five before evaluating Phase 5's gate. Serial dispatch
+defeats the parallel design.
 
-## Phase 4 — Static lenses (conflict + dominance + gap)
+If the user deselected some lenses in Phase 3.5, dispatch ONLY the selected
+ones. For each unselected static lens, write the skipped-placeholder JSON
+directly (no Agent call needed for skipped lenses).
 
 ```bash
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_4_dispatch_start" >> "$TIMING_LOG"
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_6_dispatch_start" >> "$TIMING_LOG"
 ```
 
-Dispatch the `static-lens-runner` subagent to apply the four static lenses (conflict, dominance, gap, schema) in one pass. Detection criteria live in `references/lens-rules.md` — the subagent reads that document. The skill itself does no lens analysis.
+Detection criteria for the four static lenses (conflict, dominance, gap, schema) live in `references/lens-rules.md` — `static-lens-runner` reads that document. The TR phonetic criteria live in `references/tr-phonetic.md` — `tr-phonetic-runner` reads that document. The skill itself does no lens analysis.
 
-**Line-number contract:** every `line` field the subagent writes is a body.txt index (1-indexed, blank lines included). Phase 7 is the single place that translates these to original-file line numbers.
+**Line-number contract:** every `line` field each subagent writes is a body.txt index (1-indexed, blank lines included). Phase 7 is the single place that translates these to original-file line numbers.
 
-Pass inputs and output paths as **separate** top-level fields so the subagent never reads its own future outputs:
+**Dispatch shape — emit all five Agent calls in ONE turn:**
 
 ```
 Agent({
@@ -546,38 +589,90 @@ Agent({
       frontmatter:     "<absolute path to $RUN_DIR/frontmatter.json>",
       rules:           "<absolute path to $RUN_DIR/rules.json>",
       lens_rules_ref:  "<absolute path to skills/prompt-check/references/lens-rules.md>",
-      selected_lenses: <subset of ["conflict", "dominance", "gap", "schema"] from user_intent>,
+      selected_lenses: ["conflict"],
       compact_mode:    <bool from frontmatter.compact_mode>,
       max_char_limit:  <int from frontmatter.max_char_limit>,
       section_index:   "<absolute path to $RUN_DIR/section_index.json>"
     },
     output_paths: {
-      conflicts:  "<absolute path to $RUN_DIR/conflicts.json>",
-      dominances: "<absolute path to $RUN_DIR/dominances.json>",
-      gaps:       "<absolute path to $RUN_DIR/gaps.json>",
-      schema:     "<absolute path to $RUN_DIR/schema.json>"
+      conflicts:  "<absolute path to $RUN_DIR/conflicts.json>"
     }
   }),
-  description: "static lenses for " + BASENAME
+  description: "conflict lens for " + BASENAME,
+  isolation: "worktree"
+})
+
+Agent({
+  subagent_type: "static-lens-runner",
+  prompt: JSON.stringify({
+    inputs: { ..., selected_lenses: ["dominance"], ... },
+    output_paths: { dominances: "<absolute path to $RUN_DIR/dominances.json>" }
+  }),
+  description: "dominance lens for " + BASENAME,
+  isolation: "worktree"
+})
+
+Agent({
+  subagent_type: "static-lens-runner",
+  prompt: JSON.stringify({
+    inputs: { ..., selected_lenses: ["gap"], ... },
+    output_paths: { gaps: "<absolute path to $RUN_DIR/gaps.json>" }
+  }),
+  description: "gap lens for " + BASENAME,
+  isolation: "worktree"
+})
+
+Agent({
+  subagent_type: "static-lens-runner",
+  prompt: JSON.stringify({
+    inputs: { ..., selected_lenses: ["schema"], ... },
+    output_paths: { schema: "<absolute path to $RUN_DIR/schema.json>" }
+  }),
+  description: "schema lens for " + BASENAME,
+  isolation: "worktree"
+})
+
+Agent({
+  subagent_type: "tr-phonetic-runner",
+  prompt: JSON.stringify({ ... }),
+  description: "tr phonetic lens for " + BASENAME,
+  isolation: "worktree"
 })
 ```
 
-Both new fields are additive — the runner uses them when `compact_mode == true`, ignores them otherwise (backward compat).
+Each Agent call uses `isolation: "worktree"` — the runner gets its own clean
+git worktree. Output JSONs land at the per-lens path; the runner returns
+when its single output file is written. The skill awaits all five returns
+before Phase 5's drift gate.
 
-Populate `selected_lenses` from `user_intent.selected_lenses` (computed in Phase 3.5), intersected with `["conflict", "dominance", "gap", "schema"]` — i.e. drop `drift` and `tr_phonetic` since those belong to other runners. The static-lens-runner reads this field and writes empty `{"conflicts": []}` / `{"dominances": []}` / `{"gaps": []}` / `{"findings": [], "skipped": true, "reason": "lens not selected in per-run wizard"}` for any sub-lens not in the list. Schema additionally auto-skips on flat prompts (no numbered section headings) — the runner emits `{"findings": [], "applicable": false, "reason": "no numbered section headings detected"}` to `schema.json` in that case.
+**Per-lens runner contract is unchanged.** The `static-lens-runner` still accepts the same `inputs` schema (`body`, `frontmatter`, `rules`, `lens_rules_ref`, `selected_lenses`, `compact_mode`, `max_char_limit`, `section_index`) and the same `output_paths` shape (any subset of `conflicts`, `dominances`, `gaps`, `schema`). The change is in HOW the skill calls it: FOUR singleton dispatches instead of one combined call with all four lenses in `selected_lenses`. The runner still handles a multi-lens `selected_lenses` array (backward compat) — singleton-per-call is the new RECOMMENDED dispatch shape, not a breaking change.
 
-**Skip the Phase 4 dispatch entirely** if all four static lenses are deselected (the intersection is empty). In that case write empty placeholders directly:
+`compact_mode` and `max_char_limit` are additive — the runner uses them when `compact_mode == true`, ignores them otherwise (backward compat). `tr-phonetic-runner` is already line-level / cheap, so `compact_mode` has no effect on its analysis; the fields are passed for symmetry.
+
+**Per-finding output:** each singleton dispatch writes ONLY its own lens output file. The conflict dispatch writes `conflicts.json` and ignores `dominances` / `gaps` / `schema`. The dominance dispatch writes `dominances.json`. The gap dispatch writes `gaps.json`. The schema dispatch writes `schema.json`. Empty placeholder files are still required for lenses the user deselected (see below).
+
+**`selected_lenses` resolution.** For each of the four static lenses, dispatch a singleton call ONLY IF the lens is in `user_intent.selected_lenses` (computed in Phase 3.5). For each lens NOT in the selection, DO NOT dispatch — instead write the skipped-placeholder JSON directly:
 
 ```bash
-printf '{"conflicts": [], "skipped": true, "reason": "all static lenses deselected"}' > "$RUN_DIR/conflicts.json"
-printf '{"dominances": [], "skipped": true, "reason": "all static lenses deselected"}' > "$RUN_DIR/dominances.json"
-printf '{"gaps": [], "skipped": true, "reason": "all static lenses deselected"}' > "$RUN_DIR/gaps.json"
-printf '{"findings": [], "skipped": true, "reason": "all static lenses deselected"}' > "$RUN_DIR/schema.json"
+# conflict deselected
+printf '{"conflicts": [], "skipped": true, "reason": "lens not selected in per-run wizard"}' > "$RUN_DIR/conflicts.json"
+# dominance deselected
+printf '{"dominances": [], "skipped": true, "reason": "lens not selected in per-run wizard"}' > "$RUN_DIR/dominances.json"
+# gap deselected
+printf '{"gaps": [], "skipped": true, "reason": "lens not selected in per-run wizard"}' > "$RUN_DIR/gaps.json"
+# schema deselected
+printf '{"findings": [], "skipped": true, "reason": "lens not selected in per-run wizard"}' > "$RUN_DIR/schema.json"
 ```
 
-…and proceed to Phase 5 / 7 without spawning the runner.
+Schema additionally auto-skips on flat prompts (no numbered section headings) — when the lens IS selected, the runner inspects the body and emits `{"findings": [], "applicable": false, "reason": "no numbered section headings detected"}` to `schema.json` if no numbered sections exist. Auto-skip is the runner's decision, not the skill's.
 
-`static-lens-runner` writes `$RUN_DIR/conflicts.json`, `$RUN_DIR/dominances.json`, `$RUN_DIR/gaps.json`, and `$RUN_DIR/schema.json`. The skill reads them in Phase 7.
+If ALL four static lenses are deselected, no static-lens-runner dispatches happen — just the four placeholder writes above. Proceed to the tr-phonetic dispatch and Phase 5 / 7 without spawning any static-lens-runner.
+
+**Phase 6 (tr-phonetic) dispatch — fifth concurrent call.** Gated on `user_intent.tr_phonetic_enabled == true` (the runtime authoritative value from Phase 3.5 — NOT `frontmatter.tr_phonetic`). If the gate fails, the fifth call is omitted; Phase 7 treats the missing `tr_phonetic.json` as "TR lens disabled". The full tr-phonetic dispatch shape (with `tr_phonetic_ref`, `user_intent_tr_phonetic`, `section_index`, etc.) lives in the Phase 6 detail section below — emit the same payload, just in the same turn as the four static dispatches.
+
+**Phase 5 dispatch trigger:** as soon as `conflicts.json` AND `gaps.json` AND `dominances.json` all exist on disk (the three static lenses drift needs as inputs), dispatch `drift-runner`. Do NOT wait for `schema.json` or `tr_phonetic.json` — drift is independent of those.
+
+`static-lens-runner` writes `$RUN_DIR/conflicts.json`, `$RUN_DIR/dominances.json`, `$RUN_DIR/gaps.json`, or `$RUN_DIR/schema.json` depending on which singleton call dispatched it. `tr-phonetic-runner` writes `$RUN_DIR/tr_phonetic.json`. The skill reads them in Phase 7 after awaiting ALL pending dispatches (the five lens runs plus drift, if drift was triggered).
 
 ```bash
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_4_dispatch_end" >> "$TIMING_LOG"
@@ -585,7 +680,7 @@ printf '{"findings": [], "skipped": true, "reason": "all static lenses deselecte
 
 ## Phase 5 — Drift (conditional)
 
-**Orchestration:** dispatched as soon as Phase 4 completes (i.e. when `conflicts.json`, `dominances.json`, `gaps.json` have landed). Runs **in parallel with Phase 6** (if Phase 6 was triggered) — Phase 5 does NOT wait for the TR runner. Phase 7 awaits all in-flight subagents (Phase 4 + Phase 5 + Phase 6) before rendering.
+**Orchestration:** dispatched as soon as the THREE static lenses drift needs as inputs have landed — `conflicts.json` AND `gaps.json` AND `dominances.json` all exist on disk. Drift does NOT wait for `schema.json` or `tr_phonetic.json` to finish — schema and tr_phonetic are independent of drift. Runs **in parallel with whichever lens dispatches are still in-flight** (typically schema + tr_phonetic). Phase 7 awaits all in-flight subagents (the five Phase 4+6 lens runs + Phase 5 drift) before rendering.
 
 **Skip Phase 5 if EITHER condition holds:**
 
@@ -629,7 +724,8 @@ Agent({
     },
     output_path: "<absolute path to $RUN_DIR/drift.json>"
   }),
-  description: "drift analysis for " + BASENAME
+  description: "drift analysis for " + BASENAME,
+  isolation: "worktree"
 })
 ```
 
@@ -643,15 +739,17 @@ Populate `expand_count_override` with `user_intent.expand_count` from Phase 3.5 
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_5_end" >> "$TIMING_LOG"
 ```
 
-## Phase 6 — Turkish phonetic lens (conditional)
+## Phase 6 — Turkish phonetic lens (conditional — dispatched in the same turn as Phase 4)
 
-**Run this phase only if `user_intent.tr_phonetic_enabled == true`** (the runtime value computed in Phase 3.5 — NOT `frontmatter.tr_phonetic`). Frontmatter's `tr_phonetic` is the default that pre-selects the wizard checkbox; the user can flip the selection on or off in Phase 3.5, and that runtime decision is authoritative here. Otherwise skip to Phase 7 — `tr_phonetic.json` is not written, and Phase 7 treats the absence as "TR lens disabled".
+**Run this phase only if `user_intent.tr_phonetic_enabled == true`** (the runtime value computed in Phase 3.5 — NOT `frontmatter.tr_phonetic`). Frontmatter's `tr_phonetic` is the default that pre-selects the wizard checkbox; the user can flip the selection on or off in Phase 3.5, and that runtime decision is authoritative here. Otherwise skip — `tr_phonetic.json` is not written, and Phase 7 treats the absence as "TR lens disabled".
+
+**Dispatch ordering:** Phase 6's `tr-phonetic-runner` call is the FIFTH parallel Agent call emitted in the same assistant turn as the four Phase 4 static lens dispatches (see "Phases 4 + 6 — Parallel lens dispatch" above). The Phase 6 detail below documents the per-runner contract; the dispatch shape (along with `isolation: "worktree"`) is part of the combined Phase 4+6 fan-out.
 
 ```bash
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_6_skip" >> "$TIMING_LOG"
 ```
 
-When the gate passes, dispatch the `tr-phonetic-runner` subagent. It seeds `pronunciation_map` from any existing pronunciation guide block in the body, scans for new findings, dedupes against the seed, and writes a single `$RUN_DIR/tr_phonetic.json`. Every rule (skip rules, whitelist, strategy semantics, the "no semantic translation" hard rule, the three `fix_kind` values, the seed block formats and line-range tracking) lives in `references/tr-phonetic.md` — the subagent reads that document; the skill does not repeat the criteria here.
+When the gate passes, `tr-phonetic-runner` seeds `pronunciation_map` from any existing pronunciation guide block in the body, scans for new findings, dedupes against the seed, and writes a single `$RUN_DIR/tr_phonetic.json`. Every rule (skip rules, whitelist, strategy semantics, the "no semantic translation" hard rule, the three `fix_kind` values, the seed block formats and line-range tracking) lives in `references/tr-phonetic.md` — the subagent reads that document; the skill does not repeat the criteria here.
 
 **Line-number contract:** every `line` field (including `seed_block_range.start_line` / `end_line`) the subagent writes is a body.txt index. Phase 7 translates to original-file lines.
 
@@ -679,7 +777,8 @@ Agent({
     },
     output_path: "<absolute path to $RUN_DIR/tr_phonetic.json>"
   }),
-  description: "TR phonetic lens for " + BASENAME
+  description: "TR phonetic lens for " + BASENAME,
+  isolation: "worktree"
 })
 ```
 
@@ -700,6 +799,8 @@ TR phonetic is already line-level / cheap; `compact_mode` has no effect on its a
 ```bash
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_7_start" >> "$TIMING_LOG"
 ```
+
+**Await all pending dispatches first.** Before reading any per-lens output, block until ALL in-flight Agent calls have returned: the four Phase 4 static-lens-runner singletons (conflict / dominance / gap / schema), the Phase 6 tr-phonetic-runner (if its gate passed), and the Phase 5 drift-runner (if its gate passed). Phase 7 is the synchronisation barrier — do not start reading per-lens JSONs until every dispatched runner has signalled completion (its output file is written).
 
 Read every artefact that landed in `$RUN_DIR/` so far: `frontmatter.json`, `rules.json`, `conflicts.json`, `dominances.json`, `gaps.json`, `schema.json`, `drift.json`, and (if the TR gate ran) `tr_phonetic.json`. Build a single merged `findings.json` and a human-readable `report.md`. Both are line-anchored.
 
@@ -733,7 +834,7 @@ Apply this to every `findings[].line` and `findings[].related_lines[]`. After tr
 
 For backward compatibility: if `section_index.json` does not exist (older run dirs from before this feature), set `section_ref: null` for every finding without crashing. The renderer below also falls back to bare line markers when `section_ref` is null.
 
-**Language switching (mandatory):** Load `frontmatter.report_language` (`tr` or `en`; default `tr` — Phase 2 already normalised it). Use this as the key into `TEMPLATE_STRINGS` (defined below). Apply throughout the report.md render: title, top metadata labels, summary heading + column headers + lens row labels, findings heading, severity sub-headings, lens-group sub-headings, "none" marker, section/line prefixes inside finding headers, and the per-finding body labels (Current / Fix / Action / Rationale / Diff).
+**Language switching (mandatory):** Load `frontmatter.report_language` (`tr` or `en`; default `tr` — Phase 2 already normalised it). Use this as the key into `TEMPLATE_STRINGS` (defined below). Apply throughout the report.md render: title, top metadata labels, summary heading + column headers + lens row labels, findings heading, severity sub-headings, lens-group sub-headings, "none" marker, section/line prefixes inside finding headers, and the per-finding inline lens + severity labels (used in the compact one-line render).
 
 ```
 TEMPLATE_STRINGS = {
@@ -768,11 +869,15 @@ TEMPLATE_STRINGS = {
     "none_marker": "_(yok)_",
     "section_prefix": "Bölüm",
     "line_prefix": "Satır",
-    "current_label": "**Mevcut:**",
-    "fix_label": "**Düzeltme:**",
-    "action_label": "**Eylem:**",
-    "rationale_label": "**Gerekçe:**",
-    "diff_label": "**Değişiklik:**"
+    "lens_label_conflict": "çelişki",
+    "lens_label_dominance": "baskınlık",
+    "lens_label_gap": "boşluk",
+    "lens_label_schema": "şema",
+    "lens_label_drift": "davranışsal sapma",
+    "lens_label_tr_phonetic": "türkçe fonetik",
+    "severity_label_high": "yüksek",
+    "severity_label_medium": "orta",
+    "severity_label_low": "düşük"
   },
   "en": {
     "report_title": "PromptChecker Report — {basename}",
@@ -805,30 +910,115 @@ TEMPLATE_STRINGS = {
     "none_marker": "_None._",
     "section_prefix": "Section",
     "line_prefix": "L",
-    "current_label": "**Current:**",
-    "fix_label": "**Fix:**",
-    "action_label": "**Action:**",
-    "rationale_label": "**Rationale:**",
-    "diff_label": "**Diff:**"
+    "lens_label_conflict": "conflict",
+    "lens_label_dominance": "dominance",
+    "lens_label_gap": "gap",
+    "lens_label_schema": "schema",
+    "lens_label_drift": "drift",
+    "lens_label_tr_phonetic": "tr phonetic",
+    "severity_label_high": "high",
+    "severity_label_medium": "medium",
+    "severity_label_low": "low"
   }
 }
 ```
 
 Lens-generated content (`rationale`, `suggested_fix`, `current_excerpt`) is NOT translated — it stays in whatever language the runner produced. Only the skill-side template strings above switch language. So an English conflict rationale remains English in a TR report; the surrounding section headings and labels translate.
 
-**Section-aware finding headers.** Each finding bullet currently looks like `**L<line>** [C1 severity=high, R3↔R8] — <rationale>`. With `section_ref`, the bullet header becomes:
+**One-line finding render (compact summary, mandatory).** Each finding renders as ONE LINE — no separate Current / Suggested / Action / Diff / Rationale labels. The template:
 
-- When `section_ref.subsection` is present (most common case):
-  - `tr` →  `**Bölüm 7.2 — Satır 284** [C1 severity=high, R3↔R8] — <rationale>`
-  - `en` →  `**Section 7.2 — L284** [C1 severity=high, R3↔R8] — <rationale>`
-- When `section_ref` is non-null but `section_ref.subsection` is null (line in a section but not in a subsection):
-  - `tr` →  `**Bölüm 7 — Satır 284** [...]`
-  - `en` →  `**Section 7 — L284** [...]`
-- When `section_ref` is null (line outside any numbered section, e.g. preamble):
-  - `tr` →  `**Satır 284** [...]`
-  - `en` →  `**L284** [...]`
+```
+TR mode (default):
+  - **{section_marker}** [{id} {lens}, {severity}] — {short_rationale} → **{short_fix}**
 
-The prefixes (`Bölüm` / `Section`, `Satır` / `L`) come from `TEMPLATE_STRINGS[lang]["section_prefix"]` and `TEMPLATE_STRINGS[lang]["line_prefix"]`.
+EN mode:
+  - **{section_marker}** [{id} {lens}, {severity}] — {short_rationale} → **{short_fix}**
+```
+
+Where:
+
+- `{section_marker}` is the section-aware location:
+  - When `section_ref.subsection` is present (most common case):
+    - `tr` → `Bölüm 7.2 / Satır 284`
+    - `en` → `Section 7.2 — L284`
+  - When `section_ref` is non-null but `section_ref.subsection` is null (line in a section but not in a subsection):
+    - `tr` → `Bölüm 7 / Satır 284`
+    - `en` → `Section 7 — L284`
+  - When `section_ref` is null (line outside any numbered section, e.g. preamble):
+    - `tr` → `Satır 284`
+    - `en` → `L284`
+  - The prefixes (`Bölüm` / `Section`, `Satır` / `L`) come from `TEMPLATE_STRINGS[lang]["section_prefix"]` and `TEMPLATE_STRINGS[lang]["line_prefix"]`.
+- `{id}` is the finding id (`C1`, `D3`, `G2`, `S1`, `T1`, `drift-S3`).
+- `{lens}` translates per `TEMPLATE_STRINGS[lang]["lens_label_<lens>"]`:
+  - `conflict` → `çelişki` (tr) / `conflict` (en)
+  - `dominance` → `baskınlık` / `dominance`
+  - `gap` → `boşluk` / `gap`
+  - `schema` → `şema` / `schema`
+  - `drift` → `davranışsal sapma` / `drift`
+  - `tr_phonetic` → `türkçe fonetik` / `tr phonetic`
+- `{severity}` translates per `TEMPLATE_STRINGS[lang]["severity_label_<sev>"]`:
+  - `high` → `yüksek` / `high`
+  - `medium` → `orta` / `medium`
+  - `low` → `düşük` / `low`
+- `{short_rationale}` is the finding's `rationale` field TRUNCATED to ≤ 120 characters. Take the first sentence (split on `. ` / `? ` / `! `); if the first sentence is still longer than 120 chars, ellipsis at 117 chars + `...`.
+- `{short_fix}` is the `suggested_fix` field TRUNCATED to ≤ 100 characters. Same ellipsis rule. For structural fixes (multi-clause action descriptions), extract the first imperative sentence. If `suggested_fix` is null or empty, omit the `→ **{short_fix}**` suffix entirely.
+
+**Findings without a suggested_fix (drift verdicts, advisory TR, no_concrete_fix):**
+
+```
+- **{section_marker}** [{id} {lens}, {severity}] — {short_rationale}
+```
+
+No `→` arrow + fix when there is nothing concrete to apply.
+
+**Sentinel suggestions (TODO / Intentional):**
+
+```
+- **{section_marker}** [{id} {lens}, {severity}] — {short_rationale}
+    > _TODO: <open question>_     (when suggested_fix starts with TODO:)
+    > _Intentional — dismiss_      (when suggested_fix starts with Intentional)
+```
+
+The sentinel marker renders as an indented blockquote line under the main one-liner — preserves the "needs human" signal without polluting the compact main line.
+
+**The full rationale + suggested_fix remain available in findings.json (no truncation in the structured artefact). Truncation applies ONLY to the human-readable report.md / inline-suggestions.md / Phase 9 summary table.** Downstream tooling that needs the verbatim text reads findings.json.
+
+Python helper:
+
+```python
+def truncate(text, limit):
+    if not text:
+        return ""
+    # Take the first sentence boundary, if any, before the char limit.
+    first_sentence = re.split(r'(?<=[.!?])\s+', text.strip(), maxsplit=1)[0]
+    s = first_sentence if first_sentence else text
+    if len(s) <= limit:
+        return s
+    return s[:limit - 3] + "..."
+
+def render_finding_oneline(f, lang):
+    T = TEMPLATE_STRINGS[lang]
+    section_marker = build_section_marker(f.get("section_ref"), f["line"], T)  # see section-marker rules above
+    lens_label = T[f"lens_label_{f['lens']}"]
+    sev_label = T[f"severity_label_{f.get('severity','low')}"]
+    rationale = truncate(f.get("rationale", ""), 120)
+    suggested = f.get("suggested_fix") or ""
+
+    # Sentinel marker (rendered as a blockquote line under the main one-liner).
+    sentinel = None
+    if suggested.startswith("TODO:"):
+        sentinel = f"> _TODO: {suggested[5:].strip()}_"
+    elif suggested.startswith("Intentional —") or suggested.startswith("Intentional -"):
+        sentinel = "> _Intentional — dismiss_"
+
+    if sentinel:
+        return (f"- **{section_marker}** [{f['id']} {lens_label}, {sev_label}] — {rationale}\n"
+                f"    {sentinel}")
+    if not suggested.strip():
+        return f"- **{section_marker}** [{f['id']} {lens_label}, {sev_label}] — {rationale}"
+    short_fix = truncate(suggested, 100)
+    return f"- **{section_marker}** [{f['id']} {lens_label}, {sev_label}] — {rationale} → **{short_fix}**"
+```
 
 ### `$RUN_DIR/findings.json`
 
@@ -966,8 +1156,7 @@ The template skeleton below is shown in `en` (English) for readability; the actu
 <high_severity_heading>
 
 <conflicts_subheading>
-- **<section_prefix> 7.2 — <line_prefix>284** [<id> severity=high, R<a>↔R<b>] — <rationale>
-  - <diff-aware body — see render rules below>
+- **<section_prefix> 7.2 / <line_prefix>284** [<id> <lens_label>, <severity_label>] — <short_rationale> → **<short_fix>**
 - (or "<none_marker>" if no high-severity conflicts)
 
 <dominances_subheading>
@@ -1001,64 +1190,15 @@ The template skeleton below is shown in `en` (English) for readability; the actu
 
 If an entire severity bucket has zero findings across all lenses, omit that bucket entirely (don't render the severity heading followed by "_None._"). If a (severity, lens) pair has zero findings, render the lens sub-heading with `none_marker` (TEMPLATE_STRINGS-driven) so the structure stays consistent.
 
-The finding-header line itself uses the section-aware format described above (`Section 7.2 — L284` / `Bölüm 7.2 — Satır 284`); when `section_ref` is null fall back to the bare line marker (`L284` / `Satır 284`); when `section_ref.subsection` is null but `section_ref.section` is present, drop the subsection part (`Section 7 — L284` / `Bölüm 7 — Satır 284`).
+Each finding line uses the **one-line compact render** documented above (`render_finding_oneline`). No separate Current / Suggested / Action / Diff / Rationale blocks. The section-marker prefix follows the same `section_ref.subsection` / `section_ref.section` / null cascade as before — only the body of the bullet collapses to one line with truncated rationale + truncated fix.
 
-**Drift section special-case:** when drift was skipped at the run level (`drift.json.skipped_reason` is set), render a single `_Skipped — <skipped_reason>._` line under whichever severity bucket the drift scenarios would have landed in, OR under HIGH if no severity context exists. Per-scenario rendering still uses:
+**Drift section special-case:** when drift was skipped at the run level (`drift.json.skipped_reason` is set), render a single `_Skipped — <skipped_reason>._` line under whichever severity bucket the drift scenarios would have landed in, OR under HIGH if no severity context exists. Per-scenario rendering uses the same one-line compact form as other lenses:
 
 ```
-- **S1** [<kind>] <pass|fail> score=<0.00–1.00>
-  - Input: `<scenario.input truncated to 120 chars>`
-  - Reasons: <reasons joined>
+- **{section_marker}** [drift-S1 davranışsal sapma / drift, yüksek / high] — <short_rationale> → **<short_fix>**
 ```
 
-Treat drift `fail` as high severity, `pass` as low severity for bucketing purposes.
-
-### Diff rendering for findings
-
-For each finding, determine the render mode:
-
-- If `current_excerpt` and `suggested_fix` look like a substring substitution
-  (suggested_fix is similar to current_excerpt with localised character / word changes),
-  render a unified diff block:
-
-  ```diff
-  - <current_excerpt>
-  + <suggested_fix>
-  ```
-
-- If `suggested_fix` looks like a structural command
-  (starts with "Add ", "Rewrite ", "Move ", "Replace R", "Remove ", "Reword ", or is a
-  TODO sentinel like "TODO: ...", or is "Intentional — dismiss this finding"),
-  render as-is:
-
-  **Action:** <suggested_fix>
-
-Heuristic for "substring-style":
-- Compute a simple longest-common-subsequence ratio between current_excerpt and suggested_fix.
-- If ratio > 0.6 AND suggested_fix does not start with one of the structural keywords above,
-  it's substring-style → diff render.
-- Otherwise → action render.
-
-In Python (use difflib in the render heredoc):
-
-```python
-import difflib
-
-STRUCTURAL_PREFIXES = ("Add ", "Add: ", "Rewrite ", "Move ", "Replace R", "Remove ",
-                       "Reword ", "TODO:", "Intentional —", "Intentional -")
-
-def render_finding_body(current, suggested):
-    if not suggested or suggested.strip() == "":
-        return "**Action:** _(see rationale)_"
-    if any(suggested.startswith(p) for p in STRUCTURAL_PREFIXES):
-        return f"**Action:** {suggested}"
-    ratio = difflib.SequenceMatcher(None, current, suggested).ratio()
-    if ratio > 0.6:
-        return f"```diff\n- {current}\n+ {suggested}\n```"
-    return f"**Action:** {suggested}"
-```
-
-Drift findings still render with `Input:` and `Reasons:` per the per-scenario template above — the diff rule applies to conflict / dominance / gap / schema / tr_phonetic findings.
+Where the rationale captures the scenario kind + pass/fail + score (e.g. "hostile-input scenario failed, score 0.32"), and short_fix carries the verdict's `suggested_fix` if the runner produced one. Treat drift `fail` as high severity, `pass` as low severity for bucketing purposes.
 
 `report.md` is the canonical user-facing artefact. If `frontmatter.output` contains `findings_json` but not `markdown`, still write `report.md` — it costs nothing and is the doc humans read. If `output` contains `json`, write the merged report as `$RUN_DIR/report.json` (same shape as findings.json plus a `body_lines` field with the numbered body).
 
@@ -1221,9 +1361,9 @@ All timestamps are ISO 8601 UTC with millisecond precision, e.g. `2026-05-27T14:
 
 The summary table renders **DECISION_SET only**. The auto_filed processing (see Phase 9.4 stage 1) operates on **AUTO_FILED_SET**.
 
-Print a single markdown table containing every finding in DECISION_SET. Columns: `id | lens | severity | line | excerpt | suggestion`. Sort by `line` ascending, then by `severity` descending (`high > medium > low`; drift findings are surfaced with their `kind` instead of severity — treat `fail` as `high`, `pass` as `low`).
+Print a single markdown table containing every finding in DECISION_SET. The table is the **tabular form of the Phase 7 one-line render** — one row per finding with the same compact content. Columns: `id | lens | severity | section | short_rationale | short_fix`. Sort by `line` ascending, then by `severity` descending (`high > medium > low`; drift findings are surfaced with their `kind` instead of severity — treat `fail` as `high`, `pass` as `low`).
 
-Truncate `excerpt` and `suggestion` to 60 chars each, appending `…` if cut. For TR phonetic findings still in DECISION_SET (i.e. `number_readability` / `punctuation`), show `suggested_fix` as the suggestion column — `pronunciation_entry` rendering is no longer needed in the table because TR advisory findings are filtered out by the partition.
+`section` is the `{section_marker}` string from Phase 7's render (e.g. `Bölüm 7.2 / Satır 284` in TR mode, `Section 7.2 — L284` in EN mode, or the bare line marker when `section_ref` is null). `short_rationale` is `rationale` truncated to ≤ 120 chars per the Phase 7 rule. `short_fix` is `suggested_fix` truncated to ≤ 100 chars per the Phase 7 rule (empty cell when `suggested_fix` is null / empty / sentinel). For TR phonetic findings still in DECISION_SET (i.e. `number_readability` / `punctuation`), `short_fix` is the truncated `suggested_fix` — `pronunciation_entry` rendering is no longer needed in the table because TR advisory findings are filtered out by the partition.
 
 If `AUTO_FILED_SET` is non-empty, append a single line directly below the summary table (before the decision prompt):
 
@@ -1789,6 +1929,22 @@ Track the per-outcome counts for the Phase 10.5 closing summary:
 
 ### 10.4 — Discussed (the "konuşalım" sub-flow)
 
+**CRITICAL — AskUserQuestion is MANDATORY for each discussed finding.**
+
+When entering the konuşalım sub-flow for a finding, MUST emit
+AskUserQuestion with the four options (kabul et / ben revize ediyorum /
+yorum bırak / atla). Do NOT substitute prose "what do you want to do?"
+questions. Do NOT auto-pick "kabul et" if the user seems patient.
+
+If the user picks "ben revize ediyorum", the FOLLOWING free-text prompt
+(asking for the revised suggestion text) IS plain conversational — that
+one is intentionally not AskUserQuestion because free-form input is
+needed. But the four-option choice itself is always AskUserQuestion.
+
+Same headless fallback as Phase 3.5: if AskUserQuestion is unavailable,
+abort the sub-flow for this finding (leave it pending) and surface a
+warning. Do not auto-resolve.
+
 Process findings whose status is `discussed` in `id` order (stable across resume). For each one:
 
 1. **Display** the full finding to the user — lens, severity, original-file line, full `current_excerpt`, full `rationale`, full `suggested_fix` (or `pronunciation_entry` for TR), and any related rule ids.
@@ -1853,6 +2009,9 @@ Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. 
 - Don't append duplicate entries to `decisions.jsonl` on resume — append only NEW actions, not re-statements of historical decisions. Resume reads the existing file as history and continues from there.
 - Don't keep `findings_state[*].status` at `"discussed"` or `"revised"` as a terminal state — both are transient. Every finding must end at `pending` (only if the run is paused), `applied`, `overlay`, or `dismissed`.
 - Don't use `AskUserQuestion` for the free-form decision string in Phase 9.3 — it must be conversational so the user can express ranges, wildcards, and verb aliases in one line. Use `AskUserQuestion` only for the four-option choice inside the Phase 10.4 sub-flow.
+- Don't substitute prose questions for AskUserQuestion in Phase 3.5 (lens selection) or Phase 10.4 (konuşalım four-option choice). The tool is mandatory at those points; prose is a workflow regression.
+- Don't dispatch the four static lenses in a single Agent call. Phase 4 emits FIVE parallel Agent calls (conflict / dominance / gap / schema / tr_phonetic) in one assistant turn. Serial dispatch defeats the parallel design.
+- Don't wait for schema or tr_phonetic to finish before starting drift. Drift only needs conflict + dominance + gap outputs; schema and tr are independent.
 - Don't write an `applied` line to `decisions.jsonl` for a finding that didn't actually modify the prompt file. The feasibility check must precede the log write — single event per finding outcome. A failed-feasibility finding produces exactly one `routed_to_overlay` line followed by exactly one `overlay` line; an applicable finding produces exactly one `applied` line. Never two events that imply a prompt-file mutation when none occurred.
 - Don't sort findings by line number alone — severity-first grouping is mandatory for both findings.json and report.md.
 - Don't enable PROMPTCHECKER_TIMING in production runs unless debugging. The overhead is small but the timing.log file grows on every run and clutters the run dir.
@@ -1868,3 +2027,5 @@ Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. 
 - Don't treat compact mode as a hard abort. The audit STILL runs — it just runs with cheaper-per-lens policies. Severity floors, pair budgets, and drift halving are the contract; never use compact mode as an excuse to skip a lens entirely.
 - Don't translate lens-generated content (rationale, suggested_fix, current_excerpt) in Phase 7. Only skill-side template strings translate. A lens runner that wrote an English rationale stays English in a TR report.
 - Don't omit `section_ref: null` from findings.json — emit it explicitly (null is a valid value, signalling "line outside any numbered section"). Absent field is ambiguous; explicit null is clear.
+- Don't render Current / Suggested / Action labels as separate blocks in Phase 7. Compact each finding to ONE LINE with section_marker, id, lens, severity, short_rationale, and short_fix.
+- Don't truncate findings.json fields. Truncation is RENDER-ONLY (report.md + inline-suggestions.md + Phase 9 summary). findings.json carries the full rationale + suggested_fix verbatim.
