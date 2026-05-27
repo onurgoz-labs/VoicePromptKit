@@ -235,6 +235,9 @@ Commit this file so your team gets the same defaults. Unknown keys are ignored (
 | `PROMPTCHECKER_OUTPUT` | Comma-separated subset of `markdown,findings_json,json` | project config → `markdown,findings_json` |
 | `PROMPTCHECKER_EXPAND_COUNT` | Drift scenarios beyond anchor + conflict budget; `0` disables drift entirely | project config → `3` |
 | `PROMPTCHECKER_TR_PHONETIC` | Truthy (`1/true/yes/on`) enables the Turkish phonetic lens | project config → `false` |
+| `PROMPTCHECKER_TIMING` | Truthy (`true`) writes a millisecond-precision phase-boundary log to `$RUN_DIR/timing.log`. Diagnostic only — leave off in normal use. | off |
+
+**Timing logs (diagnostic):** when `PROMPTCHECKER_TIMING=true`, the skill writes `timing.log` to the run directory with one line per phase boundary (`phase_2_start`, `phase_2_end`, etc., in milliseconds since the Unix epoch). Use this when a run feels slow — `awk -F'[][]' '{print $2}' timing.log | sort -n` gives you the ordered timestamps; diffing adjacent timestamps surfaces the slowest phase. Drift simulation and subagent dispatch are common hotspots. Leave the env var off in everyday use — the log grows on every run.
 
 Set them in Claude Code's `settings.json` so they apply session-wide without touching your shell rc:
 

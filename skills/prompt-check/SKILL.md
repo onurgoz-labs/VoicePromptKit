@@ -103,6 +103,18 @@ fi
 # IMPORTANT: $PROMPT_DIR/latest is updated ONLY on success (Phase 8).
 # A run that fails mid-way leaves `latest` pointing at the previous good run.
 
+# Timing instrumentation — env-gated, zero overhead when off.
+# When PROMPTCHECKER_TIMING=true, every phase boundary appends a
+# millisecond-precision line to $RUN_DIR/timing.log.
+if [ "$PROMPTCHECKER_TIMING" = "true" ]; then
+  TIMING_LOG="$RUN_DIR/timing.log"
+  : > "$TIMING_LOG"
+  date_ms() { date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))'; }
+  log_t() { [ -n "$TIMING_LOG" ] && echo "[$(date_ms)] $1" >> "$TIMING_LOG"; }
+  log_t "phase_1_end (run-dir allocated: $RUN_DIR)"
+  export TIMING_LOG
+fi
+
 # Bootstrap interactive state placeholders so Phase 9/10 can append without
 # checking existence. These start empty; Phase 9 writes the real session.json
 # at interactive entry, and Phase 9 appends the first decision to
@@ -132,6 +144,7 @@ Extract YAML frontmatter and merge it against env vars + project config + built-
 4. Built-in defaults
 
 ```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_2_start" >> "$TIMING_LOG"
 python3 - "$ABS_PROMPT" "$RUN_DIR" "$CONFIG_PATH" <<'PY'
 import sys, re, json, os, hashlib
 prompt_path, run_dir, config_path = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -250,11 +263,16 @@ with open(os.path.join(run_dir, 'frontmatter.json'), 'w', encoding='utf-8') as f
 with open(os.path.join(run_dir, 'body.txt'), 'w', encoding='utf-8') as f:
     f.write(body)
 PY
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_2_end" >> "$TIMING_LOG"
 ```
 
 If `python3` is unavailable, fall back to reading the file yourself, splitting on the first two `---` lines, and applying the same merge logic by reasoning. State the fallback in the terminal summary.
 
 ## Phase 3 — Rule extraction (inline)
+
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_start" >> "$TIMING_LOG"
+```
 
 Read `$RUN_DIR/body.txt`. Number lines starting at 1, **including blank lines**, so that `body.txt` line N maps to original-file line `N + frontmatter.body_line_offset - 1`. Extract every atomic rule, instruction, constraint, or directive into a flat list. Apply the criteria in `references/lens-rules.md` section "Rule extraction" — split compound sentences, preserve absolutes ("always", "never"), use the lowest line where the rule begins.
 
@@ -268,7 +286,15 @@ Hold the rules in memory as JSON. Also write `$RUN_DIR/rules.json` with shape:
 
 If you extract zero rules, abort with an error written to `$RUN_DIR/error.txt` and surface that to the user.
 
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_end" >> "$TIMING_LOG"
+```
+
 ## Phase 3.5 — Lens-selection wizard (per-run)
+
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_5_start" >> "$TIMING_LOG"
+```
 
 This wizard runs **once per `/prompt-check` invocation**, after rule extraction and before lens dispatch. It is separate from the Phase 0 repo-level wizard (which governs `.promptchecker.json` defaults). Phase 3.5 captures per-run intent.
 
@@ -302,6 +328,10 @@ Phase 9 writes this `user_intent` block into `session.json` at interactive entry
 
 Phase 7 already handles missing per-lens JSON files as "lens disabled" — no change there.
 
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_5_end" >> "$TIMING_LOG"
+```
+
 ## Phases 4 + 6 — Parallel lens dispatch (with Phase 5 downstream of 4)
 
 Phase 4 (static lenses) and Phase 6 (TR phonetic, when its gate passes) are **independent** — they read different inputs and write different outputs. Dispatch both subagents in a **single message with two concurrent `Agent` calls** so they execute in parallel. Phase 5 (drift) is **downstream of Phase 4** — drift-runner reads `conflicts.json`, `gaps.json`, and `dominances.json` as inputs, so it MUST run after Phase 4's outputs land. The correct order is:
@@ -316,6 +346,11 @@ Phase 4 (static lenses) and Phase 6 (TR phonetic, when its gate passes) are **in
 Concretely: in one assistant turn, emit both Phase 4 and Phase 6 `Agent` tool calls. Await both. Then evaluate Phase 5's gate and dispatch drift-runner if warranted.
 
 ## Phase 4 — Static lenses (conflict + dominance + gap)
+
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_4_dispatch_start" >> "$TIMING_LOG"
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_6_dispatch_start" >> "$TIMING_LOG"
+```
 
 Dispatch the `static-lens-runner` subagent to apply the three static lenses in one pass. Detection criteria live in `references/lens-rules.md` — the subagent reads that document. The skill itself does no lens analysis.
 
@@ -345,6 +380,10 @@ Agent({
 
 `static-lens-runner` writes `$RUN_DIR/conflicts.json`, `$RUN_DIR/dominances.json`, and `$RUN_DIR/gaps.json`. The skill reads them in Phase 7.
 
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_4_dispatch_end" >> "$TIMING_LOG"
+```
+
 ## Phase 5 — Drift (conditional)
 
 **Skip Phase 5 if EITHER condition holds:**
@@ -360,7 +399,15 @@ Write `$RUN_DIR/drift.json` with `skipped_reason: "no anchors, conflicts, or rol
 
 In either skip case the file shape is `{"scenarios": [], "runs": [], "verdicts": [], "skipped_reason": "..."}`. Move on to Phase 6.
 
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_5_skip" >> "$TIMING_LOG"
+```
+
 Otherwise dispatch the `drift-runner` subagent (it is the only subagent this skill uses). Pass inputs and the output path as **separate** top-level fields so the subagent does not accidentally read its own future output:
+
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_5_start" >> "$TIMING_LOG"
+```
 
 ```
 Agent({
@@ -383,9 +430,17 @@ Agent({
 
 `drift-runner` generates scenarios, simulates the model on each, judges outputs, and writes `$RUN_DIR/drift.json` with shape `{scenarios, runs, verdicts}`. The skill never decomposes drift inline because it is the only step whose token cost scales with prompt length.
 
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_5_end" >> "$TIMING_LOG"
+```
+
 ## Phase 6 — Turkish phonetic lens (conditional)
 
 **Run this phase only if `frontmatter.tr_phonetic == true`.** Otherwise skip to Phase 7 — `tr_phonetic.json` is not written, and Phase 7 treats the absence as "TR lens disabled".
+
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_6_skip" >> "$TIMING_LOG"
+```
 
 When the gate passes, dispatch the `tr-phonetic-runner` subagent. It seeds `pronunciation_map` from any existing pronunciation guide block in the body, scans for new findings, dedupes against the seed, and writes a single `$RUN_DIR/tr_phonetic.json`. Every rule (skip rules, whitelist, strategy semantics, the "no semantic translation" hard rule, the three `fix_kind` values, the seed block formats and line-range tracking) lives in `references/tr-phonetic.md` — the subagent reads that document; the skill does not repeat the criteria here.
 
@@ -412,7 +467,15 @@ Agent({
 
 `tr-phonetic-runner` writes `$RUN_DIR/tr_phonetic.json` with shape `{ findings[], seed_entries[], warnings[] }`. The skill reads it in Phase 7.
 
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_6_dispatch_end" >> "$TIMING_LOG"
+```
+
 ## Phase 7 — Render outputs
+
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_7_start" >> "$TIMING_LOG"
+```
 
 Read every artefact that landed in `$RUN_DIR/` so far: `frontmatter.json`, `rules.json`, `conflicts.json`, `dominances.json`, `gaps.json`, `drift.json`, and (if the TR gate ran) `tr_phonetic.json`. Build a single merged `findings.json` and a human-readable `report.md`. Both are line-anchored.
 
@@ -625,11 +688,16 @@ Drift findings still render with `Input:` and `Reasons:` per the per-scenario te
 
 **Removed output modes:** `inline` (v0.2) and `html` (v0.3.1) are no longer supported. Phase 2 strips them with a warning; this phase need not handle them.
 
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_7_end" >> "$TIMING_LOG"
+```
+
 ## Phase 8 — Terminal summary
 
 After all writes succeed, **update the `latest` symlink** so it points at this run (the run is now durable), then print the summary:
 
 ```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_8_start" >> "$TIMING_LOG"
 ln -sfn "$RUN_NAME" "$PROMPT_DIR/latest"
 ```
 
@@ -653,9 +721,25 @@ to choose what to do with each finding. Type "iptal" to leave the session as
 pending and resume later with /prompt-check-resume.
 ```
 
+When `PROMPTCHECKER_TIMING=true`, append one extra line to the summary block above (between `Repo defaults:` and the blank line before "Entering interactive review"):
+
+```
+Timing log: <relative path to $RUN_DIR/timing.log>
+```
+
+Otherwise omit — users without timing enabled see no change.
+
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_8_end" >> "$TIMING_LOG"
+```
+
 After printing this block, **do not stop** — automatically transition to Phase 9 in the same turn. Phase 9 + Phase 10 are part of the default `/prompt-check` flow; the audit is not finished until the user either resolves every finding or explicitly cancels with "iptal".
 
 ## Phase 9 — Interactive selection
+
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_9_start" >> "$TIMING_LOG"
+```
 
 Triggered automatically once Phase 8 has printed its summary. There is no separate trigger phrase — the audit flow always passes through Phase 9. (The `/prompt-check-resume` slash command re-enters Phase 9 for a pending run from a previous session.)
 
@@ -853,7 +937,15 @@ If after parsing every pending finding still has `status: "pending"`, ask the us
 
 Transition automatically. Do not wait for further confirmation unless `decisions_resolved` is empty.
 
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_9_end" >> "$TIMING_LOG"
+```
+
 ## Phase 10 — Action dispatch
+
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_10_start" >> "$TIMING_LOG"
+```
 
 Phase 10 reads `session.json` and `decisions.jsonl` from Phase 9 and executes each decided action. The order below is fixed — see `references/overlay-format.md` Section 4 for the rationale.
 
@@ -999,6 +1091,10 @@ Session state: <relative path to $RUN_DIR/session.json>
 
 Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. If any findings remain `pending` at this point (user did not address them and did not type `gerisini atla`), set `session.json.phase = "paused"` instead and remind the user they can resume with `/prompt-check-resume <run-NNN>`.
 
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_10_end" >> "$TIMING_LOG"
+```
+
 ## Don'ts
 
 - Don't extract frontmatter with an LLM pass; use Bash/Python — it's deterministic and free.
@@ -1015,3 +1111,4 @@ Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. 
 - Don't use `AskUserQuestion` for the free-form decision string in Phase 9.3 — it must be conversational so the user can express ranges, wildcards, and verb aliases in one line. Use `AskUserQuestion` only for the four-option choice inside the Phase 10.4 sub-flow.
 - Don't write an `applied` line to `decisions.jsonl` for a finding that didn't actually modify the prompt file. The feasibility check must precede the log write — single event per finding outcome. A failed-feasibility finding produces exactly one `routed_to_overlay` line followed by exactly one `overlay` line; an applicable finding produces exactly one `applied` line. Never two events that imply a prompt-file mutation when none occurred.
 - Don't sort findings by line number alone — severity-first grouping is mandatory for both findings.json and report.md.
+- Don't enable PROMPTCHECKER_TIMING in production runs unless debugging. The overhead is small but the timing.log file grows on every run and clutters the run dir.
