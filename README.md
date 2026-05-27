@@ -232,21 +232,21 @@ Every field is optional. Most users only override `anchors` (per-prompt regressi
 
 ## Pipeline
 
-The plugin runs one skill end-to-end inside a single Claude context — no chain of round-tripping subagents. Only the drift lens dispatches a subagent (`drift-runner`), and only when there are anchors, conflicts, or role-override dominances; otherwise drift is skipped entirely.
+The plugin runs one orchestrating skill that fans out to three subagents for the lens work. `static-lens-runner` is dispatched on every run; `drift-runner` and `tr-phonetic-runner` are conditional (drift only when anchors / conflicts / role-overrides exist AND `expand_count > 0`; TR only when `tr_phonetic: true`). Phases 4-6 happen in parallel where possible — the skill dispatches all eligible subagents in one fan-out and awaits all results before Phase 7.
 
 1. **Phase 0** — First-run wizard or load existing `.promptchecker.json`.
 2. **Phase 1** — Allocate a fresh `run-NNN` directory (atomic; `latest` symlink is updated only on success).
 3. **Phase 2** — Parse frontmatter deterministically and split body. Stores `body_line_offset` and `prompt_sha256` for line-mapping and stale-audit checks.
 4. **Phase 3** — Extract atomic, line-anchored rules from `body.txt`.
-5. **Phase 4** — Apply conflict, dominance, gap lenses inline.
-6. **Phase 5** — If warranted (anchors / conflicts / role-overrides present AND `expand_count > 0`), dispatch `drift-runner` for adversarial scenarios + judging.
-7. **Phase 6** — If `tr_phonetic: true`, seed `pronunciation_map` from existing pronunciation blocks, then scan body for new TR findings.
+5. **Phase 4** — Dispatch `static-lens-runner` (subagent) which applies conflict + dominance + gap lenses and writes the three JSON outputs (`conflicts.json`, `dominances.json`, `gaps.json`).
+6. **Phase 5** — In parallel with Phase 4, if warranted (anchors / conflicts / role-overrides present AND `expand_count > 0`), dispatch `drift-runner` (subagent) for adversarial scenarios + judging.
+7. **Phase 6** — In parallel with Phases 4-5, if `tr_phonetic: true`, dispatch `tr-phonetic-runner` (subagent) which seeds from existing pronunciation blocks and scans the body for new advisory findings.
 8. **Phase 7** — Render `report.md` + `findings.json` (line numbers translated back to the original prompt file; `prompt_sha256` carried through).
 9. **Phase 8** — Update `latest` symlink (commit point), print terminal summary.
 
 ## Architecture
 
-The plugin is pure Claude Code skill orchestration. No Node, no TypeScript, no `npm install`, no `node_modules`, no `package.json` — just one skill file, three references, and one optional subagent definition.
+The plugin is pure Claude Code skill orchestration. No Node, no TypeScript, no `npm install`, no `node_modules`, no `package.json` — just one skill file, three references, and three subagent definitions (one always dispatched, two conditional).
 
 ```
 .claude-plugin/
@@ -262,14 +262,16 @@ skills/
         ├── tr-phonetic.md      (Turkish TTS rules)
         └── probes.md           (drift probe templates)
 agents/
-└── drift-runner.md             (only subagent; only dispatched when needed)
+├── drift-runner.md             (conditional — adversarial scenarios + judging)
+├── static-lens-runner.md       (always dispatched — conflict + dominance + gap)
+└── tr-phonetic-runner.md       (conditional — advisory-only TR lens)
 examples/
 ├── sample-system.md
 ├── sample-agent.md
 └── sample-vapi.md              (dogfeeds tr_phonetic: true)
 ```
 
-All cross-phase state is exchanged via JSON files under `.promptcheck/<basename>/run-NNN/`. The skill reads its own writes; the `drift-runner` subagent reads paths it is given and writes exactly one file.
+All cross-phase state is exchanged via JSON files under `.promptcheck/<basename>/run-NNN/`. The orchestrating skill reads its own writes; each subagent reads paths it is given and writes only the JSON artefacts assigned to it.
 
 ## License
 
