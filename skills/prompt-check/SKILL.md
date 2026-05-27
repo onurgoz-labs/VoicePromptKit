@@ -40,7 +40,7 @@ echo "CONFIG_EXISTS=$CONFIG_EXISTS"
 **Branch on the `CONFIG_EXISTS` line the bash block just echoed — do not infer from the path string alone.**
 
 - **If `CONFIG_EXISTS=true` (the bash block printed this line):** STOP — skip the wizard, do not write `.promptchecker.json`, do not ask any questions. Continue to Phase 1. The pre-existing file is the source of truth and will be read in Phase 2 during the frontmatter merge.
-- **Only if `CONFIG_EXISTS=false`:** run the first-run wizard before continuing. Ask the user the five questions below (prefer `AskUserQuestion` if available, otherwise plain conversational prompts; either way wait for all five answers before writing the file).
+- **Only if `CONFIG_EXISTS=false`:** run the first-run wizard before continuing. Ask the user the six questions below (prefer `AskUserQuestion` if available, otherwise plain conversational prompts; either way wait for all six answers before writing the file).
 
 **Sanity check before asking the wizard questions:** read the last echoed `CONFIG_EXISTS=` line from the bash output. If it is `true`, the wizard MUST NOT run regardless of any other reasoning. Overwriting an existing config is a silent data-loss bug.
 
@@ -54,6 +54,10 @@ echo "CONFIG_EXISTS=$CONFIG_EXISTS"
    - `markdown` (default ✓), `findings_json` (default ✓), `json`.
 5. **Drift `expand_count`** (extra scenarios beyond anchors + conflict budget):
    - Integer 0–20. Default `3`. Zero disables drift entirely.
+6. **Max prompt character limit** (triggers compact mode for large prompts):
+   - Options: 25000 (small), 50000 (default ✓), 100000 (large), 0 (unlimited — disables compact mode entirely)
+   - Free text accepted (positive integer or 0).
+   - When set to a non-zero value, prompts whose body exceeds this threshold are audited in "compact mode" — cheaper analysis policies that trade depth for speed (low-severity findings skipped, conflict pair budget capped, drift expand_count halved, rule text trimmed). The threshold compares against the BODY length (frontmatter stripped), not the full file size.
 
 After collecting answers, write `$CONFIG_PATH` as pretty JSON (2-space indent):
 
@@ -63,7 +67,8 @@ After collecting answers, write `$CONFIG_PATH` as pretty JSON (2-space indent):
   "target_model": "<answer>",
   "output": ["..."],
   "expand_count": <int>,
-  "tr_phonetic": <bool>
+  "tr_phonetic": <bool>,
+  "max_char_limit": <int>
 }
 ```
 
@@ -239,10 +244,38 @@ resolved['tr_phonetic'] = bool(tr)
 resolved['body_line_offset'] = body_line_offset
 resolved['prompt_sha256'] = prompt_sha256
 
+# Resolve max_char_limit: frontmatter > env (PROMPTCHECKER_MAX_CHAR_LIMIT) > project config > default 50000
+mcl = fm.get('max_char_limit')
+if mcl is None:
+    mcl_env = env('PROMPTCHECKER_MAX_CHAR_LIMIT')
+    if mcl_env is not None and str(mcl_env).strip() != '':
+        try:
+            mcl = int(mcl_env)
+        except ValueError:
+            mcl = None
+    if mcl is None:
+        mcl = project.get('max_char_limit', 50000)
+try:
+    resolved['max_char_limit'] = int(mcl)
+except (TypeError, ValueError):
+    resolved['max_char_limit'] = 50000
+
+# Measure body length and decide compact_mode
+body_char_count = len(body)
+resolved['body_char_count'] = body_char_count
+resolved['compact_mode'] = (
+    resolved['max_char_limit'] > 0 and body_char_count > resolved['max_char_limit']
+)
+
 # Collect warnings for unknown frontmatter / config keys (surfaced in Phase 8).
-KNOWN_FM = {'type','target_model','output','expand_count','anchors','tr_phonetic'}
-KNOWN_CFG = {'$schema','default_type','target_model','output','expand_count','tr_phonetic'}
+KNOWN_FM = {'type','target_model','output','expand_count','anchors','tr_phonetic','max_char_limit'}
+KNOWN_CFG = {'$schema','default_type','target_model','output','expand_count','tr_phonetic','max_char_limit'}
 warnings = []
+if resolved['compact_mode']:
+    warnings.append(
+        f"compact mode active: body is {body_char_count} chars, exceeds max_char_limit "
+        f"{resolved['max_char_limit']} — cheaper analysis policies will apply"
+    )
 for k in fm.keys():
     if k not in KNOWN_FM:
         warnings.append(f"unknown frontmatter key: {k}")
@@ -283,6 +316,8 @@ Hold the rules in memory as JSON. Also write `$RUN_DIR/rules.json` with shape:
 ```json
 { "rules": [{"id":"R1","category":"behavior|format|tone|policy|persona","text":"...","line":12,"source_excerpt":"..."}] }
 ```
+
+**Compact mode (frontmatter.compact_mode == true):** keep each rule's `text` field to ≤ 100 characters (rough one-line summary; truncate the explanatory clause if needed) and `source_excerpt` to ≤ 120 characters. This trims rule-list payload that downstream lenses load. Atomic-rule semantics unchanged — the policy is about VERBOSITY, not correctness.
 
 If you extract zero rules, abort with an error written to `$RUN_DIR/error.txt` and surface that to the user.
 
@@ -389,7 +424,9 @@ Agent({
       frontmatter:     "<absolute path to $RUN_DIR/frontmatter.json>",
       rules:           "<absolute path to $RUN_DIR/rules.json>",
       lens_rules_ref:  "<absolute path to skills/prompt-check/references/lens-rules.md>",
-      selected_lenses: <subset of ["conflict", "dominance", "gap", "schema"] from user_intent>
+      selected_lenses: <subset of ["conflict", "dominance", "gap", "schema"] from user_intent>,
+      compact_mode:    <bool from frontmatter.compact_mode>,
+      max_char_limit:  <int from frontmatter.max_char_limit>
     },
     output_paths: {
       conflicts:  "<absolute path to $RUN_DIR/conflicts.json>",
@@ -401,6 +438,8 @@ Agent({
   description: "static lenses for " + BASENAME
 })
 ```
+
+Both new fields are additive — the runner uses them when `compact_mode == true`, ignores them otherwise (backward compat).
 
 Populate `selected_lenses` from `user_intent.selected_lenses` (computed in Phase 3.5), intersected with `["conflict", "dominance", "gap", "schema"]` — i.e. drop `drift` and `tr_phonetic` since those belong to other runners. The static-lens-runner reads this field and writes empty `{"conflicts": []}` / `{"dominances": []}` / `{"gaps": []}` / `{"findings": [], "skipped": true, "reason": "lens not selected in per-run wizard"}` for any sub-lens not in the list. Schema additionally auto-skips on flat prompts (no numbered section headings) — the runner emits `{"findings": [], "applicable": false, "reason": "no numbered section headings detected"}` to `schema.json` in that case.
 
@@ -460,7 +499,9 @@ Agent({
       gaps:                  "<absolute path to $RUN_DIR/gaps.json>",
       dominances:            "<absolute path to $RUN_DIR/dominances.json>",
       probes_ref:            "<absolute path to skills/prompt-check/references/probes.md>",
-      expand_count_override: 3  // ← from user_intent.expand_count; takes precedence over frontmatter
+      expand_count_override: 3,  // ← from user_intent.expand_count; takes precedence over frontmatter
+      compact_mode:          <bool from frontmatter.compact_mode>,
+      max_char_limit:        <int from frontmatter.max_char_limit>
     },
     output_path: "<absolute path to $RUN_DIR/drift.json>"
   }),
@@ -469,6 +510,8 @@ Agent({
 ```
 
 Populate `expand_count_override` with `user_intent.expand_count` from Phase 3.5 (the per-run integer the user picked in the lens-selection wizard). The drift-runner uses this override when present, falling back to `frontmatter.expand_count` only when the override is absent.
+
+**Compact mode:** when `compact_mode == true`, drift-runner halves the final `expand_count` (max(1, n//2)) so adversarial scenario simulation cost drops linearly with prompt size. The override-chain still applies first — `expand_count_override` from user_intent is the value drift-runner halves.
 
 `drift-runner` generates scenarios, simulates the model on each, judges outputs, and writes `$RUN_DIR/drift.json` with shape `{scenarios, runs, verdicts}`. The skill never decomposes drift inline because it is the only step whose token cost scales with prompt length.
 
@@ -505,7 +548,9 @@ Agent({
       body:                  "<absolute path to $RUN_DIR/body.txt>",
       frontmatter:           "<absolute path to $RUN_DIR/frontmatter.json>",
       tr_phonetic_ref:       "<absolute path to skills/prompt-check/references/tr-phonetic.md>",
-      user_intent_tr_phonetic: true  // ← from user_intent.tr_phonetic_enabled; runtime authoritative
+      user_intent_tr_phonetic: true,  // ← from user_intent.tr_phonetic_enabled; runtime authoritative
+      compact_mode:          <bool from frontmatter.compact_mode>,
+      max_char_limit:        <int from frontmatter.max_char_limit>
     },
     output_path: "<absolute path to $RUN_DIR/tr_phonetic.json>"
   }),
@@ -514,6 +559,8 @@ Agent({
 ```
 
 Populate `user_intent_tr_phonetic` with `user_intent.tr_phonetic_enabled`. The runner's defensive guard checks this field instead of `frontmatter.tr_phonetic`, so user runtime overrides survive even when the frontmatter default would have suppressed the lens.
+
+TR phonetic is already line-level / cheap; `compact_mode` has no effect on its analysis. The fields are passed for symmetry and future use (logging, telemetry).
 
 `tr-phonetic-runner` writes `$RUN_DIR/tr_phonetic.json` with shape `{ findings[], seed_entries[], warnings[] }`. The skill reads it in Phase 7.
 
@@ -805,6 +852,7 @@ Findings: <relative path to $RUN_DIR/findings.json>
 Pronunciations master: .promptcheck/<basename>/pronunciations.md (<M> unique terms across <N> runs)
 Previous runs: .promptcheck/<basename>/ (run-001 … run-NNN)
 Repo defaults: <relative path to .promptchecker.json>
+- Body size: <body_char_count> chars [compact mode <ACTIVE | inactive — under <max_char_limit> char threshold | DISABLED via max_char_limit=0>]
 
 Entering interactive review (Phase 9). Use a compact decision string such as
   "C1, C3 düzelt; G2 yorum bırak; T1..T5 konuşalım; gerisini atla"
@@ -824,7 +872,15 @@ The auto-filed line is shown ONLY when the count is non-zero. It sits alongside 
 
 The `Pronunciations master:` line surfaces `.promptcheck/<basename>/pronunciations.md` — the cross-version aggregate file rebuilt by Phase 10.2.1. `<M>` is the number of unique terms in that file, `<N>` is the count of `run-NNN/` directories under the prompt that have ever contributed at least one `pronunciation_map` entry. **Omit this line entirely** when `pronunciations.md` has zero entries (i.e. no run under this prompt has produced a non-empty `pronunciation_map` yet). The line is informational and only appears when there is something for the user to read.
 
-When `PROMPTCHECKER_TIMING=true`, append one extra line to the summary block above (between `Repo defaults:` and the blank line before "Entering interactive review"):
+**Body size / compact mode line — render rules** (pull values from `frontmatter.body_char_count`, `frontmatter.max_char_limit`, `frontmatter.compact_mode`):
+
+- If `compact_mode == true`: `Body size: 87432 chars [compact mode ACTIVE — exceeds 50000 char threshold]`
+- If `compact_mode == false AND max_char_limit > 0`: `Body size: 32100 chars [compact mode inactive — under 50000 char threshold]`
+- If `max_char_limit == 0`: `Body size: 87432 chars [compact mode DISABLED via max_char_limit=0]`
+
+When compact mode is active, downstream lenses apply cheaper analysis policies — low-severity findings may be skipped, drift simulation halves its scenario budget, and rule extraction trims verbose explanations. To audit at full depth, set `max_char_limit: 0` in `.promptchecker.json` or pass `PROMPTCHECKER_MAX_CHAR_LIMIT=0`.
+
+When `PROMPTCHECKER_TIMING=true`, append one extra line to the summary block above (after the `Body size:` line and before the blank line preceding "Entering interactive review"):
 
 ```
 Timing log: <relative path to $RUN_DIR/timing.log>
@@ -863,6 +919,8 @@ Write `$RUN_DIR/session.json` (overwriting the placeholder from Phase 1) with th
     "anchors": [],
     "tr_phonetic_enabled": true,
     "anchors_added": false,
+    "max_char_limit": <int>,
+    "compact_mode_active": <bool>,
     "asked_at": "<ISO 8601 UTC from Phase 3.5>"
   },
   "findings_state": {
@@ -875,6 +933,8 @@ Write `$RUN_DIR/session.json` (overwriting the placeholder from Phase 1) with th
 ```
 
 `findings_state` is keyed by `finding.id` and seeded from `findings.json.findings[]`. Every entry starts at `status: "pending"`. `lens` and `line` are mirrored from the finding so Phase 10's TR routing rule and ordering pass do not have to re-read `findings.json`.
+
+`max_char_limit` and `compact_mode_active` are reflections of frontmatter values (not user wizard inputs at this stage) — recorded in session.json for replay / audit purposes. Copy them verbatim from `frontmatter.max_char_limit` and `frontmatter.compact_mode`.
 
 All timestamps are ISO 8601 UTC with millisecond precision, e.g. `2026-05-27T14:23:45.123Z`.
 
@@ -1530,3 +1590,5 @@ Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. 
 - Don't apply a TODO/Intentional sentinel as if it were a regular structural fix. The sentinel guard in Phase 10.3 (step 4) intercepts them: `TODO:` routes to overlay (`sentinel_todo`), `Intentional —` is dismissed (`sentinel_intentional`). Neither ever reaches the Edit tool.
 - Don't overwrite the `## Custom additions` block in `pronunciations.md`. The author owns content between the `<!-- promptchecker:custom-additions:start -->` and `<!-- promptchecker:custom-additions:end -->` markers; the rebuild MUST preserve that block verbatim.
 - Don't merge schema findings into findings.json when `schema.json.applicable == false`. Auto-skipped lenses contribute zero findings — the summary just notes the reason. Adding a phantom `Schema: 0` row without applicability context is misleading on flat prompts.
+- Don't apply compact mode when `max_char_limit == 0`. Zero explicitly disables the threshold; the body can be arbitrarily large without triggering cheaper policies.
+- Don't treat compact mode as a hard abort. The audit STILL runs — it just runs with cheaper-per-lens policies. Severity floors, pair budgets, and drift halving are the contract; never use compact mode as an excuse to skip a lens entirely.
