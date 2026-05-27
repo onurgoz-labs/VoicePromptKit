@@ -79,6 +79,29 @@ The TR lens splits its four detection categories into two routing buckets, so vo
 
 The lens never translates: `pound → paund` is a phonetic hint; `pound → İngiliz lirası` is forbidden semantic substitution.
 
+### Compact mode for long prompts
+
+When a prompt body exceeds `max_char_limit` (default `50000` chars; configurable via wizard, env var, project config, or per-prompt frontmatter), PromptChecker enters **compact mode** and applies cheaper analysis policies to trade depth for speed:
+
+- **Conflict / Gap lenses:** skip `low` severity findings; keep `medium` and `high`.
+- **Dominance lens:** emit only `role-override` and `recency` mechanisms; skip the subtler `position`, `length`, `specificity` effects.
+- **Conflict lens pair budget:** pick the 50 most-impactful rules (those with "always", "never", "must", "only", "ignore") and compare only within that set. Caps work at ~1250 comparisons regardless of prompt size.
+- **Drift lens:** halve the effective `expand_count` (`max(1, n // 2)`). A 5-scenario drift becomes 2 scenarios. This is the single biggest perf lever for long-prompt audits.
+- **Rule extraction (Phase 3):** rule `text` ≤ 100 chars, `source_excerpt` ≤ 120 chars. Trims the payload downstream lenses load.
+- **Schema and TR phonetic lenses:** unchanged. Both are heading-level / line-level and cheap regardless of size.
+
+To **disable compact mode entirely**, set `max_char_limit: 0` in your `.promptchecker.json` (or per-prompt frontmatter, or env var). The audit runs at full depth regardless of body size — useful for forensic audits where you want every finding.
+
+To **lower the threshold** (e.g. 25000 chars so compact mode kicks in sooner), set `max_char_limit: 25000` at any layer.
+
+Phase 8's terminal summary reports the body size + threshold + active/inactive state:
+
+```
+Body size: 87432 chars [compact mode ACTIVE — exceeds 50000 char threshold]
+```
+
+Compact mode is NOT a hard abort — the audit always runs. It only trims which findings are reported and which scenarios drift simulates. The artefact files (`conflicts.json`, `drift.json`, etc.) carry a top-level `compact_mode: true` field + `compact_policy` array so consumers know the policies fired.
+
 All six lenses live in `skills/prompt-check/SKILL.md` and its `references/`.
 
 ## Output layout
@@ -204,7 +227,7 @@ The plugin's behaviour is layered, highest priority first:
 
 ### First-run wizard
 
-The first time you run `/prompt-check` in a repo, the skill walks you through a 5-question wizard and saves the answers to `<repo-root>/.promptchecker.json`. Subsequent runs read that file silently. Edit it by hand to change defaults, or delete it to rerun the wizard.
+The first time you run `/prompt-check` in a repo, the skill walks you through a 6-question wizard and saves the answers to `<repo-root>/.promptchecker.json`. Subsequent runs read that file silently. Edit it by hand to change defaults, or delete it to rerun the wizard.
 
 The wizard asks:
 
@@ -213,6 +236,7 @@ The wizard asks:
 3. **Target model** for reports + drift simulation (`claude-opus-4-7` default, free text accepted).
 4. **Output formats** — multi-select from `markdown`, `findings_json`, `json`.
 5. **Drift `expand_count`** — how many extra adversarial scenarios beyond the anchor + conflict budget. `0` disables the drift lens entirely.
+6. **Max prompt character limit** — repo-level threshold for triggering compact mode. Default `50000`. `0` disables compact mode entirely. Useful when your prompts routinely exceed 50K chars and you want every audit to run at full depth regardless of size.
 
 ### Project config (`.promptchecker.json`)
 
@@ -224,7 +248,8 @@ Example for a Turkish VAPI repo:
   "target_model": "claude-opus-4-7",
   "output": ["markdown", "findings_json"],
   "expand_count": 4,
-  "tr_phonetic": true
+  "tr_phonetic": true,
+  "max_char_limit": 50000
 }
 ```
 
@@ -238,6 +263,7 @@ Commit this file so your team gets the same defaults. Unknown keys are ignored (
 | `PROMPTCHECKER_OUTPUT` | Comma-separated subset of `markdown,findings_json,json` | project config → `markdown,findings_json` |
 | `PROMPTCHECKER_EXPAND_COUNT` | Drift scenarios beyond anchor + conflict budget; `0` disables drift entirely | project config → `3` |
 | `PROMPTCHECKER_TR_PHONETIC` | Truthy (`1/true/yes/on`) enables the Turkish phonetic lens | project config → `false` |
+| `PROMPTCHECKER_MAX_CHAR_LIMIT` | Positive integer triggers compact mode when body exceeds this many chars. `0` disables compact mode. | project config → `50000` |
 | `PROMPTCHECKER_TIMING` | Truthy (`true`) writes a millisecond-precision phase-boundary log to `$RUN_DIR/timing.log`. Diagnostic only — leave off in normal use. | off |
 
 **Timing logs (diagnostic):** when `PROMPTCHECKER_TIMING=true`, the skill writes `timing.log` to the run directory with one line per phase boundary (`phase_2_start`, `phase_2_end`, etc., in milliseconds since the Unix epoch). Use this when a run feels slow — `awk -F'[][]' '{print $2}' timing.log | sort -n` gives you the ordered timestamps; diffing adjacent timestamps surfaces the slowest phase. Drift simulation and subagent dispatch are common hotspots. Leave the env var off in everyday use — the log grows on every run.
@@ -262,6 +288,7 @@ target_model: claude-opus-4-7    # overrides every layer for this prompt
 output: [markdown, findings_json]
 expand_count: 6                  # overrides project config + env-var
 tr_phonetic: true                # overrides project config + env-var
+max_char_limit: 100000           # this prompt is large; raise the threshold so compact mode does NOT trigger
 anchors:                         # always per-prompt — never inherited
   - input: "I am furious! Your product is garbage!"
     rubric: "de-escalates; remains professional"
@@ -284,7 +311,7 @@ Phase 9 and Phase 10 are the interactive layer — they run automatically after 
 
 1. **Phase 0** — First-run wizard or load existing `.promptchecker.json`.
 2. **Phase 1** — Allocate a fresh `run-NNN` directory (atomic; `latest` symlink is updated only on success).
-3. **Phase 2** — Parse frontmatter deterministically and split body. Stores `body_line_offset` and `prompt_sha256` for line-mapping and stale-audit checks.
+3. **Phase 2** — Parse frontmatter deterministically and split body. Stores `body_line_offset`, `prompt_sha256`, `body_char_count`, and `compact_mode` (true when body_char_count > max_char_limit AND max_char_limit > 0). Phase 4-6 dispatches propagate these to each runner.
 4. **Phase 3** — Extract atomic, line-anchored rules from `body.txt`.
 5. **Phase 4** — Dispatch `static-lens-runner` (subagent) which applies conflict + dominance + gap + schema lenses and writes the four JSON outputs (`conflicts.json`, `dominances.json`, `gaps.json`, `schema.json`). The schema lens auto-skips when the body has no numbered section headings. Dispatched **in parallel with Phase 6**.
 6. **Phase 6** — In parallel with Phase 4, if `tr_phonetic: true`, dispatch `tr-phonetic-runner` (subagent) which seeds from existing pronunciation blocks and scans the body for new advisory findings.
