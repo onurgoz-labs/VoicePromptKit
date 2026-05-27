@@ -22,7 +22,9 @@ Your user message is a JSON object split into **read-only inputs** and a single 
     "gaps":                  "<$RUN_DIR/gaps.json>",
     "dominances":            "<$RUN_DIR/dominances.json>",
     "probes_ref":            "<skills/prompt-check/references/probes.md>",
-    "expand_count_override": 3
+    "expand_count_override": 3,
+    "compact_mode":          false,
+    "max_char_limit":        50000
   },
   "output_path": "<$RUN_DIR/drift.json>"
 }
@@ -31,6 +33,8 @@ Your user message is a JSON object split into **read-only inputs** and a single 
 Read every file under `inputs` exactly once. **Never read `output_path`** — it does not exist yet and reading it would burn a tool call. Write to `output_path` only at the end of Step 4.
 
 `expand_count_override` is the value the user picked in the per-run wizard (Phase 3.5 of SKILL.md). When present and not null, it takes precedence over `frontmatter.expand_count`. When absent or null, fall back to `frontmatter.expand_count` (existing behaviour). When `expand_count_override == 0`, drift is disabled for this run — write `{"scenarios":[],"runs":[],"verdicts":[],"warnings":["expand_count is 0 — drift disabled"]}` to `output_path` and return (mirror the SKILL.md drift skip path).
+
+`compact_mode` is `true` when the body exceeds `max_char_limit`. When `true`, the runner halves the final scenario budget (see "Compact mode policy" below). When absent / null / false, full-depth simulation.
 
 ## Step 1 — Generate scenarios
 
@@ -47,7 +51,23 @@ expand_count = inputs.expand_count_override if inputs.expand_count_override is n
                else frontmatter.expand_count
 ```
 
-Per-run override priority: `inputs.expand_count_override` (if present and not null) > `frontmatter.expand_count` > built-in default (3).
+Per-run override priority:
+  raw_expand_count = inputs.expand_count_override (if present and not null)
+                  OR frontmatter.expand_count
+                  OR built-in default 3
+
+If inputs.compact_mode == true:
+  effective_expand_count = max(1, raw_expand_count // 2)
+  (halve the scenario budget; never go below 1 unless raw_expand_count was 0)
+
+If raw_expand_count == 0:
+  drift is disabled — write empty payload with warning "expand_count is 0 — drift disabled"
+
+else:
+  use effective_expand_count in the cap formula:
+  cap = effective_expand_count + anchors.length + min(2, conflicts.length + gaps.length)
+
+**Compact mode halves expand_count.** A user-selected `expand_count: 5` becomes effective `2` (5 // 2) when compact_mode is on. This is the single biggest performance lever for drift on large prompts — scenario count maps linearly to LLM simulation cost.
 
 For each scenario, choose `kind` and construct `input` per the matching probe template. Every scenario MUST have at least one assertion OR a non-empty rubric.
 
@@ -190,11 +210,15 @@ Write a single JSON file at `output_path` with shape:
   "verdicts": [
     { "scenario_id":"S1","pass":true,"score":0.85,"reasons":["..."],"violated_assertions":[] }
   ],
-  "warnings": []
+  "warnings": [],
+  "compact_mode": true,
+  "compact_policy": ["expand_count_halved"]
 }
 ```
 
-Use pretty JSON (2-space indent). After writing, return a one-line status to the skill: `drift complete (batch): <N> scenarios, <P> passed, <F> failed`. Nothing else.
+The output schema `{scenarios, runs, verdicts, warnings}` gains an optional top-level `compact_mode: true` field when compact-mode policy fired, plus a `compact_policy` array listing which trim policies fired. When `compact_mode == false`, neither field appears (or both are emitted as `compact_mode: false, compact_policy: []` — consumer-friendly).
+
+Use pretty JSON (2-space indent). After writing, return a one-line status to the skill: `drift complete (batch): <N> scenarios, <P> passed, <F> failed [compact mode: <ACTIVE | inactive>]`. Nothing else.
 
 ## Batch discipline (mandatory)
 

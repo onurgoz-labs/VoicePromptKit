@@ -18,7 +18,9 @@ Your user message is a JSON object split into **read-only inputs** and a single 
     "body":                   "<$RUN_DIR/body.txt>",
     "frontmatter":            "<$RUN_DIR/frontmatter.json>",
     "tr_phonetic_ref":        "<skills/prompt-check/references/tr-phonetic.md>",
-    "user_intent_tr_phonetic": true
+    "user_intent_tr_phonetic": true,
+    "compact_mode":           false,
+    "max_char_limit":         50000
   },
   "output_path":              "<$RUN_DIR/tr_phonetic.json>"
 }
@@ -27,6 +29,8 @@ Your user message is a JSON object split into **read-only inputs** and a single 
 Read every file under `inputs` exactly once. **Never read `output_path`** — it does not exist yet and reading it would burn a tool call. Write to `output_path` only at the end of Step 3.
 
 `user_intent_tr_phonetic` is the authoritative value for THIS run. The skill's Phase 3.5 wizard sets it based on the user's lens selection. When present, the runner gates on this value, NOT on `frontmatter.tr_phonetic`. When absent or null (legacy callers), fall back to `frontmatter.tr_phonetic`.
+
+`compact_mode` is passed for symmetry with the other runners and future telemetry / logging. TR phonetic analysis is already line-level and cheap, so compact mode does NOT change which findings the runner emits. The runner is free to log a `compact_mode: true` field in its output for downstream visibility, but no behaviour change is required.
 
 The reference at `tr_phonetic_ref` is your spec. Its skip rules, curated risky list, whitelist, strategy semantics, severity guide, and "no semantic translation" hard rule are mandatory. Do not rely on memory; read the file at the start of every run.
 
@@ -162,9 +166,12 @@ Write a single JSON file at `output_path` with shape:
       "source": "seed"
     }
   ],
-  "warnings": []
+  "warnings": [],
+  "compact_mode": true
 }
 ```
+
+When `compact_mode == true`, emit a top-level `compact_mode: true` field in the output JSON for consistency with the other runners. No `compact_policy` array (no policies fired). When `compact_mode == false`, the field may be omitted.
 
 Use pretty JSON (2-space indent). After writing, return a one-line status to the skill:
 
@@ -172,7 +179,7 @@ Use pretty JSON (2-space indent). After writing, return a one-line status to the
 tr phonetic complete: <N> findings, <S> seed entries
 ```
 
-Nothing else.
+(Compact mode is not surfaced in the status line since no behaviour changed.) Nothing else.
 
 ## Failure modes
 
