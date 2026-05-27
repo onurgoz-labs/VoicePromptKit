@@ -21,7 +21,8 @@ Your user message is a JSON object split into **read-only inputs** and four **ou
     "lens_rules_ref":  "<skills/prompt-check/references/lens-rules.md>",
     "selected_lenses": ["conflict", "dominance", "gap", "schema"],
     "compact_mode":    false,
-    "max_char_limit":  50000
+    "max_char_limit":  50000,
+    "section_index":   "<$RUN_DIR/section_index.json>"
   },
   "output_paths": {
     "conflicts":  "<$RUN_DIR/conflicts.json>",
@@ -33,6 +34,8 @@ Your user message is a JSON object split into **read-only inputs** and four **ou
 ```
 
 Read every file under `inputs` exactly once. **Never read any path under `output_paths`** — those files do not exist yet and reading them would burn a tool call. Write to each output path only at the end of the corresponding step.
+
+`section_index` is a read-only lookup table built in Phase 3 of the skill. For every finding you emit, attach a `section_ref` field by looking up the finding's `line` in `section_index.ranges`. If the line falls inside a range with `section: not null`, set `section_ref` to `{section, subsection, section_title, subsection_title}`. Otherwise set `section_ref: null` (the line is outside any numbered section — e.g. a preamble, an unstructured prompt, or a line between sections). The lookup is mandatory for all four static lenses including schema.
 
 `selected_lenses` is the subset of the four static lenses (`["conflict", "dominance", "gap", "schema"]`) that the user kept enabled in the per-run wizard. Possible values: any non-empty subset. **For backward compatibility, if the input field is absent OR null OR empty, treat it as `["conflict", "dominance", "gap", "schema"]` (all four) — the existing behaviour, now including the schema lens.** See the "Selected-lenses dispatch" section below for the per-lens skip protocol.
 
@@ -53,11 +56,13 @@ Apply the **Conflict lens** section of `lens_rules_ref` against the rule list in
 - Cluster transitive contradictions (A vs B vs C) into a single conflict with multiple `rule_ids`.
 - Severity follows the heuristics in `lens_rules_ref` (high = direct logical opposite or safety/policy contradiction; medium = conflicts under common inputs; low = nudges in opposite directions).
 
-Write the result to `output_paths.conflicts` using the schema from `lens_rules_ref`:
+Write the result to `output_paths.conflicts` using the schema from `lens_rules_ref`. Every finding MUST carry a `section_ref` field per the "Section reference (mandatory for every finding)" section below:
 
 ```json
-{ "conflicts": [{ "id": "C1", "rule_ids": ["R3","R8"], "severity": "low|medium|high", "reasoning": "<≤ 400 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural" }] }
+{ "conflicts": [{ "id": "C1", "rule_ids": ["R3","R8"], "severity": "low|medium|high", "reasoning": "<≤ 400 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "VALUE FRAMING AXES", "subsection_title": "MÜBADELE VALUE HIERARCHY" } }] }
 ```
+
+When the finding's `line` has no section context, emit explicit `section_ref: null` (not absent).
 
 If no conflicts exist, write `{"conflicts": []}`. Empty is a legitimate outcome.
 
@@ -74,11 +79,13 @@ Apply the **Dominance lens** section of `lens_rules_ref` against the rule list.
 
 Use `body.txt` to confirm position/length/recency claims when needed — e.g. to check that a "later instruction" is genuinely later in the file. Read `body.txt` only once across the whole run; do not re-read it per dominance candidate.
 
-Write the result to `output_paths.dominances`:
+Write the result to `output_paths.dominances`. Every finding MUST carry a `section_ref` field per the "Section reference (mandatory for every finding)" section below:
 
 ```json
-{ "dominances": [{ "id": "D1", "dominant_rule_id": "R12", "dominated_rule_id": "R3", "mechanism": "position|length|specificity|recency|role-override", "severity": "low|medium|high", "reasoning": "<≤ 300 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural" }] }
+{ "dominances": [{ "id": "D1", "dominant_rule_id": "R12", "dominated_rule_id": "R3", "mechanism": "position|length|specificity|recency|role-override", "severity": "low|medium|high", "reasoning": "<≤ 300 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "VALUE FRAMING AXES", "subsection_title": "MÜBADELE VALUE HIERARCHY" } }] }
 ```
+
+When the finding's `line` has no section context, emit explicit `section_ref: null` (not absent).
 
 If no dominances exist, write `{"dominances": []}`.
 
@@ -93,11 +100,13 @@ Apply the **Gap lens (strict scope)** section of `lens_rules_ref`.
 - `kind` must be one of: `undefined_edge_case`, `ambiguous_term`.
 - Do not flag absent concepts the prompt never raised (missing personas, missing failure modes, missing tool-use boundaries, missing voice-agent affordances, etc.). The only exception is when an existing rule references the topic.
 
-Write the result to `output_paths.gaps`:
+Write the result to `output_paths.gaps`. Every finding MUST carry a `section_ref` field per the "Section reference (mandatory for every finding)" section below:
 
 ```json
-{ "gaps": [{ "id": "G1", "kind": "undefined_edge_case|ambiguous_term", "description": "<one sentence>", "related_rule_ids": ["R5"], "severity": "low|medium|high", "suggested_fix": "<concrete one-sentence resolution or structural action>", "fix_strategy": "substring | structural" }] }
+{ "gaps": [{ "id": "G1", "kind": "undefined_edge_case|ambiguous_term", "description": "<one sentence>", "related_rule_ids": ["R5"], "severity": "low|medium|high", "suggested_fix": "<concrete one-sentence resolution or structural action>", "fix_strategy": "substring | structural", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "VALUE FRAMING AXES", "subsection_title": "MÜBADELE VALUE HIERARCHY" } }] }
 ```
+
+When the finding's `line` has no section context, emit explicit `section_ref: null` (not absent).
 
 If no gaps exist, write `{"gaps": []}`.
 
@@ -109,7 +118,7 @@ If no gaps exist, write `{"gaps": []}`.
 
 **If applicable:** parse the body for ATX headings. Build an ordered list of all headings with their line numbers, parent context, and parsed numbering. Apply the seven anomaly categories from `lens_rules_ref` (Schema lens section): `section_gap`, `subsection_gap`, `out_of_order`, `subsection_orphan`, `heading_style_inconsistent`, `missing_parent`, `step_gap`.
 
-For each anomaly found, emit a finding with the schema described in `lens_rules_ref`. Set `fix_strategy` per the table in the reference (most are `structural`; only `heading_style_inconsistent` is `substring`). Every finding must have a non-empty `suggested_fix` per the concrete-fix invariant (TODO/Intentional sentinels are valid fallbacks if no clean resolution exists).
+For each anomaly found, emit a finding with the schema described in `lens_rules_ref`. Set `fix_strategy` per the table in the reference (most are `structural`; only `heading_style_inconsistent` is `substring`). Every finding must have a non-empty `suggested_fix` per the concrete-fix invariant (TODO/Intentional sentinels are valid fallbacks if no clean resolution exists). Every finding MUST also carry a `section_ref` field per the "Section reference (mandatory for every finding)" section below. For schema findings specifically, `section_ref` is the section CONTEXT the flagged heading lives in (e.g. a `section_gap` finding flagging the line where `## SECTION 7` appears would carry `section_ref: {section: "7", subsection: null, ...}`).
 
 Write `{"applicable": true, "reason": null, "findings": [...]}` to `output_paths.schema`. Schema findings do not reference rule IDs — emit `rule_ids: []` on every finding.
 
@@ -139,6 +148,33 @@ When compact mode is active, the status surfaces it so the skill (and any downst
 `<APPLICABLE>` reports whether the schema lens ran (`APPLICABLE`) vs auto-skipped due to a flat prompt with no numbered headings (`NOT APPLICABLE`) vs deselected by the wizard (`SKIPPED`). It is always one of those three tokens.
 
 Nothing else. No commentary, no explanation, no trailing newline beyond the single status line.
+
+## Section reference (mandatory for every finding)
+
+For every finding emitted by conflict, dominance, gap, OR schema lenses, attach `section_ref` by looking up the finding's `line` in `inputs.section_index`.
+
+Lookup algorithm (apply verbatim — deterministic, not LLM):
+
+1. Read `section_index.json` once at the start of Step 1. Cache `ranges` in memory.
+2. For each finding, compute `section_ref` from its `line` via the helper below:
+
+   ```python
+   def section_ref_for_line(line, ranges):
+       for r in ranges:
+           if r["from_line"] <= line <= r["to_line"] and r["section"] is not None:
+               return {
+                   "section": r["section"],
+                   "subsection": r["subsection"],
+                   "section_title": r["section_title"],
+                   "subsection_title": r["subsection_title"]
+               }
+       return None
+   ```
+
+3. Emit `section_ref` as part of the finding object.
+4. If `section_index.applicable == false` (body has no numbered sections), every `section_ref` is `null`. Don't fabricate refs; flat prompts have no section context.
+
+Self-correction: if you find yourself emitting a finding WITHOUT `section_ref` (absent field, not explicit null), that's a runner error — re-emit with explicit `section_ref: null`.
 
 ## Concrete-fix invariant (mandatory before writing any output file)
 
@@ -226,4 +262,5 @@ When `compact_mode == false`, neither field appears (or both are emitted as `com
   - `output_paths.schema`     → `{"applicable": null, "findings": [], "warnings": ["could not read <path>"]}`
 - If `rules.json` parses but contains zero rules, write the same empty payload to the conflict / dominance / gap paths with a warning `"no rules to analyse"`. The schema lens does NOT consume `rules.json` — it still runs (heading parsing is independent), so do not short-circuit `output_paths.schema` on this condition.
 - If a single lens step fails after another already succeeded, still write a valid (possibly empty) JSON object with a warning to the remaining output paths before returning. Every early exit must leave **valid JSON at all four output paths** so the skill can finish Phase 7 without crashing.
+- If `section_index.json` is missing or unreadable, fall back to emitting `section_ref: null` on every finding plus a warning in each output file (`warnings: ["section_index missing — section_ref defaulted to null for every finding"]`). Don't abort the audit — the lenses still produce valid findings without section context.
 - Never crash silently. The skill depends on the four files existing before it merges findings.

@@ -20,13 +20,16 @@ Your user message is a JSON object split into **read-only inputs** and a single 
     "tr_phonetic_ref":        "<skills/prompt-check/references/tr-phonetic.md>",
     "user_intent_tr_phonetic": true,
     "compact_mode":           false,
-    "max_char_limit":         50000
+    "max_char_limit":         50000,
+    "section_index":          "<$RUN_DIR/section_index.json>"
   },
   "output_path":              "<$RUN_DIR/tr_phonetic.json>"
 }
 ```
 
 Read every file under `inputs` exactly once. **Never read `output_path`** — it does not exist yet and reading it would burn a tool call. Write to `output_path` only at the end of Step 3.
+
+`section_index` is the read-only lookup table built in Phase 3. For every TR finding you emit, attach a `section_ref` field via line lookup (same algorithm as static-lens-runner). Auto-filed TR findings (foreign_word + abbreviation, hidden from Phase 9) still carry `section_ref` for the cross-version pronunciations master and the report's pronunciation map section.
 
 `user_intent_tr_phonetic` is the authoritative value for THIS run. The skill's Phase 3.5 wizard sets it based on the user's lens selection. When present, the runner gates on this value, NOT on `frontmatter.tr_phonetic`. When absent or null (legacy callers), fall back to `frontmatter.tr_phonetic`.
 
@@ -144,6 +147,12 @@ Write a single JSON file at `output_path` with shape:
       "fix_kind": "replace | advisory",
       "severity": "low | medium | high",
       "line": 42,
+      "section_ref": {
+        "section": "1",
+        "subsection": "1.3",
+        "section_title": "IDENTITY: WHO IS DEFNE",
+        "subsection_title": "About Boyut Yayın Grubu"
+      },
       "current_excerpt": "...",
       "suggested_fix": "...",
       "pronunciation_entry": {
@@ -173,6 +182,8 @@ Write a single JSON file at `output_path` with shape:
 
 When `compact_mode == true`, emit a top-level `compact_mode: true` field in the output JSON for consistency with the other runners. No `compact_policy` array (no policies fired). When `compact_mode == false`, the field may be omitted.
 
+When the finding's `line` has no section context (it falls outside every numbered range, or `section_index.applicable == false`), emit explicit `section_ref: null` (not absent).
+
 Use pretty JSON (2-space indent). After writing, return a one-line status to the skill:
 
 ```
@@ -181,10 +192,36 @@ tr phonetic complete: <N> findings, <S> seed entries
 
 (Compact mode is not surfaced in the status line since no behaviour changed.) Nothing else.
 
+## Section reference (mandatory for every TR finding)
+
+Read `inputs.section_index` once at the start of Step 2 (body scan). For each finding produced, attach `section_ref` via line lookup using the same algorithm as the other lens runners:
+
+```python
+def section_ref_for_line(line, ranges):
+    for r in ranges:
+        if r["from_line"] <= line <= r["to_line"] and r["section"] is not None:
+            return {
+                "section": r["section"],
+                "subsection": r["subsection"],
+                "section_title": r["section_title"],
+                "subsection_title": r["subsection_title"]
+            }
+    return None
+```
+
+Auto-filed findings (foreign_word + abbreviation) still carry `section_ref` — the pronunciations master file may use it to provide section context per term (e.g. "Gaggia Milano (Section 1.3 — About Boyut Yayın Grubu)").
+
+If `section_index.applicable == false` (no numbered headings in the body) or the line falls outside every range, emit explicit `section_ref: null` (not absent).
+
+If `section_index.json` is missing, default to `section_ref: null` on every finding and emit a warning in the output's `warnings` array.
+
+Self-correction: if you find yourself emitting a finding WITHOUT `section_ref` (absent field, not explicit null), that's a runner error — re-emit with explicit `section_ref: null`.
+
 ## Failure modes
 
 - If any required input file is missing or unreadable, write `{"findings":[], "seed_entries":[], "warnings":["could not read <path>"]}` to `output_path` and return.
 - If `inputs.user_intent_tr_phonetic` is false (the user disabled the TR lens for this run via the Phase 3.5 wizard), write `{"findings":[], "seed_entries":[], "warnings":["tr_phonetic disabled by user in per-run wizard"]}` to `output_path` and return.
 - If `inputs.user_intent_tr_phonetic` is absent or null (legacy callers): fall back to `frontmatter.tr_phonetic`. If THAT is also false, write `{"findings":[], "seed_entries":[], "warnings":["tr_phonetic disabled in frontmatter (no per-run override)"]}` to `output_path` and return. The skill normally only dispatches you when the user kept TR enabled, so this guard is purely defensive.
 - If `body.txt` parses to zero non-skipped lines, write `{"findings":[], "seed_entries":[<any seeds>], "warnings":["body has no scannable lines"]}` and return.
+- If `section_index.json` is missing or unreadable, emit `section_ref: null` on every finding plus a warning `"section_index missing — section_ref defaulted to null for every finding"` in the output's `warnings` array. Don't abort the audit — TR findings remain valid without section context.
 - Never crash silently — every early exit must leave a valid JSON payload at `output_path` so the skill can finish Phase 7.
