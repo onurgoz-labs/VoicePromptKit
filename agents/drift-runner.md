@@ -15,27 +15,39 @@ Your user message is a JSON object split into **read-only inputs** and a single 
 ```json
 {
   "inputs": {
-    "body":        "<$RUN_DIR/body.txt>",
-    "frontmatter": "<$RUN_DIR/frontmatter.json>",
-    "rules":       "<$RUN_DIR/rules.json>",
-    "conflicts":   "<$RUN_DIR/conflicts.json>",
-    "gaps":        "<$RUN_DIR/gaps.json>",
-    "dominances":  "<$RUN_DIR/dominances.json>",
-    "probes_ref":  "<skills/prompt-check/references/probes.md>"
+    "body":                  "<$RUN_DIR/body.txt>",
+    "frontmatter":           "<$RUN_DIR/frontmatter.json>",
+    "rules":                 "<$RUN_DIR/rules.json>",
+    "conflicts":             "<$RUN_DIR/conflicts.json>",
+    "gaps":                  "<$RUN_DIR/gaps.json>",
+    "dominances":            "<$RUN_DIR/dominances.json>",
+    "probes_ref":            "<skills/prompt-check/references/probes.md>",
+    "expand_count_override": 3
   },
-  "output_path":   "<$RUN_DIR/drift.json>"
+  "output_path": "<$RUN_DIR/drift.json>"
 }
 ```
 
 Read every file under `inputs` exactly once. **Never read `output_path`** — it does not exist yet and reading it would burn a tool call. Write to `output_path` only at the end of Step 4.
+
+`expand_count_override` is the value the user picked in the per-run wizard (Phase 3.5 of SKILL.md). When present and not null, it takes precedence over `frontmatter.expand_count`. When absent or null, fall back to `frontmatter.expand_count` (existing behaviour). When `expand_count_override == 0`, drift is disabled for this run — write `{"scenarios":[],"runs":[],"verdicts":[],"warnings":["expand_count is 0 — drift disabled"]}` to `output_path` and return (mirror the SKILL.md drift skip path).
 
 ## Step 1 — Generate scenarios
 
 Apply the rules in `probes_ref` ("Generation order" section). Cap total scenarios at:
 
 ```
-frontmatter.expand_count + anchors.length + min(2, conflicts.length + gaps.length)
+expand_count + anchors.length + min(2, conflicts.length + gaps.length)
 ```
+
+where `expand_count` is resolved from inputs as:
+
+```
+expand_count = inputs.expand_count_override if inputs.expand_count_override is not None
+               else frontmatter.expand_count
+```
+
+Per-run override priority: `inputs.expand_count_override` (if present and not null) > `frontmatter.expand_count` > built-in default (3).
 
 For each scenario, choose `kind` and construct `input` per the matching probe template. Every scenario MUST have at least one assertion OR a non-empty rubric.
 
@@ -185,6 +197,8 @@ Write a single JSON file at `output_path` with shape:
 Use pretty JSON (2-space indent). After writing, return a one-line status to the skill: `drift complete (batch): <N> scenarios, <P> passed, <F> failed`. Nothing else.
 
 ## Batch discipline (mandatory)
+
+**Per-run expand_count override:** the skill's Phase 3.5 wizard may have changed `expand_count` for this run (e.g. user picked 3 even though frontmatter says 5). The override arrives via `inputs.expand_count_override`. Honour it as the source of truth for the scenario cap. The frontmatter value is the FALLBACK only.
 
 Step 2 and Step 3 are SINGLE-PASS batch operations. Common failure modes when an LLM batches:
 
