@@ -2,16 +2,16 @@
 
 Active only when `frontmatter.tr_phonetic == true`. Voice agents (Vapi, ElevenLabs, OpenAI Realtime, etc.) read text aloud; constructs that look fine in writing may be mispronounced or sound robotic.
 
-## Output shape — advisory-only, one optional strategy field
+## Output shape — fix_kind set per category
 
-**Every TR finding has `fix_kind: "advisory"`.** Apply-mode never modifies the prompt based on TR findings — they appear in `report.md` and `findings.json` for the author to read, weigh, and act on by hand. The `kind` field still distinguishes the detection category, and each finding still surfaces a concrete suggestion (either a `suggested_fix` for textual issues or a `pronunciation_entry` for foreign words / abbreviations) so the report is actionable.
+**TR findings carry `fix_kind` set by their `kind`:** `foreign_word` + `abbreviation` → `"advisory"` (overlay only, prompt never modified); `number_readability` + `punctuation` → `"replace"` (normal apply flow — user's `düzelt` decision modifies the prompt file). The `kind` field distinguishes the detection category, and each finding surfaces a concrete suggestion (either a `suggested_fix` for textual issues or a `pronunciation_entry` for foreign words / abbreviations).
 
-| `kind` | Suggestion shape | What the author should do |
-|---|---|---|
-| `number_readability` | `suggested_fix` (verbal form of the number) | Replace by hand if the line is meant to be spoken; skip for written-only sections |
-| `abbreviation` | `pronunciation_entry` (curated risky list) | Decide whether to spell out, add a pronunciation note, or leave alone |
-| `foreign_word` | `pronunciation_entry` (with `strategy: pronounce | rephrase | follow_with_translation`) | Voice-design call — author may add a TTS hint block, rephrase, or accept the default reading |
-| `punctuation` | `suggested_fix` (corrected punctuation / break point) | Almost always safe to apply by hand; advisory because punctuation is style-sensitive |
+| `kind` | `fix_kind` | Suggestion shape | What apply-mode does |
+|---|---|---|---|
+| `number_readability` | `replace` | `suggested_fix` (verbal form of the number) | Replaces `current_excerpt` with `suggested_fix` in the prompt file when the user picks `düzelt`; routes to overlay on `yorum bırak` |
+| `abbreviation` | `advisory` | `pronunciation_entry` (curated risky list) | Overlay only — prompt text never modified. Author hand-merges into a pronunciation guide or TTS provider config |
+| `foreign_word` | `advisory` | `pronunciation_entry` (with `strategy: pronounce | rephrase | follow_with_translation`) | Overlay only — voice-design call the author owns; the prompt visible script is not edited |
+| `punctuation` | `replace` | `suggested_fix` (corrected punctuation / break point) | Replaces `current_excerpt` with `suggested_fix` in the prompt file when the user picks `düzelt`; routes to overlay on `yorum bırak` |
 
 Common finding shape:
 
@@ -19,7 +19,7 @@ Common finding shape:
 {
   "id": "T1",
   "kind": "number_readability | abbreviation | foreign_word | punctuation",
-  "fix_kind": "advisory",
+  "fix_kind": "replace | advisory",
   "severity": "low | medium | high",
   "line": 42,
   "current_excerpt": "...",
@@ -35,7 +35,7 @@ Common finding shape:
 }
 ```
 
-Only one of `suggested_fix` / `pronunciation_entry` is populated per finding. Both are informational — apply-mode reads neither for TR findings.
+Only one of `suggested_fix` / `pronunciation_entry` is populated per finding. For `fix_kind: "replace"` findings (`number_readability`, `punctuation`), apply-mode reads `suggested_fix` and rewrites the prompt file. For `fix_kind: "advisory"` findings (`foreign_word`, `abbreviation`), apply-mode never modifies the prompt — the `pronunciation_entry` lands in the overlay for the author to hand-merge.
 
 ### `strategy` semantics
 
@@ -51,6 +51,18 @@ Severity guide:
 - **high** — TTS will mispronounce or skip; meaning lost.
 - **medium** — TTS reads it but unnaturally; listener may hesitate.
 - **low** — cosmetic / preference.
+
+## Why the split — voice-design vs textual correction
+
+`foreign_word` and `abbreviation` findings emit `pronunciation_entry` payloads (DHL → "de-ha-el", Gaggia → "gacca"). These describe HOW the TTS should speak the term, not WHAT text should appear in the prompt. Auto-editing the prompt to insert phonetic spellings would corrupt the visible script (`DHL` becoming `de-ha-el` breaks the meaning). These stay advisory — the author hand-merges them into a pronunciation guide block or the TTS provider's config.
+
+`number_readability` and `punctuation` findings emit `suggested_fix` payloads with concrete textual corrections (100 TL → yüz lira; missing comma added). These ARE textual edits — the visible script should change. They emit `fix_kind: "replace"` and follow the normal apply flow when the user picks `düzelt`. The author can still route them to overlay via `yorum bırak`.
+
+## Hard rule: foreign words and abbreviations never modify the prompt
+
+`foreign_word` and `abbreviation` findings are advisory-only — apply-mode NEVER modifies the prompt file for them, regardless of the verb the user typed. The pronunciation lands in `inline-suggestions.md` for the author to hand-merge.
+
+`number_readability` and `punctuation` findings MAY modify the prompt — same as `conflict` / `dominance` / `gap` findings. They emit `fix_kind: "replace"` and follow the normal `düzelt` / `yorum bırak` routing.
 
 ## Hard rule: never translate
 
