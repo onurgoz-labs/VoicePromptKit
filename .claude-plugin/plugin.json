@@ -1,6 +1,6 @@
 {
   "name": "PromptChecker",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Audit prompts interactively through four lenses (conflict, dominance, gap, drift) plus optional Turkish phonetic lens. Parallel subagent dispatch, free-form per-finding decisions, overlay file for non-applied suggestions, append-only decision log. Never modifies the prompt without an explicit user decision.",
   "author": {
     "name": "Onur GOZ",
