@@ -5,7 +5,7 @@ description: Audit a prompt file (system prompt, agent definition, voice script,
 
 # prompt-check
 
-You audit a prompt file at the path supplied as `$1`. Read the prompt once, then dispatch each lens family to its dedicated subagent (`static-lens-runner`, `drift-runner`, `tr-phonetic-runner`). Merge their outputs in Phase 7. Write all artefacts under an isolated run directory. **Never modify the original prompt file.**
+You audit a prompt file at the path supplied as `$1`. Read the prompt once, then dispatch each lens family to its dedicated subagent (`static-lens-runner`, `drift-runner`, `tr-phonetic-runner`). Merge their outputs in Phase 7. After the terminal summary (Phase 8), automatically enter the **interactive review** — Phase 9 (summary + decision parsing) and Phase 10 (action dispatch) are part of the default flow, not a separate command. Write all artefacts under an isolated run directory. **Never modify the original prompt file except in Phase 10's `applied` step, governed by the SHA256 stale-audit guard.**
 
 ## Inputs you have
 
@@ -13,8 +13,10 @@ You audit a prompt file at the path supplied as `$1`. Read the prompt once, then
 - `references/lens-rules.md` — full criteria for the static lenses; read by `static-lens-runner`.
 - `references/tr-phonetic.md` — Turkish phonetic rules; read by `tr-phonetic-runner`.
 - `references/probes.md` — adversarial probe templates; read by `drift-runner`.
+- `references/dialog-flow.md` — interactive templates, free-form decision grammar, lens-selection question shape, and the "konuşalım" sub-flow. Read by Phase 9 and Phase 10.
+- `references/overlay-format.md` — `inline-suggestions.md` layout, `decisions.jsonl` shape, and Phase 10 ordering rules. Read by Phase 10.
 
-The skill itself does not need to read these reference files — it only passes their paths to the matching subagent.
+The skill itself does not need to read the three lens reference files (`lens-rules.md`, `tr-phonetic.md`, `probes.md`) — it only passes their paths to the matching subagent. The two interactive references (`dialog-flow.md`, `overlay-format.md`) ARE read by the skill itself in Phase 9 and Phase 10.
 
 ## Phase 0 — Project config (wizard on first run)
 
@@ -90,6 +92,14 @@ fi
 
 # IMPORTANT: $PROMPT_DIR/latest is updated ONLY on success (Phase 8).
 # A run that fails mid-way leaves `latest` pointing at the previous good run.
+
+# Bootstrap interactive state placeholders so Phase 9/10 can append without
+# checking existence. These start empty; Phase 9 writes the real session.json
+# at interactive entry, and Phase 9 appends the first decision to
+# decisions.jsonl. Both files are append-only / rewrite-in-full after that.
+: > "$RUN_DIR/decisions.jsonl"
+printf '{}' > "$RUN_DIR/session.json"
+
 echo "RUN_DIR=$RUN_DIR"
 echo "RUN_NAME=$RUN_NAME"
 echo "ABS_PROMPT=$ABS_PROMPT"
@@ -97,8 +107,9 @@ echo "ABS_PROMPT=$ABS_PROMPT"
 
 **Invariants for the entire run:**
 - All artefacts go under `$RUN_DIR/`. Never `.promptcheck/.tmp/`.
-- Original prompt file is read-only. No inline annotation, no edits, no `.bak`.
+- Original prompt file is read-only EXCEPT in Phase 10's `applied` step (governed by SHA256 guard + explicit user decision). No inline annotation, no `.bak`, no edits in any other phase.
 - Previous run directories are left intact (versioning).
+- `session.json` and `decisions.jsonl` are bootstrapped here so Phase 9/10 never have to test for existence.
 
 ## Phase 2 — Frontmatter (deterministic, not LLM)
 
@@ -116,11 +127,13 @@ import sys, re, json, os, hashlib
 prompt_path, run_dir, config_path = sys.argv[1], sys.argv[2], sys.argv[3]
 text = open(prompt_path, encoding='utf-8').read()
 
-# D1: snapshot the prompt content hash for stale-audit detection in apply-mode
+# D1: snapshot the prompt content hash for stale-audit detection in Phase 10's
+# applied step (SHA mismatch → auto-route applied decisions to overlay).
 prompt_sha256 = hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 # B1: compute body_line_offset so downstream phases can map body.txt lines
-# back to the original prompt file's line numbers (apply-mode depends on this).
+# back to the original prompt file's line numbers (Phase 10's applied step
+# depends on this — it locates findings by original-file line + current_excerpt).
 m = re.match(r'^---\r?\n(.*?)\r?\n---\r?\n?(.*)$', text, re.DOTALL)
 if m:
     raw_fm = m.group(1)
@@ -245,6 +258,40 @@ Hold the rules in memory as JSON. Also write `$RUN_DIR/rules.json` with shape:
 
 If you extract zero rules, abort with an error written to `$RUN_DIR/error.txt` and surface that to the user.
 
+## Phase 3.5 — Lens-selection wizard (per-run)
+
+This wizard runs **once per `/prompt-check` invocation**, after rule extraction and before lens dispatch. It is separate from the Phase 0 repo-level wizard (which governs `.promptchecker.json` defaults). Phase 3.5 captures per-run intent.
+
+Ask the user via `AskUserQuestion`:
+
+1. **"Bu prompt için hangi mercekleri çalıştırayım?"** — multi-select. Options: `conflict`, `dominance`, `gap`, `drift`, `tr_phonetic`. Default: all five pre-selected. The frontmatter `tr_phonetic` value (from Phase 2) pre-selects/deselects `tr_phonetic` accordingly; the user can still override.
+2. **If `drift` is included in the selection:** ask an integer follow-up for `expand_count`. Default = `frontmatter.expand_count` (which already merges per-prompt → env → project → 3). Range 0–20. If the user picks 0, drift is effectively disabled even though the lens was selected — Phase 5's existing `expand_count == 0` kill switch handles this.
+3. **If `tr_phonetic` is included AND `frontmatter.tr_phonetic` was `false`:** ask a yes/no confirmation "Türkçe sesli ajan için TTS denetimi yapılsın mı?". If the user says no, drop `tr_phonetic` from the selection.
+
+The exact wording and option labels live in `references/dialog-flow.md`. Refer to that file for the prompt strings — do not inline copy them here.
+
+Persist the answer in memory as `user_intent`:
+
+```json
+{
+  "selected_lenses": ["conflict","dominance","gap","drift","tr_phonetic"],
+  "expand_count": 3,
+  "anchors": [],
+  "asked_at": "<ISO 8601 UTC>"
+}
+```
+
+`anchors` is copied verbatim from `frontmatter.anchors` (no per-run question for anchors; they live in frontmatter only).
+
+Phase 9 writes this `user_intent` block into `session.json` at interactive entry. Until then it is held in memory by the skill.
+
+**Dispatch impact:**
+- Phase 4 (static lenses): if `conflict`, `dominance`, or `gap` is unselected, instruct `static-lens-runner` to skip those sub-lenses (the runner writes an empty `{"conflicts": []}` etc. for skipped sub-lenses, OR the skill simply does not dispatch when all three are unselected).
+- Phase 5 (drift): the existing skip gate (`expand_count == 0` OR no anchors/conflicts/role-overrides) already handles drift opt-out. Additionally, if `drift` is unselected here, skip Phase 5 entirely and write `drift.json` with `skipped_reason: "drift lens deselected by user"`.
+- Phase 6 (TR phonetic): only dispatch if `tr_phonetic` is in `user_intent.selected_lenses` AND `frontmatter.tr_phonetic == true` (after the Phase 3.5 confirmation). Otherwise skip — no `tr_phonetic.json` is written, and Phase 7 treats missing files as "lens disabled".
+
+Phase 7 already handles missing per-lens JSON files as "lens disabled" — no change there.
+
 ## Phases 4 + 6 — Parallel lens dispatch (with Phase 5 downstream of 4)
 
 Phase 4 (static lenses) and Phase 6 (TR phonetic, when its gate passes) are **independent** — they read different inputs and write different outputs. Dispatch both subagents in a **single message with two concurrent `Agent` calls** so they execute in parallel. Phase 5 (drift) is **downstream of Phase 4** — drift-runner reads `conflicts.json`, `gaps.json`, and `dominances.json` as inputs, so it MUST run after Phase 4's outputs land. The correct order is:
@@ -334,7 +381,7 @@ When the gate passes, dispatch the `tr-phonetic-runner` subagent. It seeds `pron
 
 **Line-number contract:** every `line` field (including `seed_block_range.start_line` / `end_line`) the subagent writes is a body.txt index. Phase 7 translates to original-file lines.
 
-**Advisory invariant:** every TR finding has `fix_kind: "advisory"`. PromptChecker never auto-applies any TR phonetic suggestion to the prompt file — neither substring replacement nor pronunciation block injection. The subagent populates either `suggested_fix` (textual issues) or `pronunciation_entry` (foreign words / abbreviations) for the report, but apply-mode treats every TR finding as advisory and only surfaces their count in the diff summary. The author decides.
+**Advisory invariant:** every TR finding has `fix_kind: "advisory"`. PromptChecker never auto-applies any TR phonetic suggestion to the prompt file — neither substring replacement nor pronunciation block injection. The subagent populates either `suggested_fix` (textual issues) or `pronunciation_entry` (foreign words / abbreviations) for the report. Phase 9's TR routing rule guarantees this at the interactive layer: any TR finding decided as `applied` is auto-converted to `overlay` before Phase 10 ever sees it. The author decides whether and how to act on TR findings by hand.
 
 Pass inputs and the output path as **separate** top-level fields:
 
@@ -365,9 +412,9 @@ Read every artefact that landed in `$RUN_DIR/` so far: `frontmatter.json`, `rule
 original_line = body_line + frontmatter.body_line_offset - 1
 ```
 
-Apply this to every `findings[].line` and `findings[].related_lines[]`. After translation, body.txt indices must no longer appear in any rendered output. Apply-mode and report.md both depend on this.
+Apply this to every `findings[].line` and `findings[].related_lines[]`. After translation, body.txt indices must no longer appear in any rendered output. Phase 9 (summary view), Phase 10 (applied step), and `report.md` all depend on this.
 
-**Carry the prompt hash:** copy `frontmatter.prompt_sha256` into the top of findings.json so apply-mode can detect a stale audit.
+**Carry the prompt hash:** copy `frontmatter.prompt_sha256` into the top of findings.json so Phase 10's applied step can detect a stale audit and auto-route to overlay.
 
 ### `$RUN_DIR/findings.json`
 
@@ -423,10 +470,10 @@ Apply this to every `findings[].line` and `findings[].related_lines[]`. After tr
 }
 ```
 
-`pronunciation_map` is the union of `tr_phonetic.json.seed_entries` (entries the prompt already had — `source: "seed"`) and the `pronunciation_entry` payload of TR findings (`source: "finding"`). Dedupe by `term` (case-insensitive); if a seed entry and a finding entry collide, **seed wins** (the author's curated text is the source of truth). It is a flat reference list rendered in `report.md` and surfaced in `findings.json` for downstream tooling — apply-mode never injects it back into the prompt.
+`pronunciation_map` is the union of `tr_phonetic.json.seed_entries` (entries the prompt already had — `source: "seed"`) and the `pronunciation_entry` payload of TR findings (`source: "finding"`). Dedupe by `term` (case-insensitive); if a seed entry and a finding entry collide, **seed wins** (the author's curated text is the source of truth). It is a flat reference list rendered in `report.md` and surfaced in `findings.json` for downstream tooling — Phase 10 never injects it back into the prompt.
 
 `findings[]` is sorted by `line` ascending, then by severity descending. For each finding:
-- `fix_kind: "replace"` → apply-mode edits the line so it produces `suggested_fix` instead of `current_excerpt`. Only emitted by `conflict`, `dominance`, `gap`, `drift` lenses (never TR phonetic).
+- `fix_kind: "replace"` → Phase 10's applied step rewrites the line so it produces `suggested_fix` instead of `current_excerpt`. Only emitted by `conflict`, `dominance`, `gap`, `drift` lenses (never TR phonetic).
 - `fix_kind: "advisory"` → no automatic apply. **Every TR phonetic finding uses this**, regardless of whether `suggested_fix` or `pronunciation_entry` is populated.
 
 The TR lens never produces `replace` findings — TR suggestions are always reported, never written.
@@ -508,73 +555,313 @@ Findings: <relative path to $RUN_DIR/findings.json>
 Previous runs: .promptcheck/<basename>/ (run-001 … run-NNN)
 Repo defaults: <relative path to .promptchecker.json>
 
-Say "fix these" or "düzelt bunları" and I will apply suggested_fix entries from findings.json.
+Entering interactive review (Phase 9). Use a compact decision string such as
+  "C1, C3 düzelt; G2 yorum bırak; T1..T5 konuşalım; gerisini atla"
+to choose what to do with each finding. Type "iptal" to leave the session as
+pending and resume later with /prompt-check-resume.
 ```
 
-## Apply-mode (when the user asks to fix)
+After printing this block, **do not stop** — automatically transition to Phase 9 in the same turn. Phase 9 + Phase 10 are part of the default `/prompt-check` flow; the audit is not finished until the user either resolves every finding or explicitly cancels with "iptal".
 
-Apply-mode is entered in either of two ways:
+## Phase 9 — Interactive selection
 
-- The user runs the explicit slash command **`/prompt-check-apply [run-id]`** — preferred path.
-- The user types "fix these" / "düzelt bunları" / "apply the fixes" / similar trigger phrase in the same or a later session.
+Triggered automatically once Phase 8 has printed its summary. There is no separate trigger phrase — the audit flow always passes through Phase 9. (The `/prompt-check-resume` slash command re-enters Phase 9 for a pending run from a previous session.)
 
-In both paths, resolve the run directory: explicit `run-id` argument > `latest` symlink. Read `<run-dir>/findings.json`.
+Read `references/dialog-flow.md` for the templates, the free-form decision grammar, the verb-to-status mapping, and the "konuşalım" sub-flow contract. Do not inline the grammar here.
 
-### Pre-flight — stale-audit guard (mandatory)
+### 9.1 — Bootstrap session.json
 
-Before touching anything, verify the prompt file has not changed since the audit:
+Write `$RUN_DIR/session.json` (overwriting the placeholder from Phase 1) with the initial shape:
+
+```json
+{
+  "run_id": "<run-NNN>",
+  "prompt_path": "<absolute path>",
+  "prompt_sha256_at_audit": "<from findings.json.prompt_sha256>",
+  "user_intent": {
+    "selected_lenses": ["conflict","dominance","gap","drift","tr_phonetic"],
+    "expand_count": 3,
+    "anchors": [],
+    "asked_at": "<ISO 8601 UTC from Phase 3.5>"
+  },
+  "findings_state": {
+    "C1": { "status": "pending", "lens": "conflict", "line": 12, "updated_at": "<ISO 8601 UTC>" },
+    "...": "..."
+  },
+  "phase": 9,
+  "updated_at": "<ISO 8601 UTC>"
+}
+```
+
+`findings_state` is keyed by `finding.id` and seeded from `findings.json.findings[]`. Every entry starts at `status: "pending"`. `lens` and `line` are mirrored from the finding so Phase 10's TR routing rule and ordering pass do not have to re-read `findings.json`.
+
+All timestamps are ISO 8601 UTC with millisecond precision, e.g. `2026-05-27T14:23:45.123Z`.
+
+### 9.2 — Render the summary view
+
+Print a single markdown table containing every finding. Columns: `id | lens | severity | line | excerpt | suggestion`. Sort by `line` ascending, then by `severity` descending (`high > medium > low`; drift findings are surfaced with their `kind` instead of severity — treat `fail` as `high`, `pass` as `low`).
+
+Truncate `excerpt` and `suggestion` to 60 chars each, appending `…` if cut. For TR phonetic findings, show `pronunciation_entry.phonetic` (or `.alt_translation`) as the suggestion column when `suggested_fix` is null.
+
+The exact table header / footer wording lives in `references/dialog-flow.md`.
+
+### 9.3 — Prompt for decisions
+
+Emit the prompt string from `references/dialog-flow.md` (Turkish + English example), e.g.:
+
+> Hangilerini ne yapayım? Örnek: `C1, C3 düzelt; G2 yorum bırak; T1..T5 konuşalım; gerisini atla`. "iptal" yazarak oturumu beklemede bırakıp daha sonra `/prompt-check-resume` ile devam edebilirsin.
+
+**Use the conversational channel — NOT `AskUserQuestion`.** The decision grammar is compact free-form text; `AskUserQuestion` would force discrete options. Wait for the user's reply on the next turn.
+
+If the user types `iptal` (or `cancel`), write `session.json.phase = "paused"`, surface a one-line "Session paused. Resume with /prompt-check-resume <run-NNN>." message, and exit. `decisions.jsonl` stays untouched.
+
+### 9.4 — Parse the decision string (deterministic)
+
+The detailed grammar (id-lists, ranges with `..`, wildcards like `gerisini` / `rest`, verb aliases for `düzelt`/`fix`/`apply`, `yorum bırak`/`overlay`/`note`, `atla`/`skip`/`dismiss`, `konuşalım`/`discuss`/`talk`) lives in `references/dialog-flow.md`. Implement the parser as a single Python heredoc so it is deterministic. Skeleton:
+
+```bash
+python3 - "$RUN_DIR" <<'PY'
+import sys, json, os, datetime, re
+run_dir = sys.argv[1]
+user_input = os.environ.get('PROMPTCHECKER_DECISION_INPUT', '')
+
+session = json.load(open(os.path.join(run_dir, 'session.json'), encoding='utf-8'))
+findings_state = session['findings_state']
+known_ids = list(findings_state.keys())
+
+# Verb mapping — full table is in references/dialog-flow.md
+VERBS = {
+    # Turkish
+    'düzelt':'applied','duzelt':'applied','uygula':'applied',
+    'yorum':'overlay','yorum bırak':'overlay','not bırak':'overlay','overlay':'overlay',
+    'atla':'dismissed','geç':'dismissed','sil':'dismissed','iptal et':'dismissed',
+    'konuşalım':'discussed','konusalim':'discussed','tartış':'discussed',
+    # English
+    'fix':'applied','apply':'applied','accept':'applied',
+    'note':'overlay','comment':'overlay',
+    'skip':'dismissed','dismiss':'dismissed','ignore':'dismissed',
+    'discuss':'discussed','talk':'discussed',
+}
+
+WILDCARDS = {'gerisini','geri kalan','rest','others','remaining','all'}
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00','Z')
+
+def expand_id_token(tok, known):
+    tok = tok.strip()
+    if not tok: return []
+    if tok.lower() in WILDCARDS:
+        return [fid for fid, st in findings_state.items() if st['status'] == 'pending']
+    if '..' in tok:
+        a, b = tok.split('..', 1)
+        a, b = a.strip(), b.strip()
+        # Same prefix (e.g. T1..T5)
+        ma, mb = re.match(r'^([A-Za-z]+)(\d+)$', a), re.match(r'^([A-Za-z]+)(\d+)$', b)
+        if ma and mb and ma.group(1) == mb.group(1):
+            lo, hi = sorted([int(ma.group(2)), int(mb.group(2))])
+            return [f"{ma.group(1)}{n}" for n in range(lo, hi+1) if f"{ma.group(1)}{n}" in known]
+        return []
+    return [tok] if tok in known else []
+
+# Split top-level on ';' — segments
+decisions_resolved = []   # list of (fid, status, raw_segment)
+unrecognised = []
+seen_ids = set()
+
+for segment in user_input.split(';'):
+    segment = segment.strip()
+    if not segment: continue
+    # Find the verb by greedy-longest match against VERBS keys
+    verb_key, status = None, None
+    seg_lower = segment.lower()
+    for v in sorted(VERBS.keys(), key=len, reverse=True):
+        if v in seg_lower:
+            verb_key, status = v, VERBS[v]
+            break
+    if status is None:
+        unrecognised.append(segment); continue
+    # The id-list is everything before the verb token
+    idx = seg_lower.index(verb_key)
+    id_part = segment[:idx].strip().rstrip(',')
+    ids = []
+    for tok in re.split(r'[,\s]+', id_part):
+        ids.extend(expand_id_token(tok, known_ids))
+    for fid in ids:
+        if fid in seen_ids: continue
+        seen_ids.add(fid)
+        decisions_resolved.append((fid, status, segment))
+
+# TR routing rule: tr_phonetic + applied → overlay
+routed = []
+for i, (fid, status, raw) in enumerate(decisions_resolved):
+    if status == 'applied' and findings_state[fid]['lens'] == 'tr_phonetic':
+        routed.append(fid)
+        decisions_resolved[i] = (fid, 'overlay', raw)
+
+# Append to decisions.jsonl: routed entries FIRST (one per routed id), then the actual decisions
+out_path = os.path.join(run_dir, 'decisions.jsonl')
+with open(out_path, 'a', encoding='utf-8') as f:
+    for fid in routed:
+        f.write(json.dumps({
+            'finding_id': fid,
+            'action': 'routed_to_overlay',
+            'reason': 'TR phonetic findings never modify the prompt file',
+            'at': now(),
+        }, ensure_ascii=False) + '\n')
+    for fid, status, raw in decisions_resolved:
+        f.write(json.dumps({
+            'finding_id': fid,
+            'action': status,
+            'source': 'phase_9_decision_string',
+            'raw_segment': raw,
+            'at': now(),
+        }, ensure_ascii=False) + '\n')
+
+# Update session.json
+for fid, status, _ in decisions_resolved:
+    findings_state[fid]['status'] = status
+    findings_state[fid]['updated_at'] = now()
+session['phase'] = 9
+session['updated_at'] = now()
+json.dump(session, open(os.path.join(run_dir, 'session.json'), 'w', encoding='utf-8'), indent=2, ensure_ascii=False)
+
+# Outcome counters for the terminal line
+buckets = {'applied':0,'overlay':0,'dismissed':0,'discussed':0}
+for fid, status, _ in decisions_resolved:
+    buckets[status] = buckets.get(status, 0) + 1
+
+print(json.dumps({
+    'parsed': len(decisions_resolved),
+    'applied': buckets['applied'],
+    'overlay': buckets['overlay'],
+    'dismissed': buckets['dismissed'],
+    'discussed': buckets['discussed'],
+    'tr_routed': len(routed),
+    'unrecognised': unrecognised,
+}, ensure_ascii=False))
+PY
+```
+
+Pass the user's reply as `PROMPTCHECKER_DECISION_INPUT` (or stdin — whichever is cleaner in the harness). The block above is illustrative; trust `references/dialog-flow.md` as the source of truth for the verb table and grammar edge cases.
+
+### 9.5 — Report parse outcome
+
+Print one line:
+
+```
+Parsed N decisions: A applied, B overlay, C dismissed, D discussed, E TR-routed to overlay, F unrecognised.
+```
+
+If `unrecognised` is non-empty, list the unparsed segments and re-prompt — loop back to 9.3. Do not advance to Phase 10 until every segment is either parsed or the user types `iptal`.
+
+If after parsing every pending finding still has `status: "pending"`, ask the user one clarifying turn (using the template in `references/dialog-flow.md`) before falling through to Phase 10. Pending findings at Phase 10 entry are treated as `dismissed` only when the user explicitly says `gerisini atla` (or equivalent).
+
+### 9.6 — Hand off to Phase 10
+
+Transition automatically. Do not wait for further confirmation unless `decisions_resolved` is empty.
+
+## Phase 10 — Action dispatch
+
+Phase 10 reads `session.json` and `decisions.jsonl` from Phase 9 and executes each decided action. The order below is fixed — see `references/overlay-format.md` Section 4 for the rationale.
+
+**Do not read decisions.jsonl or session.json while a Phase 10 sub-step is still writing to them.** Each sub-step reads its inputs once at entry, performs its writes, then yields to the next sub-step.
+
+### 10.1 — Dismissed
+
+For each finding with `findings_state[fid].status == "dismissed"`: log only, no I/O. Count for the closing summary. Do not append anything to `decisions.jsonl` here — the Phase 9 entry already records the decision.
+
+### 10.2 — Overlay
+
+Collect every finding whose status is `overlay` (this includes the TR-routed findings from Phase 9.4). Rebuild `$RUN_DIR/inline-suggestions.md` in full per the layout in `references/overlay-format.md`. The file is **rewritten from scratch on every Phase 10 pass** — idempotent regeneration ensures resumed sessions produce consistent overlays.
+
+Do not append per-finding entries to `decisions.jsonl` for this step — the `overlay` decision was already logged in Phase 9.4 (or 10.3 if auto-converted from `applied`).
+
+### 10.3 — Applied
+
+**Pre-flight (mandatory):** compute the current SHA256 of the prompt file:
 
 ```bash
 ACTUAL_SHA=$(shasum -a 256 "$PROMPT_PATH" | awk '{print $1}')
 ```
 
-Compare against `findings.json.prompt_sha256`. If they differ, **abort** — do not apply anything. Surface:
+Compare against `session.json.prompt_sha256_at_audit` (which mirrors `findings.json.prompt_sha256`).
+
+- **If SHA matches:** proceed with the applied pass.
+- **If SHA mismatches:** the prompt has drifted since the audit. Do NOT abort the whole phase — auto-convert every `applied` decision to `overlay`. For each such finding:
+  - Append a `routed_to_overlay` entry to `decisions.jsonl` with `reason: "prompt drifted since audit; routed to overlay"`.
+  - Update `findings_state[fid].status = "overlay"` in `session.json`.
+  - Add the finding to the overlay set processed in 10.2 (rerun 10.2 if any auto-conversion happened).
+  - Skip the substring-replace logic entirely for that finding.
+
+If SHA matches, for each finding with `status == "applied"`:
+
+1. Read the prompt file fresh (do not trust an in-memory cache from earlier phases).
+2. Index to `findings[].line` — this is already an original-file line (Phase 7 translated it).
+3. Search for `current_excerpt` as a substring on that line.
+   - If the excerpt appears **zero times** on that line: auto-convert to `overlay` with note `"current_excerpt no longer present on line N"`. Log `routed_to_overlay` in decisions.jsonl, update session.json, add to overlay set (rerun 10.2).
+   - If the excerpt appears **more than once** on that line: auto-convert to `overlay` with note `"ambiguous occurrence — excerpt appears multiple times on line N"`. Log `routed_to_overlay`, update session.json, add to overlay set.
+   - If the excerpt appears **exactly once**: perform the substring replacement (`current_excerpt` → `suggested_fix`) and write the prompt file back.
+4. Append a per-finding entry to `decisions.jsonl` with `action: "applied"`, `at: <now>`, `original_sha256: <ACTUAL_SHA>`, `new_sha256: <after-write SHA>`. This documents the actual mutation, separate from the user decision recorded in Phase 9.
+
+After the applied pass completes, recompute `current_prompt_sha256 = shasum -a 256 "$PROMPT_PATH"` and store it in memory for downstream queries. **Do not modify `findings.json.prompt_sha256`** — that field is the audit snapshot and stays frozen.
+
+If any auto-conversion happened in this sub-step, re-run 10.2 once more so `inline-suggestions.md` includes the newly routed overlay findings.
+
+### 10.4 — Discussed (the "konuşalım" sub-flow)
+
+Process findings whose status is `discussed` in `id` order (stable across resume). For each one:
+
+1. **Display** the full finding to the user — lens, severity, original-file line, full `current_excerpt`, full `rationale`, full `suggested_fix` (or `pronunciation_entry` for TR), and any related rule ids.
+2. **Ask** via `AskUserQuestion` with the four options defined in `references/dialog-flow.md`. The expected options are:
+   - Apply as suggested (`applied`)
+   - Add as overlay only (`overlay`)
+   - Skip (`dismissed`)
+   - I'll revise it myself (`revised`)
+3. **If the user picks "ben revize ediyorum" / "revised":**
+   - Open a free-form conversational prompt: ask the user to type the new suggestion text.
+   - Append a `revised` entry to `decisions.jsonl` with `new_suggestion: <user-supplied text>`, `original_suggestion: <findings.suggested_fix>`, `at: <now>`.
+   - Then ask via `AskUserQuestion` whether to apply the revised text or store it as overlay only — two options.
+   - The user's chosen final action runs through the same logic as 10.3 (if `applied`) or 10.2 (if `overlay`). For `applied`, the substring being replaced is still `current_excerpt`; the replacement is the revised text from the user.
+4. **TR routing rule still applies inside 10.4:** if the finding has `lens == "tr_phonetic"` and the user picks `applied` (or `revised → applied`), auto-convert to `overlay` with a `routed_to_overlay` entry in `decisions.jsonl` preceding the `overlay` entry.
+5. **Record the final action** in `decisions.jsonl` (`applied` / `overlay` / `dismissed`). Update `findings_state[fid].status` to that terminal status. Do not leave `discussed` or `revised` as the final status — they are transient.
+6. **Loop** until every `discussed` finding has been resolved to one of the four terminal states.
+
+If during 10.4 a SHA mismatch is detected (the user took a long pause and an external tool changed the file), apply the same drift handling as 10.3: auto-convert pending `applied` decisions in 10.4 to `overlay`, log the routing, continue.
+
+### 10.5 — Phase 10 closing summary
+
+Print a single block:
 
 ```
-Prompt has changed since this audit (run-NNN). Re-run /prompt-check first, then /prompt-check-apply.
-Expected SHA: <findings.prompt_sha256>
-Actual SHA:   <ACTUAL_SHA>
+Interactive review complete — <run-NNN>
+
+- Applied:        <N> finding(s) written to <prompt-path>
+- Overlay:        <N> finding(s) in inline-suggestions.md
+- Dismissed:      <N>
+- Revised:        <N> (of which: A applied, B overlay)
+- TR auto-routed: <N> (TR phonetic findings never modify the prompt)
+- Stale-audit auto-routed: <N> (SHA mismatch since audit)
+- Ambiguous-occurrence auto-routed: <N>
+
+Overlay file: <relative path to $RUN_DIR/inline-suggestions.md>  (if any overlays exist)
+Decisions log: <relative path to $RUN_DIR/decisions.jsonl>
+Session state: <relative path to $RUN_DIR/session.json>
 ```
 
-If they match, proceed.
-
-### Replace pass — line-level substitutions (non-TR lenses only)
-
-For each finding where ALL of these hold:
-- `fix_kind == "replace"`
-- `suggested_fix` is non-empty
-- `lens != "tr_phonetic"` (TR findings are **never** auto-applied — see "TR phonetic exclusion" below)
-
-Do:
-
-1. Read the prompt file fresh.
-2. Locate the line via `line` number (already translated to original-file line by Phase 7) AND `current_excerpt` substring match (both must agree — if not, skip and report).
-3. If `current_excerpt` appears more than once on that line, refuse to apply that finding and report it (no occurrence index → ambiguous).
-4. Apply the substring replacement.
-5. Write the file back.
-
-Group conflicting suggestions: if two findings target the same line, present a choice rather than silently applying one. Never apply a finding whose `suggested_fix` is empty — those are advisory only.
-
-### TR phonetic exclusion (hard rule)
-
-Apply-mode **never** modifies the prompt based on TR phonetic findings — no substring replacement, no pronunciation guide injection, no auto-inserted blocks. TR findings live in `report.md` / `findings.json` for the author to read and act on by hand. If `findings.json` contains TR findings, surface their count in the diff summary so the author knows they exist; do not touch the file because of them.
-
-Rationale: phonetic adjustments and pronunciation hints are voice-design decisions the human author owns. False positives are common (proper nouns, brand voice, dialect choice), and a silently-injected block can poison a Vapi/ElevenLabs script in subtle ways. PromptChecker reports — the author decides.
-
-### Diff surface
-
-After the replace pass, show a short summary in the terminal:
-- Pre-flight: `Prompt SHA match — ok` or `Prompt SHA mismatch — aborted`.
-- Replace pass: `N findings applied, M skipped (mismatch / ambiguous occurrence), K conflicts on same line`.
-- TR phonetic: `<N> advisory findings — reported only, no auto-apply (see report.md)` (omit if no TR findings).
-
-If the replace pass is empty, say so explicitly — do not pretend to have done work.
+Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. If any findings remain `pending` at this point (user did not address them and did not type `gerisini atla`), set `session.json.phase = "paused"` instead and remind the user they can resume with `/prompt-check-resume <run-NNN>`.
 
 ## Don'ts
 
 - Don't extract frontmatter with an LLM pass; use Bash/Python — it's deterministic and free.
 - Don't read the original prompt more than once per phase; pass `body.txt` between steps.
 - Don't run lens analysis inline in the skill. Each lens family has a dedicated subagent (`static-lens-runner`, `drift-runner`, `tr-phonetic-runner`); the skill only dispatches and reads outputs.
-- Don't write outside `$RUN_DIR/` (except for `.promptchecker.json` in Phase 0, with the user's explicit consent through the wizard).
-- Don't modify the original prompt file in any phase — only Apply-mode does that, and only when the user explicitly asks.
-- Don't run the wizard if `.promptchecker.json` already exists. The user owns that file.
+- Don't write outside `$RUN_DIR/` (except for `.promptchecker.json` in Phase 0 with explicit wizard consent, and the original prompt file in Phase 10's applied step under SHA guard + user decision).
+- Don't modify the original prompt file in any phase other than Phase 10's applied step — and even there, only when the SHA matches and the user explicitly decided `applied`.
+- Don't run the Phase 0 wizard if `.promptchecker.json` already exists. The user owns that file.
+- Don't reintroduce batch / apply-mode. There is no `/prompt-check-apply` anymore — its semantics are folded into Phase 10. Resume uses `/prompt-check-resume`.
+- Don't define `inline-suggestions.md` format, `decisions.jsonl` shape, or the decision grammar inline in this skill — they live in `references/overlay-format.md` and `references/dialog-flow.md`.
+- Don't read `decisions.jsonl` or `session.json` in the same sub-step that writes to them — finish the write, then move on.
+- Don't append duplicate entries to `decisions.jsonl` on resume — append only NEW actions, not re-statements of historical decisions. Resume reads the existing file as history and continues from there.
+- Don't keep `findings_state[*].status` at `"discussed"` or `"revised"` as a terminal state — both are transient. Every finding must end at `pending` (only if the run is paused), `applied`, `overlay`, or `dismissed`.
+- Don't use `AskUserQuestion` for the free-form decision string in Phase 9.3 — it must be conversational so the user can express ranges, wildcards, and verb aliases in one line. Use `AskUserQuestion` only for the four-option choice inside the Phase 10.4 sub-flow.
