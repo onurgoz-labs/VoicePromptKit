@@ -799,7 +799,17 @@ Note: Phase 9 already wrote `routed_to_overlay` lines for TR-routed `applied` de
 ACTUAL_SHA=$(shasum -a 256 "$PROMPT_PATH" | awk '{print $1}')
 ```
 
-For each finding with `findings_state[fid].status == "applied"`, run a **feasibility check first** (read-only — no writes to `decisions.jsonl`, no writes to the prompt file). Determine ONE outcome per finding from the following ordered rules:
+For each finding with `findings_state[fid].status == "applied"`, run a **feasibility check first** (read-only — no writes to `decisions.jsonl`, no writes to the prompt file).
+
+Possible feasibility outcomes (one per finding):
+- `tr_routed` — TR foreign_word/abbreviation, never modifies the prompt file
+- `no_concrete_fix` — empty or null `suggested_fix` (should never happen with v0.4.1+, but defensive)
+- `sha_mismatch` — stale audit; SHA256 of prompt file changed since audit snapshot
+- `ambiguous` — `current_excerpt` appears zero or multiple times on `finding.line`
+- `structural_declined` — user declined the risk warning for a `fix_strategy: "structural"` finding (see dispatch below)
+- `applicable` — passes all feasibility checks, proceed to `fix_strategy` dispatch
+
+Determine the outcome per finding from the following ordered rules:
 
 1. If `finding.lens == "tr_phonetic"` → outcome `tr_routed`, reason `"TR phonetic findings never modify the prompt file"`.
 2. Else if `finding.suggested_fix` is `null` or an empty string → outcome `no_concrete_fix`, reason `"no concrete suggested_fix — manual author revision required"`.
@@ -811,15 +821,33 @@ For each finding with `findings_state[fid].status == "applied"`, run a **feasibi
 
 **Single-event write per finding** based on the outcome:
 
-- **`applicable`** — perform the substring replacement (`current_excerpt` → `suggested_fix`) on `finding.line` and write the prompt file back atomically. Then append ONE line to `decisions.jsonl`:
+- **`applicable`** — perform the dispatch on `fix_strategy`:
+
+  For each finding marked `applicable` (passed all earlier feasibility checks), dispatch on `fix_strategy`:
+
+  - **`fix_strategy: "substring"` (or absent, for backward compatibility):**
+    Perform the substring replacement: read the prompt file, locate `line` + `current_excerpt`, replace with `suggested_fix`. Write the file back. Log: `{"action": "applied", "target": "prompt_file", "tool": "substring_replace", "fix_strategy": "substring", "from": "<current_excerpt>", "to": "<suggested_fix>", "line": N}`.
+
+  - **`fix_strategy: "structural"`:**
+    Surface a risk warning to the user BEFORE applying: "⚠ Structural change for <finding-id>: the suggestion is an action description, not a literal substring. I will use the Edit tool to apply: <suggested_fix>. Confirm? (y/n)". If the user declines, the outcome flips to `structural_declined` — route to overlay instead with note "user declined structural apply", and append a single `routed_to_overlay` line followed by a single `overlay` line to `decisions.jsonl` (no `applied` line). If the user accepts, apply via the Edit tool (semantic edit reflecting the intent of `suggested_fix`), then log: `{"action": "applied", "target": "prompt_file", "tool": "edit", "fix_strategy": "structural", "intent": "<suggested_fix>", "line": N, "risk_acknowledged": true}`.
+
+    Implementation note: when the user said `hepsini düzelt` (wildcard), the risk-warning prompt is shown ONCE per structural finding, not bundled. Each structural application is its own decision point.
+
+  After a successful write (either substring_replace or edit), append the corresponding entry to `decisions.jsonl`. For backward-compatible substring writes the full line shape is:
 
   ```json
-  {"ts":"<now>","finding":"<id>","lens":"<lens>","action":"applied","target":"prompt_file","from":"<current_excerpt>","to":"<suggested_fix>","line":<N>,"source":"phase_9_decision_string","raw_segment":"<user-segment>","original_sha256":"<ACTUAL_SHA>","new_sha256":"<post-write SHA>"}
+  {"ts":"<now>","finding":"<id>","lens":"<lens>","action":"applied","target":"prompt_file","tool":"substring_replace","fix_strategy":"substring","from":"<current_excerpt>","to":"<suggested_fix>","line":<N>,"source":"phase_9_decision_string","raw_segment":"<user-segment>","original_sha256":"<ACTUAL_SHA>","new_sha256":"<post-write SHA>"}
+  ```
+
+  For structural writes:
+
+  ```json
+  {"ts":"<now>","finding":"<id>","lens":"<lens>","action":"applied","target":"prompt_file","tool":"edit","fix_strategy":"structural","intent":"<suggested_fix>","line":<N>,"risk_acknowledged":true,"source":"phase_9_decision_string","raw_segment":"<user-segment>","original_sha256":"<ACTUAL_SHA>","new_sha256":"<post-write SHA>"}
   ```
 
   Recompute `ACTUAL_SHA` immediately after the write so the next finding in this pass sees the updated hash (otherwise subsequent applied findings within the same pass would all trip rule 3).
 
-- **`tr_routed` / `no_concrete_fix` / `sha_mismatch` / `ambiguous`** — do NOT modify the prompt file. Update `findings_state[fid].status = "overlay"` in memory. Append ONE `routed_to_overlay` line then ONE `overlay` line to `decisions.jsonl`:
+- **`tr_routed` / `no_concrete_fix` / `sha_mismatch` / `ambiguous` / `structural_declined`** — do NOT modify the prompt file. Update `findings_state[fid].status = "overlay"` in memory. Append ONE `routed_to_overlay` line then ONE `overlay` line to `decisions.jsonl`:
 
   ```json
   {"ts":"<now>","finding":"<id>","lens":"<lens>","action":"routed_to_overlay","reason":"<reason from outcome>","source":"phase_9_decision_string","raw_segment":"<user-segment>"}
@@ -828,18 +856,20 @@ For each finding with `findings_state[fid].status == "applied"`, run a **feasibi
 
   Add the finding to the overlay set processed in 10.2.
 
-**No `applied` line is ever written for a finding whose outcome was anything other than `applicable`.** The feasibility check precedes the log write — full stop.
+**No `applied` line is ever written for a finding whose outcome was anything other than `applicable` + successful dispatch.** The feasibility check (and, for structural, the user's risk acknowledgement) precedes the log write — full stop.
 
 After the applied pass completes, recompute `current_prompt_sha256 = shasum -a 256 "$PROMPT_PATH"` and store it in memory for downstream queries. **Do not modify `findings.json.prompt_sha256`** — that field is the audit snapshot and stays frozen.
 
-If any auto-conversion happened in this sub-step (any outcome other than `applicable`), re-run 10.2 once so `inline-suggestions.md` includes the newly routed overlay findings.
+If any auto-conversion happened in this sub-step (any outcome other than `applicable` + applied), re-run 10.2 once so `inline-suggestions.md` includes the newly routed overlay findings.
 
 Track the per-outcome counts for the Phase 10.5 closing summary:
-- `applied_count` — outcome was `applicable` and the write succeeded
+- `applied_count` — outcome was `applicable` and the write succeeded (any `fix_strategy`)
+- `structural_applied_count` — subset of `applied_count` where `fix_strategy: "structural"` (user acknowledged the risk warning and the Edit tool fired)
 - `tr_routed_count` — outcome `tr_routed`
 - `no_fix_count` — outcome `no_concrete_fix`
 - `stale_audit_count` — outcome `sha_mismatch`
 - `ambiguous_count` — outcome `ambiguous`
+- `structural_declined_count` — outcome `structural_declined` (user said no to the risk warning)
 
 ### 10.4 — Discussed (the "konuşalım" sub-flow)
 
@@ -869,8 +899,8 @@ Print a single block. The counts mirror the per-outcome accounting from 10.3 and
 ```
 Interactive review complete — <run-NNN>
 
-- Applied:        <N> (each one actually wrote to <prompt-path>)
-- Auto-routed:    <X> (TR: <a>, no-fix: <b>, stale-audit: <c>, ambiguous: <d>)
+- Applied:        <N> (each one actually wrote to <prompt-path>; of which <S> structural via Edit tool)
+- Auto-routed:    <X> (TR: <a>, no-fix: <b>, stale-audit: <c>, ambiguous: <d>, structural-declined: <e>)
 - Manually overlay: <Y> (user chose "yorum bırak" directly)
 - Dismissed:      <Z>
 - Revised:        <W> (of which: A applied, B overlay)
@@ -880,8 +910,8 @@ Decisions log: <relative path to $RUN_DIR/decisions.jsonl>
 Session state: <relative path to $RUN_DIR/session.json>
 ```
 
-- `Applied` = `applied_count` from 10.3 (the number of `applied` lines in `decisions.jsonl` for this pass; never inflated by failed-feasibility findings).
-- `Auto-routed` = `tr_routed_count + no_fix_count + stale_audit_count + ambiguous_count` from 10.3. Always break down by the four reasons so the user knows why each one was redirected.
+- `Applied` = `applied_count` from 10.3 (the number of `applied` lines in `decisions.jsonl` for this pass; never inflated by failed-feasibility findings). The `of which <S> structural via Edit tool` split surfaces `structural_applied_count` so the user can see how many writes went through the risk-warned Edit path versus plain substring replacement.
+- `Auto-routed` = `tr_routed_count + no_fix_count + stale_audit_count + ambiguous_count + structural_declined_count` from 10.3. Always break down by the five reasons so the user knows why each one was redirected.
 - `Manually overlay` = findings whose Phase 9 decision was `overlay` (or `konuşalım → overlay`). Does NOT include the auto-routed bucket — those are reported separately to avoid double-counting.
 - `Revised` = findings that went through the `konuşalım → revised` path in 10.4. The `A applied, B overlay` split reflects the terminal action chosen for each revised entry.
 

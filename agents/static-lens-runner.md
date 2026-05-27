@@ -45,7 +45,7 @@ Apply the **Conflict lens** section of `lens_rules_ref` against the rule list in
 Write the result to `output_paths.conflicts` using the schema from `lens_rules_ref`:
 
 ```json
-{ "conflicts": [{ "id": "C1", "rule_ids": ["R3","R8"], "severity": "low|medium|high", "reasoning": "<≤ 400 chars>" }] }
+{ "conflicts": [{ "id": "C1", "rule_ids": ["R3","R8"], "severity": "low|medium|high", "reasoning": "<≤ 400 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural" }] }
 ```
 
 If no conflicts exist, write `{"conflicts": []}`. Empty is a legitimate outcome.
@@ -63,7 +63,7 @@ Use `body.txt` to confirm position/length/recency claims when needed — e.g. to
 Write the result to `output_paths.dominances`:
 
 ```json
-{ "dominances": [{ "id": "D1", "dominant_rule_id": "R12", "dominated_rule_id": "R3", "mechanism": "position|length|specificity|recency|role-override", "severity": "low|medium|high", "reasoning": "<≤ 300 chars>" }] }
+{ "dominances": [{ "id": "D1", "dominant_rule_id": "R12", "dominated_rule_id": "R3", "mechanism": "position|length|specificity|recency|role-override", "severity": "low|medium|high", "reasoning": "<≤ 300 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural" }] }
 ```
 
 If no dominances exist, write `{"dominances": []}`.
@@ -79,7 +79,7 @@ Apply the **Gap lens (strict scope)** section of `lens_rules_ref`.
 Write the result to `output_paths.gaps`:
 
 ```json
-{ "gaps": [{ "id": "G1", "kind": "undefined_edge_case|ambiguous_term", "description": "<one sentence>", "related_rule_ids": ["R5"], "severity": "low|medium|high" }] }
+{ "gaps": [{ "id": "G1", "kind": "undefined_edge_case|ambiguous_term", "description": "<one sentence>", "related_rule_ids": ["R5"], "severity": "low|medium|high", "suggested_fix": "<concrete one-sentence resolution or structural action>", "fix_strategy": "substring | structural" }] }
 ```
 
 If no gaps exist, write `{"gaps": []}`.
@@ -106,6 +106,21 @@ Every finding you emit MUST have a non-empty `suggested_fix` string. Before writ
   - For a gap where you cannot draft a resolution: `'TODO: <one-sentence open question>'`
   - For any other case: write a concrete one-sentence rewrite.
 - A finding with `suggested_fix: null` or `suggested_fix: ''` is invalid output. Self-correct before writing.
+
+## fix_strategy invariant (mandatory)
+
+Every finding you emit MUST carry a `fix_strategy` field. After computing `suggested_fix`, classify it:
+
+- If `suggested_fix` is a clean rewrite that could literally substitute for `current_excerpt` → `fix_strategy: "substring"`.
+- If `suggested_fix` is a structural action (starts with "Add", "Rewrite", "Move", "Replace R<n>", "Remove R<n>", "Reword R<n>") OR is a sentinel (`"TODO: ..."`, `"Intentional —"`) → `fix_strategy: "structural"`.
+
+Quick heuristic:
+- Does suggested_fix begin with a verb like "Rewrite", "Add", "Move", "Remove", "Reword"? → structural.
+- Does suggested_fix begin with "TODO:" or "Intentional —"? → structural.
+- Otherwise, if suggested_fix looks like a natural-language sentence that would directly replace `current_excerpt` → substring.
+- If unsure, lean structural — Phase 10 surfaces a warning, never breaks anything.
+
+Self-correction: if a finding lacks `fix_strategy`, that's a runner error.
 
 ## Failure modes
 
