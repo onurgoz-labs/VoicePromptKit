@@ -32,71 +32,40 @@ Phase 10 always writes to the **latest** run's overlay (the run that produced th
 
 ## Findings with overlay status
 
-### {{section_marker}} [{{finding_id}} {{lens}} severity={{severity}}] — status: overlay
-- **Current:** `<current_excerpt>`
-- **Diff:** (for substring-style suggestions — render as a ```diff block; see "Rendering mode" below)
-  ```diff
-  - <current_excerpt>
-  + <suggested_fix>
-  ```
-- **Action:** `<suggested_fix>` (for structural / TODO suggestions; see "Rendering mode" below)
-- **Rationale:** <rationale>
-- **Decided:** <ISO 8601>
-- **Note:** <user-supplied note or omit>
+### {section_marker} [{finding_id} {lens}, {severity}] — status: overlay
 
-### {{section_marker}} [{{finding_id}} {{lens}}] — status: overlay (revised)
-- **Current:** `<current_excerpt>`
-- **Original suggestion:** `<original suggested_fix from findings.json>`
-- **User-revised:** `<the text the user supplied during konuşalım>` (rendered as a diff block vs. `<current_excerpt>` when substring-style, otherwise as **Action:**)
-- **Rationale:** <original rationale>
-- **Decided:** <ISO 8601>
+> {short_rationale} → **{short_fix}**
 
-## Pronunciation map (TTS — internal reference)
-
-(Rendered only when findings.json.pronunciation_map is non-empty. Entries from BOTH source: "seed" and source: "finding" are listed, deduped by term.)
-
-- `<term>` → "<phonetic>" (strategy: <strategy>) — <note (if present)>
-  - From: <T<id>, T<id>>  (source_finding_ids; empty for seed-only entries)
-- `<term>` — rephrase as "<alt_translation>" — <note (if present)>
-  - From: seed (prompt's pre-existing pronunciation guide block)
+- _Decided:_ {timestamp} · _Note:_ {note (omit when absent)} · _Decision:_ overlay
 ```
 
-Where `{{section_marker}}` is:
-- `Section 7.2 — L284` (when section_ref.subsection is set)
-- `Section 7 — L284` (when only section is set)
-- `L284` (when section_ref is null)
+Where:
 
-(English in inline-suggestions.md regardless of `report_language` — the overlay file is a structured artefact, language switching applies to report.md only.)
+- `{section_marker}` is `Section 7.2 — L284` (when `section_ref.subsection` is set), `Section 7 — L284` (when only `section_ref.section` is set), or `L284` (when `section_ref` is null). English in the overlay regardless of `report_language` — the overlay file is a structured artefact, language switching applies to `report.md` only.
+- `{short_rationale}` is the finding's `rationale` truncated to ≤ 120 chars (first sentence; ellipsis at 117 + `"..."` if longer).
+- `{short_fix}` is the `suggested_fix` truncated to ≤ 100 chars. For sentinel suggestions (`TODO: ...` / `Intentional —`) the `→` arrow is omitted and the body line shows `> {short_rationale}` only; the sentinel surfaces in the third metadata line as `_Decision: overlay (sentinel: TODO)_` (or `sentinel: Intentional`).
+- For **drift findings** (`suggested_fix == null` / `line == null`): `### [drift-S3 drift, high] — status: overlay` (no `section_marker`, no `→ fix`), then the rationale line, then the metadata.
+- For **advisory TR findings** with `pronunciation_entry` populated and `suggested_fix == null`: the body line surfaces the pronunciation hint instead of `→ fix`: `> {short_rationale} → **{pronunciation_entry.term} → "{pronunciation_entry.phonetic}"** (strategy: {strategy})`.
+
+The **revised** variant uses the same compact shape, with the heading marker swapped to `(revised)` and the body line showing the user-supplied replacement:
+
+```markdown
+### {section_marker} [{finding_id} {lens}, {severity}] — status: overlay (revised)
+
+> {short_rationale} → **{short_revised_text}** _(was: "{short_original_fix}")_
+
+- _Decided:_ {timestamp} · _Note:_ {note (omit when absent)} · _Decision:_ overlay (revised)
+```
 
 The section marker matches `section_ref` from findings.json. When `section_ref: null`, the marker is the bare line number. Schema lens findings that flag a heading itself (e.g. `section_gap` on line 280 = `## SECTION 7`) use the heading's own section as the marker.
 
-### Rendering mode for the Suggested field
+### Compact render rules
 
-The overlay uses the same heuristic as report.md Phase 7:
-- Substring-style suggestion (ratio > 0.6 to current_excerpt AND not starting with a structural keyword) → render as a ```diff block.
-- Structural suggestion ("Add ", "Rewrite ", "Move ", "Replace R", "Remove ", "Reword ", TODO sentinels, "Intentional —") → render as `**Action:** <suggested_fix>`.
-- Empty suggested_fix → render `**Action:** _(see rationale)_`.
-
-The overlay is rewritten in full each Phase 10 pass (idempotent), so the rendering choice is recomputed every time — no stale diff blocks survive a switch from substring to structural.
-
-In Python (mirrors the heredoc in SKILL.md Phase 7):
-
-```python
-import difflib
-
-STRUCTURAL_PREFIXES = ("Add ", "Add: ", "Rewrite ", "Move ", "Replace R", "Remove ",
-                       "Reword ", "TODO:", "Intentional —", "Intentional -")
-
-def render_overlay_body(current, suggested):
-    if not suggested or suggested.strip() == "":
-        return "**Action:** _(see rationale)_"
-    if any(suggested.startswith(p) for p in STRUCTURAL_PREFIXES):
-        return f"**Action:** {suggested}"
-    ratio = difflib.SequenceMatcher(None, current, suggested).ratio()
-    if ratio > 0.6:
-        return f"```diff\n- {current}\n+ {suggested}\n```"
-    return f"**Action:** {suggested}"
-```
+- **Truncation is render-only.** `findings.json` still carries the full `rationale` + `suggested_fix` verbatim. Truncation applies ONLY to overlay + report + summary table.
+- **Truncation algorithm:** take the first sentence (split on `. ` or `! ` or `? ` boundary). If the first sentence exceeds the limit (120 chars rationale / 100 chars fix), ellipsis at limit-3 + `...`. Preserve trailing punctuation when the sentence fits.
+- **Structural fix shortening:** for `fix_strategy=structural` suggestions like `"Rewrite the X to remove Y. Suggested: 'Z'"`, extract the first imperative (`"Rewrite the X to remove Y."`) — NOT the suggested replacement text.
+- **Section-aware sort still applies.** Overlay sorts by severity desc → lens group → line asc, same as `findings.json.findings[]`.
+- **Per-finding entries excluded** for auto-filed TR findings (`foreign_word` + `abbreviation`, `decisions.jsonl` action: `auto_filed`). They appear only in the Pronunciation map section, not in "Findings with overlay status".
 
 ### Rendering rules
 
