@@ -27,13 +27,22 @@ Locate the config path:
 ```bash
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 CONFIG_PATH="$REPO_ROOT/.promptchecker.json"
+if [ -f "$CONFIG_PATH" ]; then
+  CONFIG_EXISTS=true
+else
+  CONFIG_EXISTS=false
+fi
 echo "REPO_ROOT=$REPO_ROOT"
 echo "CONFIG_PATH=$CONFIG_PATH"
+echo "CONFIG_EXISTS=$CONFIG_EXISTS"
 ```
 
-**If `$CONFIG_PATH` exists, skip the wizard and continue to Phase 1.** Read it later in Phase 2 during frontmatter merge.
+**Branch on the `CONFIG_EXISTS` line the bash block just echoed — do not infer from the path string alone.**
 
-**If `$CONFIG_PATH` does not exist**, run the first-run wizard before continuing. Ask the user the five questions below (prefer `AskUserQuestion` if available, otherwise plain conversational prompts; either way wait for all five answers before writing the file).
+- **If `CONFIG_EXISTS=true` (the bash block printed this line):** STOP — skip the wizard, do not write `.promptchecker.json`, do not ask any questions. Continue to Phase 1. The pre-existing file is the source of truth and will be read in Phase 2 during the frontmatter merge.
+- **Only if `CONFIG_EXISTS=false`:** run the first-run wizard before continuing. Ask the user the five questions below (prefer `AskUserQuestion` if available, otherwise plain conversational prompts; either way wait for all five answers before writing the file).
+
+**Sanity check before asking the wizard questions:** read the last echoed `CONFIG_EXISTS=` line from the bash output. If it is `true`, the wizard MUST NOT run regardless of any other reasoning. Overwriting an existing config is a silent data-loss bug.
 
 1. **Default prompt type** for this repo (frontmatter `type:` overrides per-prompt):
    - Options: `system`, `agent`, `vapi`, `task`, `chain`, or *unspecified*.
@@ -62,6 +71,7 @@ Confirm to the user: `Saved repo defaults to <relative path>. Edit it any time o
 
 **Invariants:**
 - Never run the wizard if `$CONFIG_PATH` already exists. The user owns that file.
+- **Never run the wizard when `CONFIG_EXISTS=true`.** This is a hard rule — no edge case justifies overwriting a populated `.promptchecker.json`. If something seems off (corrupt file, unknown keys), warn the user and continue to Phase 1; do NOT run the wizard.
 - If `git rev-parse` fails (not a git repo), use the current working directory as the repo root and warn the user that the config lives in cwd, not a tracked repo.
 
 ## Phase 1 — Working directory + versioning
