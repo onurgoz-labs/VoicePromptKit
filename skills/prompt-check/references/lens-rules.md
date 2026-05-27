@@ -250,3 +250,42 @@ When unsure, ask: "How many realistic inputs trigger this?"
 - **high**: affects most realistic inputs, or causes safety/policy violation.
 - **medium**: affects some realistic inputs.
 - **low**: corner case, would only matter in edge inputs.
+
+## Compact mode
+
+Active when the prompt body length exceeds `frontmatter.max_char_limit` (default 50000 chars; set to 0 to disable). The skill computes the body length in Phase 2 and propagates `compact_mode: true | false` to every lens runner via the dispatch contract.
+
+The policies below trade audit DEPTH for SPEED. Every finding KIND remains possible — compact mode does not invent or remove categories — it trims which severities and pair-comparisons are evaluated.
+
+### Per-lens policy
+
+| Lens | Compact-mode change |
+|---|---|
+| **Conflict** | Severity floor: `medium`. Emit `high` and `medium` only; skip `low`. Pair budget: pick the 50 most-impactful rules (those containing "always", "never", "must", "only", "ignore") and compare only within that set. Cap at ~1250 pair comparisons regardless of N. |
+| **Dominance** | Mechanism restriction: emit only `role-override` and `recency`. Skip `position`, `length`, `specificity` (subtle effects requiring pair-comparison cost). Severity floor: `medium`. |
+| **Gap** | Severity floor: `medium`. Skip `low`-severity gaps (corner cases). Keep `undefined_edge_case` and `ambiguous_term` at medium/high. |
+| **Schema** | No change. Heading parsing is cheap regardless of body size. |
+| **Drift** | Halve `effective_expand_count = max(1, raw_expand_count // 2)`. Scenario count maps linearly to LLM simulation cost — this is the single biggest perf lever for drift on large prompts. |
+| **TR phonetic** | No change. Line-level pattern matching is already cheap. |
+
+### Rule extraction (Phase 3)
+
+In compact mode, keep each rule's `text` field to ≤ 100 characters and `source_excerpt` to ≤ 120 characters. This trims the rule-list payload that downstream lenses load. Atomic-rule semantics unchanged — the policy is about VERBOSITY, not correctness.
+
+### Output annotation
+
+Every static-lens output file (`conflicts.json`, `dominances.json`, `gaps.json`, `schema.json`) gains a top-level `compact_mode: true` field when policy fired, plus a `compact_policy` array listing which trim policies applied (e.g. `["severity_floor_medium", "pair_budget_50"]`). `drift.json` gains `compact_mode: true` + `compact_policy: ["expand_count_halved"]`. `tr_phonetic.json` gains `compact_mode: true` only (no policy fired — informational).
+
+### Override hierarchy for max_char_limit
+
+Same priority chain as other repo defaults (most specific wins):
+1. Per-prompt frontmatter (`max_char_limit: 100000` in the YAML header)
+2. Env var (`PROMPTCHECKER_MAX_CHAR_LIMIT=0` in Claude Code settings)
+3. Project config (`.promptchecker.json` `max_char_limit`)
+4. Built-in default: `50000`
+
+Set `max_char_limit: 0` at any layer to disable compact mode entirely — the audit runs at full depth regardless of body size.
+
+### Not a hard abort
+
+Compact mode does NOT abort the audit on oversize prompts. It runs THROUGH them with cheaper policies. To enforce a hard limit (refuse to audit prompts over N chars), you would add a separate frontmatter field (`hard_limit:`) — that is not part of v0.4.7 and not implemented.
