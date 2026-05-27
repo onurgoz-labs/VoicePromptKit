@@ -58,6 +58,8 @@ options:
 
 This question is **advisory only** — anchors live in the prompt file's frontmatter, not in `session.json`. If the user says `Evet, sonra`, set `user_intent.anchors_added: false` and add a one-line reminder to the summary footer: `_Reminder: add anchors to <prompt> frontmatter before the next audit._`
 
+**Report language (wizard's 7th question).** After the 6 lens-related questions, the wizard asks a 7th question: `report_language` (`tr` / `en`, default `tr`). This controls the language of skill-rendered text in report.md, the Phase 8 terminal summary, and Phase 9 dialog prompts. Lens-generated content (rationale, suggested_fix, current_excerpt) stays in whatever language the runner produced — only the skill's template strings translate. The full TEMPLATE_STRINGS dictionary lives in SKILL.md Phase 7; this file just acknowledges the field exists and its scope (template-only translation).
+
 ## 2 — Summary view rendering (Phase 9, after audit completes)
 
 After Phase 7 produces `findings.json`, the skill renders a single markdown table covering every finding from every selected lens. This is the user's one-shot view of the audit.
@@ -71,21 +73,24 @@ After Phase 7 produces `findings.json`, the skill renders a single markdown tabl
 | `id` | `findings[].id` | none |
 | `lens` | `findings[].lens` | none |
 | `severity` | `findings[].severity` | none |
+| `section` | `findings[].section_ref.subsection` if set, else `findings[].section_ref.section` if set, else `—` | none |
 | `line` | `findings[].line` (original-file) | none |
 | `excerpt` | `findings[].current_excerpt` | 60 chars + `…` if longer |
 | `suggestion` | `findings[].suggested_fix` if present else `findings[].rationale` | 80 chars + `…` if longer |
+
+The `section` column anchors findings in their containing prompt section. Useful when a 1758-line prompt has dozens of findings — the user can quickly group them by section/subsection mentally. Findings with no section context show `—`.
 
 **Rendered shape:**
 
 ```markdown
 ## Findings — run-NNN
 
-| id | lens | sev | line | excerpt | suggestion |
-|----|------|-----|------|---------|------------|
-| C1 | conflict | high | 12 | always answer in English | rephrase rule R3 to scope to non-TR users… |
-| S1 | schema | high | 280 | ## SECTION 7 — VALUE FRAMING | Insert Section 6 — <Placeholder> between line 220 and 280, OR renumber Section 7 → 6 and shift subsequent sections down. |
-| G2 | gap | medium | 27 | … | … |
-| T1 | tr_phonetic | high | 42 | 100 TL | yüz lira |
+| id | lens | sev | section | line | excerpt | suggestion |
+|----|------|-----|---------|------|---------|------------|
+| C1 | conflict | high | 7.2 | 284 | Always be formal... | Maintain a professional but warm register. |
+| S1 | schema | high | 7 | 280 | ## SECTION 7 — VALUE FRAMING | Insert Section 6 — <Placeholder> between line 220 and 280, OR renumber Section 7 → 6 and shift subsequent sections down. |
+| G2 | gap | medium | — | 27 | … | … |
+| T3 | tr_phonetic | low | 1.3 | 17 | Kurban Bayramı... | Kurban Bayramı tatili, ... |
 
 _Note: 3 TR pronunciation findings (foreign_word + abbreviation) will be auto-filed to the overlay's Pronunciation map. They are not in the table — no decision needed._
 
@@ -122,6 +127,8 @@ The user's reply is a single free-form string. Parse it into a list of `(finding
 | `konuşalım`, `tartış`, `inceleyelim` | `discuss`, `talk` | `discussed` (transient — triggers sub-flow in §5) |
 
 The parser is LLM-driven, not regex-driven. Natural variants (`fix bunları`, `şunu düzelt`, `bunları yorum bırakalım`) MUST be accepted as long as the verb intent is clear. When the verb is ambiguous, re-prompt the user with: `Bu kararı net anlayamadım: <segment>. Açar mısın?` rather than silently dropping the segment.
+
+Verb tokens are language-agnostic — both TR and EN synonyms parse identically in either `report_language`. The verb table above is the canonical reference; `report_language: en` does NOT swap the verbs to English-only. `düzelt`, `yorum bırak`, `atla`, `konuşalım`, `iptal` remain the parser's canonical keywords regardless of the report language setting.
 
 **Special tokens:**
 

@@ -102,6 +102,18 @@ Body size: 87432 chars [compact mode ACTIVE — exceeds 50000 char threshold]
 
 Compact mode is NOT a hard abort — the audit always runs. It only trims which findings are reported and which scenarios drift simulates. The artefact files (`conflicts.json`, `drift.json`, etc.) carry a top-level `compact_mode: true` field + `compact_policy` array so consumers know the policies fired.
 
+### Section-aware findings
+
+For prompts that use numbered section headings (`## SECTION N` + `### N.M`), every finding carries a `section_ref` field pointing to its containing section and subsection. The report.md and inline-suggestions.md surfaces this as a section-aware header instead of the bare line number:
+
+```
+### Section 7.2 — L284 [C1 conflict severity=high, R3↔R8] — Tone contradiction...
+```
+
+Useful for long prompts (1758 lines like `boyutyayin/mainprompt.md`) where the user otherwise has to map line numbers to sections mentally. Findings outside any numbered section (preambles, flat prompts) show the bare line number with no section prefix.
+
+The section index is built deterministically in Phase 3 of the audit (no LLM cost) and propagated to every lens runner via `inputs.section_index`. Schema lens, conflict, dominance, gap, and TR phonetic findings all attach `section_ref` automatically. Drift findings are behavioural and always carry `section_ref: null`.
+
 All six lenses live in `skills/prompt-check/SKILL.md` and its `references/`.
 
 ## Output layout
@@ -227,7 +239,7 @@ The plugin's behaviour is layered, highest priority first:
 
 ### First-run wizard
 
-The first time you run `/prompt-check` in a repo, the skill walks you through a 6-question wizard and saves the answers to `<repo-root>/.promptchecker.json`. Subsequent runs read that file silently. Edit it by hand to change defaults, or delete it to rerun the wizard.
+The first time you run `/prompt-check` in a repo, the skill walks you through a 7-question wizard and saves the answers to `<repo-root>/.promptchecker.json`. Subsequent runs read that file silently. Edit it by hand to change defaults, or delete it to rerun the wizard.
 
 The wizard asks:
 
@@ -237,6 +249,7 @@ The wizard asks:
 4. **Output formats** — multi-select from `markdown`, `findings_json`, `json`.
 5. **Drift `expand_count`** — how many extra adversarial scenarios beyond the anchor + conflict budget. `0` disables the drift lens entirely.
 6. **Max prompt character limit** — repo-level threshold for triggering compact mode. Default `50000`. `0` disables compact mode entirely. Useful when your prompts routinely exceed 50K chars and you want every audit to run at full depth regardless of size.
+7. **Report language** — controls the language of report.md, terminal summary, and Phase 9 dialog prompts. Options: `tr` (Türkçe, default) or `en` (English). Lens-generated content (rationale, suggested_fix, current_excerpt) stays in whatever language the runner produced; only skill-side templates translate.
 
 ### Project config (`.promptchecker.json`)
 
@@ -249,7 +262,8 @@ Example for a Turkish VAPI repo:
   "output": ["markdown", "findings_json"],
   "expand_count": 4,
   "tr_phonetic": true,
-  "max_char_limit": 50000
+  "max_char_limit": 50000,
+  "report_language": "tr"
 }
 ```
 
@@ -264,6 +278,7 @@ Commit this file so your team gets the same defaults. Unknown keys are ignored (
 | `PROMPTCHECKER_EXPAND_COUNT` | Drift scenarios beyond anchor + conflict budget; `0` disables drift entirely | project config → `3` |
 | `PROMPTCHECKER_TR_PHONETIC` | Truthy (`1/true/yes/on`) enables the Turkish phonetic lens | project config → `false` |
 | `PROMPTCHECKER_MAX_CHAR_LIMIT` | Positive integer triggers compact mode when body exceeds this many chars. `0` disables compact mode. | project config → `50000` |
+| `PROMPTCHECKER_REPORT_LANGUAGE` | `tr` or `en`. Sets skill-render language. | project config → `tr` |
 | `PROMPTCHECKER_TIMING` | Truthy (`true`) writes a millisecond-precision phase-boundary log to `$RUN_DIR/timing.log`. Diagnostic only — leave off in normal use. | off |
 
 **Timing logs (diagnostic):** when `PROMPTCHECKER_TIMING=true`, the skill writes `timing.log` to the run directory with one line per phase boundary (`phase_2_start`, `phase_2_end`, etc., in milliseconds since the Unix epoch). Use this when a run feels slow — `awk -F'[][]' '{print $2}' timing.log | sort -n` gives you the ordered timestamps; diffing adjacent timestamps surfaces the slowest phase. Drift simulation and subagent dispatch are common hotspots. Leave the env var off in everyday use — the log grows on every run.
@@ -289,6 +304,7 @@ output: [markdown, findings_json]
 expand_count: 6                  # overrides project config + env-var
 tr_phonetic: true                # overrides project config + env-var
 max_char_limit: 100000           # this prompt is large; raise the threshold so compact mode does NOT trigger
+report_language: en              # this prompt gets an English report even though repo default is tr
 anchors:                         # always per-prompt — never inherited
   - input: "I am furious! Your product is garbage!"
     rubric: "de-escalates; remains professional"
