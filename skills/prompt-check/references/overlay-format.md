@@ -45,6 +45,15 @@ Phase 10 always writes to the **latest** run's overlay (the run that produced th
 - **User-revised:** `<the text the user supplied during konuşalım>`
 - **Rationale:** <original rationale>
 - **Decided:** <ISO 8601>
+
+## Pronunciation map (TTS — internal reference)
+
+(Rendered only when findings.json.pronunciation_map is non-empty. Entries from BOTH source: "seed" and source: "finding" are listed, deduped by term.)
+
+- `<term>` → "<phonetic>" (strategy: <strategy>) — <note (if present)>
+  - From: <T<id>, T<id>>  (source_finding_ids; empty for seed-only entries)
+- `<term>` — rephrase as "<alt_translation>" — <note (if present)>
+  - From: seed (prompt's pre-existing pronunciation guide block)
 ```
 
 ### Rendering rules
@@ -57,6 +66,28 @@ Phase 10 always writes to the **latest** run's overlay (the run that produced th
 - **Backticks inside excerpts:** if `current_excerpt` or `suggested_fix` contains a backtick, swap the surrounding `` ` `` for `` `` `` (pair of backticks) so markdown renders correctly.
 - **Note line omitted** when the user supplied no note. Don't write `**Note:** —` or empty quotes.
 - **Decided timestamp** equals the `ts` of the most recent `overlay` / `revised` entry for that finding in `decisions.jsonl`.
+
+### Pronunciation map rendering rules
+
+The "Pronunciation map" section sits at the **bottom** of `inline-suggestions.md`, after every per-finding entry. It is a flat reference list of every term in `findings.json.pronunciation_map` — both `source: "seed"` (entries the prompt's pre-existing pronunciation guide block already contained) and `source: "finding"` (entries derived from TR phonetic findings). Phase 10 reads `findings.json.pronunciation_map` and renders one bullet per entry.
+
+Per-entry rendering depends on `strategy`:
+
+- **`strategy: "pronounce"`** → `` `<term>` → "<phonetic>" `` with optional `(alt: "<alt_translation>")` appended when `alt_translation` is present.
+- **`strategy: "rephrase"`** → `` `<term>` — rephrase as "<alt_translation>" `` with the `note` appended in parens when present. If `alt_translation` is empty, render `` `<term>` — rephrase (no concrete alternative supplied) `` and surface the note as-is.
+- **`strategy: "follow_with_translation"`** → `` `<term>` → follow with: "<alt_translation>" ``.
+
+After the main line, indent a sub-bullet `From: ...`:
+- For `source: "seed"` entries → `From: seed (prompt's pre-existing pronunciation guide block)`.
+- For `source: "finding"` entries → `From: <comma-joined source_finding_ids>` (e.g. `From: T3, T7`).
+
+Append the entry's `note` as a trailing `— <note>` on the main line when present and non-empty, regardless of strategy.
+
+Sort entries alphabetically by `term` (case-insensitive). Dedupe by `term` (case-insensitive); seed wins on collision (mirrors Phase 7's merge rule).
+
+This section is **idempotent** — rewritten in full each Phase 10 pass. It mirrors `findings.json.pronunciation_map` so the user has every TR-phonetic risky term in a single bottom-of-file reference, independent of which findings they routed where (overlay, applied, dismissed, or still pending). The section heading + body exist purely as a consolidated TTS cheat-sheet; per-finding entries remain the structured home for the decision flow.
+
+If `findings.json.pronunciation_map` is empty or absent, the entire "Pronunciation map" section is OMITTED — no empty heading, no "(no entries)" placeholder. The section's presence in the rendered file is itself a signal that there are risky terms worth scanning before recording.
 
 ## 2. `decisions.jsonl` — append-only audit log
 
@@ -146,22 +177,33 @@ A single Phase 10 pass processes decisions in this order:
 
 1. **`dismissed`** — log only, no I/O beyond appending to `decisions.jsonl`.
 2. **`overlay`** — rebuild `inline-suggestions.md` from the post-update `session.json`.
-3. **`applied`** — write to the prompt file in one pass. For each finding, `line` and `current_excerpt` must agree (substring match on the named line). Ambiguous occurrences (substring appears more than once on the line) are skipped and **converted to `overlay`** with a note explaining why.
-4. **TR-routed entries** — every finding that hit `routed_to_overlay` belongs in the overlay file too; the routing line in `decisions.jsonl` is a pure redirect record, the `overlay` entry that follows it is what causes the actual write.
+3. **`applied`** — **feasibility-first, single-event logging.** Phase 10 evaluates each `applied`-tagged finding's feasibility BEFORE writing anything to `decisions.jsonl`. The `decisions.jsonl` write is a single line reflecting the actual outcome, not the user's pre-check intent. `applied` is written only when the prompt file was genuinely modified; otherwise the finding produces exactly one `routed_to_overlay` line followed by exactly one `overlay` line.
+
+   The feasibility check, in fixed order, assigns each finding one of these outcomes:
+
+   | Outcome | Trigger | `routed_to_overlay.reason` string |
+   |---|---|---|
+   | `tr_routed` | `finding.lens == "tr_phonetic"` | `"TR phonetic findings never modify the prompt file"` |
+   | `no_concrete_fix` | `finding.suggested_fix` is null or empty | `"no concrete suggested_fix — manual author revision required"` |
+   | `sha_mismatch` | current prompt SHA256 != `findings.json.prompt_sha256` | `"stale audit — prompt SHA256 mismatch"` |
+   | `ambiguous` | `current_excerpt` appears zero or >1 times on the named line | `"ambiguous occurrence — substring matches multiple positions"` |
+   | `applicable` | all four checks above passed | (no `routed_to_overlay`; a single `applied` line is written instead) |
+
+   For `applicable`: perform the substring replacement, write the prompt file, then append ONE `applied` line. For any other outcome: append ONE `routed_to_overlay` line (with the matching reason), then ONE `overlay` line. Two lines max per failed finding. Never write a misleading `applied` line that implies the prompt was modified when it was not.
+4. **TR-routed entries from Phase 9** — TR `applied` decisions that Phase 9 already redirected to `overlay` arrive at step 2 above as ordinary `overlay` state; the `routed_to_overlay` line for them was logged in Phase 9.4, not in step 3.
 5. **Re-render `session.json`** to reflect every state change in this pass.
 6. **Return to Phase 9** for any `discussed` findings that have not been resolved yet (`revised` / `applied` / `overlay` / `dismissed` has not yet followed the `discussed` line).
 
-The ordering matters: writing the overlay file before the prompt file means a failure between steps 2 and 3 leaves the user with an honest "here's what I planned" record rather than half-modified state.
+The ordering matters: writing the overlay file before the prompt file means a failure between steps 2 and 3 leaves the user with an honest "here's what I planned" record rather than half-modified state. The feasibility-first rule inside step 3 means `decisions.jsonl` never lies about whether the prompt file was actually touched.
 
 ## 5. Stale-audit guard interaction
 
-Phase 10 MUST verify the prompt file's SHA256 matches `findings.json.prompt_sha256` before any `applied` action (this mirrors the apply-mode pre-flight described in `SKILL.md`).
+Phase 10 MUST verify the prompt file's SHA256 matches `findings.json.prompt_sha256` before any `applied` action (this mirrors the apply-mode pre-flight described in `SKILL.md`). The SHA check is one of the four feasibility outcomes enumerated in Section 4 — when it fires the `sha_mismatch` outcome is assigned and the same single-event pattern applies.
 
 On mismatch — i.e. the prompt drifted since the audit:
 
-- **Abort the `applied` step** for the affected finding(s). Do not write to the prompt file.
-- **Convert** that decision automatically to `overlay`, attaching a note: `"prompt drifted since audit; routed to overlay"`.
-- **Log** the conversion in `decisions.jsonl` as a `routed_to_overlay` entry with `reason: "stale audit — prompt SHA256 mismatch"`, immediately followed by the resulting `overlay` entry.
+- **Skip the prompt-file write** for the affected finding(s). Do not write to the prompt file.
+- **Append ONE `routed_to_overlay` entry** to `decisions.jsonl` with `reason: "stale audit — prompt SHA256 mismatch"`, immediately followed by ONE `overlay` entry. **Never** an `applied` entry first — the feasibility check runs before any log write, so the misleading "applied then routed" double-event is impossible.
 - Surface to the user: the run is salvaged (their intent is preserved in the overlay file) but they should re-run `/prompt-check` to refresh the audit before any future `applied` actions.
 
-The stale-audit guard never silently discards a decision; it always preserves intent by re-routing to the overlay channel.
+The stale-audit guard never silently discards a decision; it always preserves intent by re-routing to the overlay channel — using the same two-line pattern as the other three failed-feasibility outcomes (`tr_routed`, `no_concrete_fix`, `ambiguous`).

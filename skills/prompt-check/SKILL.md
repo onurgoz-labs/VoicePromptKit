@@ -777,36 +777,59 @@ Collect every finding whose status is `overlay` (this includes the TR-routed fin
 
 Do not append per-finding entries to `decisions.jsonl` for this step — the `overlay` decision was already logged in Phase 9.4 (or 10.3 if auto-converted from `applied`).
 
-### 10.3 — Applied
+### 10.3 — Applied (feasibility-first, single-event logging)
 
-**Pre-flight (mandatory):** compute the current SHA256 of the prompt file:
+**Core invariant:** `decisions.jsonl` records ONE event per finding outcome in this sub-step. The `applied` action is written **only when the prompt file was genuinely modified**. If a finding cannot be applied for any reason, it produces a single `routed_to_overlay` entry followed by a single `overlay` entry — never a misleading `applied` entry first.
+
+Note: Phase 9 already wrote `routed_to_overlay` lines for TR-routed `applied` decisions before they arrived at Phase 10 as `overlay`. The TR-routing path therefore never enters 10.3 — it is handled by 10.2 directly. The TR feasibility check below remains as a defensive guard in case a future caller skips Phase 9's TR routing.
+
+**Pre-flight (mandatory):** compute the current SHA256 of the prompt file once for the whole sub-step:
 
 ```bash
 ACTUAL_SHA=$(shasum -a 256 "$PROMPT_PATH" | awk '{print $1}')
 ```
 
-Compare against `session.json.prompt_sha256_at_audit` (which mirrors `findings.json.prompt_sha256`).
+For each finding with `findings_state[fid].status == "applied"`, run a **feasibility check first** (read-only — no writes to `decisions.jsonl`, no writes to the prompt file). Determine ONE outcome per finding from the following ordered rules:
 
-- **If SHA matches:** proceed with the applied pass.
-- **If SHA mismatches:** the prompt has drifted since the audit. Do NOT abort the whole phase — auto-convert every `applied` decision to `overlay`. For each such finding:
-  - Append a `routed_to_overlay` entry to `decisions.jsonl` with `reason: "prompt drifted since audit; routed to overlay"`.
-  - Update `findings_state[fid].status = "overlay"` in `session.json`.
-  - Add the finding to the overlay set processed in 10.2 (rerun 10.2 if any auto-conversion happened).
-  - Skip the substring-replace logic entirely for that finding.
+1. If `finding.lens == "tr_phonetic"` → outcome `tr_routed`, reason `"TR phonetic findings never modify the prompt file"`.
+2. Else if `finding.suggested_fix` is `null` or an empty string → outcome `no_concrete_fix`, reason `"no concrete suggested_fix — manual author revision required"`.
+3. Else if `ACTUAL_SHA != session.json.prompt_sha256_at_audit` (which mirrors `findings.json.prompt_sha256`) → outcome `sha_mismatch`, reason `"stale audit — prompt SHA256 mismatch"`.
+4. Else read the prompt file fresh and index to `finding.line` (already an original-file line; Phase 7 translated it). Count occurrences of `current_excerpt` on that line:
+   - Zero matches → outcome `ambiguous`, reason `"ambiguous occurrence — substring matches multiple positions"` (treat zero-match identically to multi-match; the substring is no longer locatable on the named line — overlay is the safe fallback).
+   - More than one match → outcome `ambiguous`, same reason as above.
+   - Exactly one match → outcome `applicable`.
 
-If SHA matches, for each finding with `status == "applied"`:
+**Single-event write per finding** based on the outcome:
 
-1. Read the prompt file fresh (do not trust an in-memory cache from earlier phases).
-2. Index to `findings[].line` — this is already an original-file line (Phase 7 translated it).
-3. Search for `current_excerpt` as a substring on that line.
-   - If the excerpt appears **zero times** on that line: auto-convert to `overlay` with note `"current_excerpt no longer present on line N"`. Log `routed_to_overlay` in decisions.jsonl, update session.json, add to overlay set (rerun 10.2).
-   - If the excerpt appears **more than once** on that line: auto-convert to `overlay` with note `"ambiguous occurrence — excerpt appears multiple times on line N"`. Log `routed_to_overlay`, update session.json, add to overlay set.
-   - If the excerpt appears **exactly once**: perform the substring replacement (`current_excerpt` → `suggested_fix`) and write the prompt file back.
-4. Append a per-finding entry to `decisions.jsonl` with `action: "applied"`, `at: <now>`, `original_sha256: <ACTUAL_SHA>`, `new_sha256: <after-write SHA>`. This documents the actual mutation, separate from the user decision recorded in Phase 9.
+- **`applicable`** — perform the substring replacement (`current_excerpt` → `suggested_fix`) on `finding.line` and write the prompt file back atomically. Then append ONE line to `decisions.jsonl`:
+
+  ```json
+  {"ts":"<now>","finding":"<id>","lens":"<lens>","action":"applied","target":"prompt_file","from":"<current_excerpt>","to":"<suggested_fix>","line":<N>,"source":"phase_9_decision_string","raw_segment":"<user-segment>","original_sha256":"<ACTUAL_SHA>","new_sha256":"<post-write SHA>"}
+  ```
+
+  Recompute `ACTUAL_SHA` immediately after the write so the next finding in this pass sees the updated hash (otherwise subsequent applied findings within the same pass would all trip rule 3).
+
+- **`tr_routed` / `no_concrete_fix` / `sha_mismatch` / `ambiguous`** — do NOT modify the prompt file. Update `findings_state[fid].status = "overlay"` in memory. Append ONE `routed_to_overlay` line then ONE `overlay` line to `decisions.jsonl`:
+
+  ```json
+  {"ts":"<now>","finding":"<id>","lens":"<lens>","action":"routed_to_overlay","reason":"<reason from outcome>","source":"phase_9_decision_string","raw_segment":"<user-segment>"}
+  {"ts":"<now>","finding":"<id>","lens":"<lens>","action":"overlay"}
+  ```
+
+  Add the finding to the overlay set processed in 10.2.
+
+**No `applied` line is ever written for a finding whose outcome was anything other than `applicable`.** The feasibility check precedes the log write — full stop.
 
 After the applied pass completes, recompute `current_prompt_sha256 = shasum -a 256 "$PROMPT_PATH"` and store it in memory for downstream queries. **Do not modify `findings.json.prompt_sha256`** — that field is the audit snapshot and stays frozen.
 
-If any auto-conversion happened in this sub-step, re-run 10.2 once more so `inline-suggestions.md` includes the newly routed overlay findings.
+If any auto-conversion happened in this sub-step (any outcome other than `applicable`), re-run 10.2 once so `inline-suggestions.md` includes the newly routed overlay findings.
+
+Track the per-outcome counts for the Phase 10.5 closing summary:
+- `applied_count` — outcome was `applicable` and the write succeeded
+- `tr_routed_count` — outcome `tr_routed`
+- `no_fix_count` — outcome `no_concrete_fix`
+- `stale_audit_count` — outcome `sha_mismatch`
+- `ambiguous_count` — outcome `ambiguous`
 
 ### 10.4 — Discussed (the "konuşalım" sub-flow)
 
@@ -831,23 +854,26 @@ If during 10.4 a SHA mismatch is detected (the user took a long pause and an ext
 
 ### 10.5 — Phase 10 closing summary
 
-Print a single block:
+Print a single block. The counts mirror the per-outcome accounting from 10.3 and the user-driven outcomes from 10.2 / 10.4 — each finding is counted exactly once.
 
 ```
 Interactive review complete — <run-NNN>
 
-- Applied:        <N> finding(s) written to <prompt-path>
-- Overlay:        <N> finding(s) in inline-suggestions.md
-- Dismissed:      <N>
-- Revised:        <N> (of which: A applied, B overlay)
-- TR auto-routed: <N> (TR phonetic findings never modify the prompt)
-- Stale-audit auto-routed: <N> (SHA mismatch since audit)
-- Ambiguous-occurrence auto-routed: <N>
+- Applied:        <N> (each one actually wrote to <prompt-path>)
+- Auto-routed:    <X> (TR: <a>, no-fix: <b>, stale-audit: <c>, ambiguous: <d>)
+- Manually overlay: <Y> (user chose "yorum bırak" directly)
+- Dismissed:      <Z>
+- Revised:        <W> (of which: A applied, B overlay)
 
 Overlay file: <relative path to $RUN_DIR/inline-suggestions.md>  (if any overlays exist)
 Decisions log: <relative path to $RUN_DIR/decisions.jsonl>
 Session state: <relative path to $RUN_DIR/session.json>
 ```
+
+- `Applied` = `applied_count` from 10.3 (the number of `applied` lines in `decisions.jsonl` for this pass; never inflated by failed-feasibility findings).
+- `Auto-routed` = `tr_routed_count + no_fix_count + stale_audit_count + ambiguous_count` from 10.3. Always break down by the four reasons so the user knows why each one was redirected.
+- `Manually overlay` = findings whose Phase 9 decision was `overlay` (or `konuşalım → overlay`). Does NOT include the auto-routed bucket — those are reported separately to avoid double-counting.
+- `Revised` = findings that went through the `konuşalım → revised` path in 10.4. The `A applied, B overlay` split reflects the terminal action chosen for each revised entry.
 
 Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. If any findings remain `pending` at this point (user did not address them and did not type `gerisini atla`), set `session.json.phase = "paused"` instead and remind the user they can resume with `/prompt-check-resume <run-NNN>`.
 
@@ -865,3 +891,4 @@ Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. 
 - Don't append duplicate entries to `decisions.jsonl` on resume — append only NEW actions, not re-statements of historical decisions. Resume reads the existing file as history and continues from there.
 - Don't keep `findings_state[*].status` at `"discussed"` or `"revised"` as a terminal state — both are transient. Every finding must end at `pending` (only if the run is paused), `applied`, `overlay`, or `dismissed`.
 - Don't use `AskUserQuestion` for the free-form decision string in Phase 9.3 — it must be conversational so the user can express ranges, wildcards, and verb aliases in one line. Use `AskUserQuestion` only for the four-option choice inside the Phase 10.4 sub-flow.
+- Don't write an `applied` line to `decisions.jsonl` for a finding that didn't actually modify the prompt file. The feasibility check must precede the log write — single event per finding outcome. A failed-feasibility finding produces exactly one `routed_to_overlay` line followed by exactly one `overlay` line; an applicable finding produces exactly one `applied` line. Never two events that imply a prompt-file mutation when none occurred.
