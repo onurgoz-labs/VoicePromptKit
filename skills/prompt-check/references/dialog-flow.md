@@ -72,25 +72,30 @@ After Phase 7 produces `findings.json`, the skill renders a single markdown tabl
 |---|---|---|
 | `id` | `findings[].id` | none |
 | `lens` | `findings[].lens` | none |
-| `severity` | `findings[].severity` | none |
+| `sev` | `findings[].severity` | none |
 | `section` | `findings[].section_ref.subsection` if set, else `findings[].section_ref.section` if set, else `—` | none |
 | `line` | `findings[].line` (original-file) | none |
-| `excerpt` | `findings[].current_excerpt` | 60 chars + `…` if longer |
-| `suggestion` | `findings[].suggested_fix` if present else `findings[].rationale` | 80 chars + `…` if longer |
+| `summary` | composed: `{short_rationale} → **{short_fix}**` (drift / advisory-only finding: rationale only) | rationale ≤ 120 chars · fix ≤ 100 chars (see below) |
 
 The `section` column anchors findings in their containing prompt section. Useful when a 1758-line prompt has dozens of findings — the user can quickly group them by section/subsection mentally. Findings with no section context show `—`.
+
+The `summary` column combines:
+
+- A short **rationale** (truncated to ≈ 80–90 chars; first sentence).
+- The arrow `→` separator.
+- The short **fix** (truncated to ≈ 50–60 chars; first imperative).
 
 **Rendered shape:**
 
 ```markdown
 ## Findings — run-NNN
 
-| id | lens | sev | section | line | excerpt | suggestion |
-|----|------|-----|---------|------|---------|------------|
-| C1 | conflict | high | 7.2 | 284 | Always be formal... | Maintain a professional but warm register. |
-| S1 | schema | high | 7 | 280 | ## SECTION 7 — VALUE FRAMING | Insert Section 6 — <Placeholder> between line 220 and 280, OR renumber Section 7 → 6 and shift subsequent sections down. |
-| G2 | gap | medium | — | 27 | … | … |
-| T3 | tr_phonetic | low | 1.3 | 17 | Kurban Bayramı... | Kurban Bayramı tatili, ... |
+| id | lens | sev | section | line | summary |
+|---|---|---|---|---|---|
+| C1 | conflict | high | 7.2 | 284 | Tone contradiction (R3↔R2): "always formal" vs "casual ve friendly" → **Maintain a professional but warm register.** |
+| S1 | schema | high | 7 | 280 | Section 5 → Section 7: Section 6 missing → **Insert Section 6 — Placeholder, OR renumber 7 → 6.** |
+| G2 | gap | medium | 3.4 | 27 | R7 silence threshold hedged as "e.g. 5 seconds" → **Pin a concrete duration (e.g. 5 or 7 seconds).** |
+| T3 | tr_phonetic | low | 1.3 | 17 | Long sentence carrying date range needs pacing → **Comma after "sebebiyle".** |
 
 _Note: 3 TR pronunciation findings (foreign_word + abbreviation) will be auto-filed to the overlay's Pronunciation map. They are not in the table — no decision needed._
 
@@ -100,6 +105,23 @@ Hangilerini ne yapayım? Örnek:
 Verbs: düzelt | yorum bırak | atla | konuşalım  (alias: apply | overlay | dismiss | discuss)
 Special: gerisini atla | gerisini yorum | hepsini düzelt | hepsini yorum bırak | hepsini atla | iptal
 ```
+
+For findings where `suggested_fix` is null (drift, advisory TR with only `pronunciation_entry`), the `summary` cell carries the rationale alone:
+
+```markdown
+| drift-S3 | drift | medium | — | — | Model refuses to acknowledge the conflict between R3 and R8 in adversarial scenario. |
+```
+
+The `id | lens | sev | section | line | summary` header row stays the same in both TR and EN modes — the labels follow `report_language` but the column NAMES are language-agnostic data anchors.
+
+The `summary` column is a ONE-LINE compact view: `short_rationale → short_fix`.
+Truncation algorithm matches `overlay-format.md` (first sentence, ≤ 120 chars
+rationale, ≤ 100 chars fix). The full rationale + fix remain in `findings.json`
+for downstream tooling and Phase 10 application.
+
+Goal: the user can scan the table and immediately see "what" and "what to do"
+without expanding each row. The decision prompt that follows the table
+references findings by id only (`"C1, C3 düzelt; G2 yorum bırak..."`).
 
 > **Note:** TR findings with `kind == "foreign_word"` or `"abbreviation"` (`fix_kind: "advisory"`) are NOT in this table — they auto-file to the overlay's Pronunciation map without a user decision. Only TR findings with `kind == "number_readability"` or `"punctuation"` (`fix_kind: "replace"`) appear here. The `T1` row above is an example of a TR `number_readability` finding (`100 TL` → `yüz lira`), which is `fix_kind: "replace"` and therefore still in the table.
 >
@@ -174,19 +196,29 @@ Verb tokens are language-agnostic — both TR and EN synonyms parse identically 
 | `iptal` appears anywhere in the string | Abort immediately. No decisions are applied. Surface: `Cancelled — every finding still pending. Re-render the summary with /prompt-check-resume <run-id>.` |
 | Empty input | Treat as `iptal`. |
 
-After parsing, surface a one-paragraph plan **before** Phase 10 dispatches:
+After parsing, surface a compact plan **before** Phase 10 dispatches. Each item shows `{id} [{section_marker}, {lens}, {severity_in_language}]` followed by `{short_rationale} → {verb}: "{short_fix}"`. Items with identical decisions group together (multiple ids together with a count):
 
 ```
-Plan:
-  applied  → C1, C3, T4, T5  (T4..T5: TR number_readability / punctuation — normal apply)
-  overlay  → G2, T1, T2, T3  (T1..T3 auto-routed: TR foreign_word / abbreviation)
-  dismissed → C2, D1, D2, G1
-  discussed → (none)
-Warnings: unknown finding id: Z9 — skipped
-Proceed? (yes/no)
+PLAN — onaylamak için "evet", iptal için "iptal":
+
+  C1 [Bölüm 7.2 / Satır 284, conflict, yüksek]
+     Tone çelişkisi → düzelt: "Maintain a professional but warm register."
+
+  G2 [Bölüm 3.4 / Satır 27, gap, orta]
+     Belirsiz threshold → yorum bırak: "Pin a concrete duration..."
+
+  T1..T3 [tr_phonetic, advisory]
+     3 auto-filed pronunciation hints (Gaggia, DHL, iPhone)
+
+  C3, D2 [düşük önem]
+     2 atlanan finding
+
+Toplam: 4 işlem (1 düzelt, 1 yorum bırak, 3 auto-filed, 2 atla).
 ```
 
-Wait for explicit confirmation before any side-effect. If the user says no, return to the free-form decision prompt with the same findings table.
+Truncation matches `overlay-format.md`: ≤ 120 chars rationale, ≤ 100 chars fix; first sentence / first imperative. Warnings from §3.3 (unknown id, unrecognised verb, mixed-prefix range, descending range) append below the totals line as `Uyarılar: unknown finding id: Z9 — skipped`.
+
+Wait for explicit confirmation (`evet` / `yes`) before any side-effect. If the user says `iptal` / `no`, return to the free-form decision prompt with the same findings table.
 
 Schema findings (`S1`, `S2`, ...) follow the normal apply / overlay / dismiss / discuss flow — no special routing. Most schema fixes are structural (renumber / reorder / insert), so when the user picks `düzelt`, Phase 10 surfaces the risk warning before using the Edit tool. The exception is `heading_style_inconsistent` which is substring-style and applies cleanly.
 
@@ -226,15 +258,20 @@ Process discussed findings in `id` order (lens prefix groups together: C1, C2, �
 
 ### 5.1 — Display the finding in full
 
+The displayed context line uses the compact `{id} [{section_marker}, {lens}, {severity}]` header, followed by a blockquote with the **full** rationale and suggested fix. Truncation is intentionally NOT applied here — konuşalım is the sub-flow where the user wants depth.
+
 ```
-─── Discussion: T2 ───
-Lens:       tr_phonetic
-Severity:   medium
-Line:       73
-Excerpt:    "D&R'den geçtim"
-Rationale:  Brand contains an ampersand; TTS will read "and" in English.
-Suggestion: D&R → "de ve er"
+**Konuşalım — C3 [Bölüm 7.2 / Satır 284, conflict, yüksek]**
+
+> Tone çelişkisi (R3↔R2): "always formal" + "casual ve friendly" tek bir
+> prompt'ta birlikte yaşayamaz; model recency-biased olduğu için R8'e meyleder.
+>
+> Önerilen düzeltme: "Default formal; lean warm for first-time callers."
+
+Ne yapmak istiyorsun? (AskUserQuestion ile 4 seçenek)
 ```
+
+The blockquote shows the FULL `rationale` (no truncation here — the sub-flow is when the user wants depth). The `suggested_fix` is also full-length. Truncation applies only to summary tables (§2) and overlay per-finding entries (see `overlay-format.md`), NOT to konuşalım displays.
 
 ### 5.2 — Ask via AskUserQuestion (4 options)
 
