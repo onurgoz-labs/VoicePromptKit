@@ -5,14 +5,16 @@ description: Audit a prompt file (system prompt, agent definition, voice script,
 
 # prompt-check
 
-You audit a prompt file at the path supplied as `$1`. Work in a single context. Read the prompt once. Analyse all four (or five) lenses inline. Write artefacts under an isolated run directory. **Never modify the original prompt file.**
+You audit a prompt file at the path supplied as `$1`. Read the prompt once, then dispatch each lens family to its dedicated subagent (`static-lens-runner`, `drift-runner`, `tr-phonetic-runner`). Merge their outputs in Phase 7. Write all artefacts under an isolated run directory. **Never modify the original prompt file.**
 
 ## Inputs you have
 
 - `$1` — relative or absolute path to the prompt file under audit.
-- `references/lens-rules.md` — full criteria for each lens (read on first use).
-- `references/tr-phonetic.md` — Turkish phonetic rules (read only if `tr_phonetic: true`).
-- `references/probes.md` — adversarial probe templates (read only if drift phase runs).
+- `references/lens-rules.md` — full criteria for the static lenses; read by `static-lens-runner`.
+- `references/tr-phonetic.md` — Turkish phonetic rules; read by `tr-phonetic-runner`.
+- `references/probes.md` — adversarial probe templates; read by `drift-runner`.
+
+The skill itself does not need to read these reference files — it only passes their paths to the matching subagent.
 
 ## Phase 0 — Project config (wizard on first run)
 
@@ -244,21 +246,35 @@ Hold the rules in memory as JSON. Also write `$RUN_DIR/rules.json` with shape:
 
 If you extract zero rules, abort with an error written to `$RUN_DIR/error.txt` and surface that to the user.
 
-## Phase 4 — Four lenses (single pass, inline)
+## Phase 4 — Static lenses (conflict + dominance + gap)
 
-Apply all four lenses in the same context, in sequence. Each lens reads the rule list (and body where noted) and produces a JSON section. Detection criteria for every lens live in `references/lens-rules.md` — consult that document; do not re-state the criteria here.
+Dispatch the `static-lens-runner` subagent to apply the three static lenses in one pass. Detection criteria live in `references/lens-rules.md` — the subagent reads that document. The skill itself does no lens analysis.
 
-Produce one in-memory analysis object:
+**Line-number contract:** every `line` field the subagent writes is a body.txt index (1-indexed, blank lines included). Phase 7 is the single place that translates these to original-file line numbers.
 
-```json
-{
-  "conflicts":  [{"id":"C1","rule_ids":["R3","R8"],"severity":"low|medium|high","reasoning":"..."}],
-  "dominances": [{"id":"D1","dominant_rule_id":"R12","dominated_rule_id":"R3","mechanism":"position|length|specificity|recency|role-override","severity":"low|medium|high","reasoning":"..."}],
-  "gaps":       [{"id":"G1","kind":"undefined_edge_case|ambiguous_term","description":"...","related_rule_ids":["R5"],"severity":"low|medium|high"}]
-}
+Pass inputs and output paths as **separate** top-level fields so the subagent never reads its own future outputs:
+
+```
+Agent({
+  subagent_type: "static-lens-runner",
+  prompt: JSON.stringify({
+    inputs: {
+      body:           "<absolute path to $RUN_DIR/body.txt>",
+      frontmatter:    "<absolute path to $RUN_DIR/frontmatter.json>",
+      rules:          "<absolute path to $RUN_DIR/rules.json>",
+      lens_rules_ref: "<absolute path to skills/prompt-check/references/lens-rules.md>"
+    },
+    output_paths: {
+      conflicts:  "<absolute path to $RUN_DIR/conflicts.json>",
+      dominances: "<absolute path to $RUN_DIR/dominances.json>",
+      gaps:       "<absolute path to $RUN_DIR/gaps.json>"
+    }
+  }),
+  description: "static lenses for " + BASENAME
+})
 ```
 
-Write each section to `$RUN_DIR/{conflicts,dominances,gaps}.json` as you complete it. The drift section is filled by Phase 5.
+`static-lens-runner` writes `$RUN_DIR/conflicts.json`, `$RUN_DIR/dominances.json`, and `$RUN_DIR/gaps.json`. The skill reads them in Phase 7.
 
 ## Phase 5 — Drift (conditional)
 
@@ -300,69 +316,36 @@ Agent({
 
 ## Phase 6 — Turkish phonetic lens (conditional)
 
-**Run this phase only if `frontmatter.tr_phonetic == true`.** Read `references/tr-phonetic.md` end-to-end before generating any findings — its skip rules, whitelist, strategy semantics, and "no semantic translation" hard rule are mandatory and not repeated here.
+**Run this phase only if `frontmatter.tr_phonetic == true`.** Otherwise skip to Phase 7 — `tr_phonetic.json` is not written, and Phase 7 treats the absence as "TR lens disabled".
 
-### Phase 6.0 — Seed `pronunciation_map` from existing blocks
+When the gate passes, dispatch the `tr-phonetic-runner` subagent. It seeds `pronunciation_map` from any existing pronunciation guide block in the body, scans for new findings, dedupes against the seed, and writes a single `$RUN_DIR/tr_phonetic.json`. Every rule (skip rules, whitelist, strategy semantics, the "no semantic translation" hard rule, the three `fix_kind` values, the seed block formats and line-range tracking) lives in `references/tr-phonetic.md` — the subagent reads that document; the skill does not repeat the criteria here.
 
-Before scanning the body for new findings, parse any existing pronunciation guide blocks in `body.txt` and seed `pronunciation_map`. Recognised block formats:
+**Line-number contract:** every `line` field (including `seed_block_range.start_line` / `end_line`) the subagent writes is a body.txt index. Phase 7 translates to original-file lines.
 
-- **Managed marker block:** `<!-- promptchecker:pronunciation-guide:start --> ... <!-- promptchecker:pronunciation-guide:end -->`
-- **Legacy heading block:** a line containing `TTS PRONUNCIATION NOTES`, `Pronunciation guide`, `Okunuş rehberi`, `Telaffuz`, or `Telaffuz notları` followed by a bullet list within the next ~20 lines.
+**Advisory invariant:** TR findings can be `replace`, `pronunciation_hint`, or `advisory`, but the apply-mode contract treats every TR finding as advisory-only when the prompt body is concerned — Pass 1 never edits a line on behalf of a TR finding, and Pass 2 only writes into the managed pronunciation guide block.
 
-For each parsed entry, infer `strategy` (see `references/tr-phonetic.md` for the rules) and record the term. Tag each seed entry with `source: "seed"`. **Remember the line range of any legacy block** — apply-mode Pass 2 needs it to migrate the block to managed format.
+Pass inputs and the output path as **separate** top-level fields:
 
-**Body scan in 6.1 dedupes against the seed:** if a term already exists in the seed `pronunciation_map`, do not emit a new finding for it. The skip rules in `references/tr-phonetic.md` already prevent the block's own lines from being re-flagged.
-
-If no existing block is found, `pronunciation_map` starts empty and proceeds to 6.1 with body-scan findings only.
-
-### Phase 6.1 — Body scan
-
-Each TR finding declares one of three `fix_kind` values (see `references/tr-phonetic.md` for full definitions): `replace`, `pronunciation_hint`, or `advisory`.
-
-Write `$RUN_DIR/tr_phonetic.json`:
-
-```json
-{
-  "seed_block_range": { "start_line": 435, "end_line": 441, "format": "legacy_heading" },
-  "findings": [
-    {
-      "id": "T1",
-      "kind": "number_readability | abbreviation | foreign_word | punctuation",
-      "fix_kind": "replace | pronunciation_hint | advisory",
-      "severity": "low | medium | high",
-      "line": 42,
-      "current_excerpt": "...",
-      "suggested_fix": "...",
-      "pronunciation_entry": {
-        "term": "DHL",
-        "strategy": "pronounce | rephrase | follow_with_translation",
-        "phonetic": "de-ha-el",
-        "alt_translation": null,
-        "note": null
-      },
-      "rationale": "..."
-    }
-  ],
-  "seed_entries": [
-    {
-      "term": "Konstantinopolis",
-      "strategy": "pronounce",
-      "phonetic": null,
-      "alt_translation": "Bizans başkenti",
-      "note": "Author marked this as high risk; rephrase when possible.",
-      "source": "seed"
-    }
-  ]
-}
+```
+Agent({
+  subagent_type: "tr-phonetic-runner",
+  prompt: JSON.stringify({
+    inputs: {
+      body:             "<absolute path to $RUN_DIR/body.txt>",
+      frontmatter:      "<absolute path to $RUN_DIR/frontmatter.json>",
+      tr_phonetic_ref:  "<absolute path to skills/prompt-check/references/tr-phonetic.md>"
+    },
+    output_path: "<absolute path to $RUN_DIR/tr_phonetic.json>"
+  }),
+  description: "TR phonetic lens for " + BASENAME
+})
 ```
 
-`seed_block_range` is null when no existing block was found. `seed_entries[]` is the parsed seed; `findings[]` contains only NEW (non-duplicate) issues from the body scan.
-
-Only one of `suggested_fix` / `pronunciation_entry` is populated per finding. **Never** propose semantic translations (`pound → İngiliz lirası` is forbidden). Phonetic hints and `alt_translation` metadata are allowed.
+`tr-phonetic-runner` writes `$RUN_DIR/tr_phonetic.json` with shape `{ seed_block_range, findings[], seed_entries[] }`. The skill reads it in Phase 7.
 
 ## Phase 7 — Render outputs
 
-Read everything you wrote into `$RUN_DIR/` so far. Build a single merged `findings.json` and a human-readable `report.md`. Both are line-anchored.
+Read every artefact that landed in `$RUN_DIR/` so far: `frontmatter.json`, `rules.json`, `conflicts.json`, `dominances.json`, `gaps.json`, `drift.json`, and (if the TR gate ran) `tr_phonetic.json`. Build a single merged `findings.json` and a human-readable `report.md`. Both are line-anchored.
 
 **Line translation (mandatory):** Every lens wrote `line` numbers as body.txt indices. Before writing findings.json, translate each `line` to an original-file line:
 
@@ -610,7 +593,7 @@ If all passes are empty, say so explicitly — do not pretend to have done work.
 
 - Don't extract frontmatter with an LLM pass; use Bash/Python — it's deterministic and free.
 - Don't read the original prompt more than once per phase; pass `body.txt` between steps.
-- Don't dispatch a subagent for any lens other than drift. The first four lenses fit comfortably in a single context.
+- Don't run lens analysis inline in the skill. Each lens family has a dedicated subagent (`static-lens-runner`, `drift-runner`, `tr-phonetic-runner`); the skill only dispatches and reads outputs.
 - Don't write outside `$RUN_DIR/` (except for `.promptchecker.json` in Phase 0, with the user's explicit consent through the wizard).
 - Don't modify the original prompt file in any phase — only Apply-mode does that, and only when the user explicitly asks.
 - Don't run the wizard if `.promptchecker.json` already exists. The user owns that file.
