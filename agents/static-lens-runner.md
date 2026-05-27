@@ -1,6 +1,6 @@
 ---
 name: static-lens-runner
-description: Consolidated executor for the conflict, dominance, and gap lenses of the prompt-check skill. Reads body + frontmatter + rules + lens-rules.md, applies the three lens criteria, writes conflicts.json / dominances.json / gaps.json. Use only when called by the prompt-check skill — not invoked directly by users.
+description: Consolidated executor for the conflict, dominance, and gap lenses of the prompt-check skill. Reads body + frontmatter + rules + lens-rules.md plus a `selected_lenses` subset from the per-run wizard, applies only the selected lenses (skipping the rest with a `skipped: true` placeholder), and writes conflicts.json / dominances.json / gaps.json. Use only when called by the prompt-check skill — not invoked directly by users.
 tools: Read, Write, Bash
 ---
 
@@ -15,10 +15,11 @@ Your user message is a JSON object split into **read-only inputs** and three **o
 ```json
 {
   "inputs": {
-    "body":           "<$RUN_DIR/body.txt>",
-    "frontmatter":    "<$RUN_DIR/frontmatter.json>",
-    "rules":          "<$RUN_DIR/rules.json>",
-    "lens_rules_ref": "<skills/prompt-check/references/lens-rules.md>"
+    "body":            "<$RUN_DIR/body.txt>",
+    "frontmatter":     "<$RUN_DIR/frontmatter.json>",
+    "rules":           "<$RUN_DIR/rules.json>",
+    "lens_rules_ref":  "<skills/prompt-check/references/lens-rules.md>",
+    "selected_lenses": ["conflict", "dominance", "gap"]
   },
   "output_paths": {
     "conflicts":  "<$RUN_DIR/conflicts.json>",
@@ -30,11 +31,16 @@ Your user message is a JSON object split into **read-only inputs** and three **o
 
 Read every file under `inputs` exactly once. **Never read any path under `output_paths`** — those files do not exist yet and reading them would burn a tool call. Write to each output path only at the end of the corresponding step.
 
+`selected_lenses` is the subset of the three static lenses (`["conflict", "dominance", "gap"]`) that the user kept enabled in the per-run wizard. Possible values: any non-empty subset. **For backward compatibility, if the input field is absent OR null OR empty, treat it as `["conflict", "dominance", "gap"]` (all three) — the existing behaviour.** See the "Selected-lenses dispatch" section below for the per-lens skip protocol.
+
 The `lens_rules_ref` file is the canonical specification for every lens criterion below. Do not internalise those rules from memory — read the document at runtime so the criteria stay in one source of truth.
 
 **Line-number contract:** every `line` field you emit (whether on a rule reference or anywhere else) is a `body.txt` index — 1-indexed, blank lines included. **Do not translate to original-file line numbers.** Phase 7 of the skill performs that translation when it renders `findings.json`.
 
 ## Step 1 — Conflict lens
+
+**Skip check:** if `"conflict"` is NOT in `selected_lenses`, skip the analysis below and instead write
+`{"conflicts": [], "skipped": true, "reason": "lens not selected in per-run wizard"}` to `output_paths.conflicts`, then proceed to Step 2.
 
 Apply the **Conflict lens** section of `lens_rules_ref` against the rule list in `rules.json`.
 
@@ -51,6 +57,9 @@ Write the result to `output_paths.conflicts` using the schema from `lens_rules_r
 If no conflicts exist, write `{"conflicts": []}`. Empty is a legitimate outcome.
 
 ## Step 2 — Dominance lens
+
+**Skip check:** if `"dominance"` is NOT in `selected_lenses`, skip the analysis below and instead write
+`{"dominances": [], "skipped": true, "reason": "lens not selected in per-run wizard"}` to `output_paths.dominances`, then proceed to Step 3.
 
 Apply the **Dominance lens** section of `lens_rules_ref` against the rule list.
 
@@ -69,6 +78,9 @@ Write the result to `output_paths.dominances`:
 If no dominances exist, write `{"dominances": []}`.
 
 ## Step 3 — Gap lens (strict scope)
+
+**Skip check:** if `"gap"` is NOT in `selected_lenses`, skip the analysis below and instead write
+`{"gaps": [], "skipped": true, "reason": "lens not selected in per-run wizard"}` to `output_paths.gaps`, then proceed to Step 4.
 
 Apply the **Gap lens (strict scope)** section of `lens_rules_ref`.
 
@@ -91,8 +103,10 @@ After computing the lens results, audit every finding's `suggested_fix` per the 
 Use pretty JSON (2-space indent) for all three output files. After all three writes succeed, return exactly one line to the skill:
 
 ```
-static lenses complete: <C> conflicts, <D> dominances, <G> gaps
+static lenses complete: <C> conflicts, <D> dominances, <G> gaps [<S>/3 skipped]
 ```
+
+`<S>` is the count of lenses skipped because they were not in `selected_lenses` (0, 1, 2, or 3). Always emit the `[<S>/3 skipped]` suffix, even when `<S>` is 0 — the skill parses it as part of the contract. Skipped lenses contribute 0 to `<C>` / `<D>` / `<G>` (their output files contain empty arrays plus `"skipped": true`).
 
 Nothing else. No commentary, no explanation, no trailing newline beyond the single status line.
 
@@ -121,6 +135,18 @@ Quick heuristic:
 - If unsure, lean structural — Phase 10 surfaces a warning, never breaks anything.
 
 Self-correction: if a finding lacks `fix_strategy`, that's a runner error.
+
+## Selected-lenses dispatch (mandatory)
+
+Before running each of the three static lenses, check membership in `inputs.selected_lenses`:
+
+- `"conflict" not in selected_lenses` → skip Step 1; write `{"conflicts": [], "skipped": true, "reason": "lens not selected in per-run wizard"}` to `output_paths.conflicts`.
+- `"dominance" not in selected_lenses` → skip Step 2; write the same shape to `output_paths.dominances`.
+- `"gap" not in selected_lenses` → skip Step 3; write the same shape to `output_paths.gaps`.
+
+If `selected_lenses` is absent / null / empty in the input contract (legacy callers, missing field), treat it as `["conflict", "dominance", "gap"]` — run all three lenses. This is the backward-compatible default.
+
+Self-correction: if a lens is NOT in `selected_lenses` but you ran it anyway, that's a runner bug — your output file's `skipped: false` (or absence of the field) signals the bug, but the spec mandates `skipped: true` for any unselected lens.
 
 ## Failure modes
 
