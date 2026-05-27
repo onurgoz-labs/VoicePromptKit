@@ -1,0 +1,270 @@
+# Dialog flow — interactive selection templates
+
+Reference document for the `prompt-check` skill's **Phase 9** (interactive selection) and **Phase 10** (action dispatch). Read on first use during a `prompt-check` run when the skill reaches the interactive phases.
+
+This file defines templates, grammar, and routing rules only. It does NOT define the step-by-step procedure (that lives in `SKILL.md`), the overlay file format (that lives in `references/overlay-format.md`), or the decisions.jsonl shape (same).
+
+## 1 — Lens selection (Phase 9 entry)
+
+Before running any analysis, ask the user which lenses to apply. Use `AskUserQuestion` with `multiSelect: true`. Default to all five selected — the user can deselect.
+
+**Primary question:**
+
+```
+question: "Which lenses do you want to run on this prompt?"
+header:   "Lenses"
+multiSelect: true
+options:
+  - label: "conflict"     description: "Rules that contradict each other under realistic inputs"
+  - label: "dominance"    description: "Silent overrides — one rule swallows another (position/length/recency/role)"
+  - label: "gap"          description: "Undefined edge cases and ambiguous terms"
+  - label: "drift"        description: "Adversarial scenarios run through drift-runner subagent"
+  - label: "tr_phonetic"  description: "Turkish phonetic readability — voice/TTS only"
+```
+
+**Follow-up — drift only.** If `drift` was selected, ask:
+
+```
+question: "How many extra drift scenarios beyond anchors + conflict budget? (0 disables drift)"
+header:   "expand_count"
+multiSelect: false
+options:
+  - label: "0"   description: "Disable drift entirely"
+  - label: "3"   description: "Default — small set, fast"
+  - label: "5"   description: "Moderate"
+  - label: "10"  description: "Wide coverage"
+  - label: "Other" description: "Type your own integer 0–20"
+```
+
+If `Other` is chosen, follow up with a free-form prompt: `Type an integer 0–20:` and validate. Out-of-range answers re-prompt; do not crash.
+
+**Follow-up — all runs (advisory).** After lens selection, regardless of which lenses were picked:
+
+```
+question: "Bu prompt'a anchor eklemek ister misin? (frontmatter'a yazılır — bu run'ı etkilemez)"
+header:   "Anchors"
+multiSelect: false
+options:
+  - label: "Hayır"        description: "Skip — no anchor changes"
+  - label: "Evet, sonra"  description: "Remind me in the summary footer"
+```
+
+This question is **advisory only** — anchors live in the prompt file's frontmatter, not in `session.json`. If the user says `Evet, sonra`, set `user_intent.anchors_added: false` and add a one-line reminder to the summary footer: `_Reminder: add anchors to <prompt> frontmatter before the next audit._`
+
+## 2 — Summary view rendering (Phase 9, after audit completes)
+
+After Phase 7 produces `findings.json`, the skill renders a single markdown table covering every finding from every selected lens. This is the user's one-shot view of the audit.
+
+**Sort order:** `line` ascending, then `severity` descending (`high` → `medium` → `low`). Stable sort — preserve `findings.json` order on ties.
+
+**Columns:**
+
+| Column | Source | Truncation |
+|---|---|---|
+| `id` | `findings[].id` | none |
+| `lens` | `findings[].lens` | none |
+| `severity` | `findings[].severity` | none |
+| `line` | `findings[].line` (original-file) | none |
+| `excerpt` | `findings[].current_excerpt` | 60 chars + `…` if longer |
+| `suggestion` | `findings[].suggested_fix` if present else `findings[].rationale` | 80 chars + `…` if longer |
+
+**Rendered shape:**
+
+```markdown
+## Findings — run-NNN
+
+| id | lens | sev | line | excerpt | suggestion |
+|----|------|-----|------|---------|------------|
+| C1 | conflict | high | 12 | always answer in English | rephrase rule R3 to scope to non-TR users… |
+| G2 | gap | medium | 27 | … | … |
+| T1 | tr_phonetic | high | 42 | 100 TL | yüz lira |
+
+Hangilerini ne yapayım? Örnek:
+  C1, C3 düzelt; G2 yorum bırak; T1..T5 konuşalım; gerisini atla
+
+Verbs: düzelt | yorum bırak | atla | konuşalım  (alias: apply | overlay | dismiss | discuss)
+Special: gerisini atla | gerisini yorum | iptal
+```
+
+After the table, render the prompt verbatim and accept free-form text on the next user turn.
+
+If `findings[]` is empty, skip the prompt entirely and surface `No findings — nothing to decide.` Still create an empty `session.json` and `decisions.jsonl` for audit symmetry.
+
+## 3 — Free-form decision parsing grammar
+
+The user's reply is a single free-form string. Parse it into a list of `(finding_ids, verb)` decisions.
+
+### 3.1 — Tokens
+
+**Verbs (case-insensitive, all map to the same status):**
+
+| Turkish | English aliases | Resulting status |
+|---|---|---|
+| `düzelt` | `apply`, `fix` | `applied` (TR findings auto-routed to `overlay` — see §4) |
+| `yorum bırak` | `overlay`, `comment` | `overlay` |
+| `atla` | `skip`, `dismiss` | `dismissed` |
+| `konuşalım` | `discuss`, `talk` | `discussed` (transient — triggers sub-flow in §5) |
+
+**Special tokens:**
+
+| Token | Meaning |
+|---|---|
+| `gerisini atla` / `rest skip` / `dismiss rest` | All findings still `pending` → `dismissed` |
+| `gerisini yorum` / `rest overlay` | All findings still `pending` → `overlay` |
+| `iptal` / `cancel` | Abort; leave every finding at `pending`; do not run Phase 10 |
+
+**ID forms inside a segment:**
+
+| Form | Example | Meaning |
+|---|---|---|
+| single | `C1` | one finding |
+| comma-list | `C1, C3, C7` | three findings |
+| range | `T1..T5` | inclusive range across same lens prefix (T1, T2, T3, T4, T5) |
+| wildcard | `gerisini` (rest) | every finding still `pending` at the moment this segment is evaluated |
+
+### 3.2 — Segment grammar
+
+- Decisions are separated by `;` (semicolon). Whitespace around `;` is ignored.
+- Each segment is `<id-list> <verb>` OR `<verb> <id-list>`. Both orders are valid: `C1 düzelt` and `düzelt C1` mean the same thing.
+- Verbs of multiple words (`yorum bırak`, `gerisini atla`) match as a single token — the parser must look ahead.
+- Segments are evaluated **left to right**. `gerisini` always means "the rest at this point", so order matters: `C1 düzelt; gerisini atla` applies C1 then dismisses the others.
+
+### 3.3 — Error handling (per-segment, never abort the batch)
+
+| Condition | Action |
+|---|---|
+| Unknown id (e.g. `Z9`) | Skip that id, append a warning to the parser report: `unknown finding id: Z9 — skipped`. Continue with the rest of the batch. |
+| Unrecognised verb | Skip the whole segment, append: `unrecognised verb "<text>" for <id-list> — retry that segment`. Continue. |
+| Range with mismatched prefixes (`C1..T3`) | Skip, append: `range C1..T3 mixes lenses — split into two segments`. Continue. |
+| Range with descending bounds (`T5..T1`) | Skip, append: `range T5..T1 is descending — write it as T1..T5`. Continue. |
+| `iptal` appears anywhere in the string | Abort immediately. No decisions are applied. Surface: `Cancelled — every finding still pending. Re-render the summary with /prompt-check-resume <run-id>.` |
+| Empty input | Treat as `iptal`. |
+
+After parsing, surface a one-paragraph plan **before** Phase 10 dispatches:
+
+```
+Plan:
+  applied  → C1, C3
+  overlay  → G2, T1, T2, T3, T4, T5  (T1..T5 auto-routed: TR phonetic)
+  dismissed → C2, D1, D2, G1
+  discussed → (none)
+Warnings: unknown finding id: Z9 — skipped
+Proceed? (yes/no)
+```
+
+Wait for explicit confirmation before any side-effect. If the user says no, return to the free-form decision prompt with the same findings table.
+
+## 4 — TR routing rule (hard)
+
+Every finding with `lens == "tr_phonetic"` is **force-routed to `overlay`**, regardless of the verb the user typed.
+
+- This applies to `düzelt`, `apply`, and `fix` — they would otherwise modify the prompt file.
+- It does NOT apply to `atla` (still dismissed) or `konuşalım` (still enters the sub-flow — but inside the sub-flow, "kabul et" and "ben revize ediyorum → apply" also redirect to overlay).
+- The skill MUST surface the redirect explicitly, one line per finding, before dispatch:
+
+```
+T3 TR phonetic — auto-routed to overlay (TR findings never modify the prompt file).
+```
+
+This rule is non-negotiable. There is no opt-out flag, no frontmatter switch, no env var. The prompt file is the author's curated text; TR pronunciation belongs in the overlay.
+
+## 5 — "Konuşalım" sub-flow (Phase 10, for `status: discussed`)
+
+When one or more findings reach `status: discussed`, enter a sub-loop **after** the plain `düzelt/overlay/atla` decisions have been applied (so the user sees a clean slate).
+
+Process discussed findings in `id` order (lens prefix groups together: C1, C2, …, D1, …, G1, …, T1, …). For each:
+
+### 5.1 — Display the finding in full
+
+```
+─── Discussion: T2 ───
+Lens:       tr_phonetic
+Severity:   medium
+Line:       73
+Excerpt:    "D&R'den geçtim"
+Rationale:  Brand contains an ampersand; TTS will read "and" in English.
+Suggestion: D&R → "de ve er"
+```
+
+### 5.2 — Ask via AskUserQuestion (4 options)
+
+```
+question: "T2 — what would you like to do?"
+header:   "T2 discussion"
+multiSelect: false
+options:
+  - label: "kabul et"          description: "Apply the default suggestion (or overlay if TR)"
+  - label: "ben revize ediyorum" description: "I'll type a replacement"
+  - label: "yorum bırak"       description: "Write to overlay only"
+  - label: "atla"              description: "Skip this finding"
+```
+
+### 5.3 — Branch on the answer
+
+| Answer | Action |
+|---|---|
+| `kabul et` | Apply `suggested_fix` (or overlay if TR per §4). Log `action: "discussed"` then `action: "applied"` (or `"overlay"`) to decisions.jsonl. |
+| `ben revize ediyorum` | Open a free-form prompt: `Type the replacement text:`. Read the user's next message verbatim. Then ask via AskUserQuestion: `Apply this to the prompt file, or write it to the overlay?` (two options: `düzelt` / `yorum bırak`; TR findings have only `yorum bırak` per §4). Log `action: "discussed"` → `action: "revised"` with `from`/`to` fields → final `action: "applied"` or `"overlay"`. |
+| `yorum bırak` | Write to overlay. Log `action: "discussed"` → `action: "overlay"`. |
+| `atla` | No file changes. Log `action: "discussed"` → `action: "dismissed"`. |
+
+### 5.4 — Iteration contract
+
+- One sub-dialogue per discussed finding, sequentially. Never batch.
+- After each finding finishes, surface a one-line confirmation: `T2 → overlay (revised).` and move on.
+- After the last discussed finding, surface the final summary (counts per action) and the path to `decisions.jsonl`.
+
+If the user types `iptal` at any point inside the sub-flow, abort the remaining discussions; leave already-processed findings at their final status and the rest at `discussed` (so `/prompt-check-resume` can pick them up).
+
+## 6 — Session bootstrap shape
+
+At Phase 9 entry (right after lens selection, before running any lens), the skill writes `$RUN_DIR/session.json`. It is the durable record of user intent and per-finding status; resume relies on it.
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "run-NNN",
+  "started_at": "<ISO 8601 UTC>",
+  "user_intent": {
+    "selected_lenses": ["conflict", "gap", "tr_phonetic"],
+    "expand_count": 3,
+    "anchors_added": false
+  },
+  "findings_state": {
+    "C1": { "status": "pending", "last_ts": "<ISO 8601 UTC>" },
+    "C2": { "status": "pending", "last_ts": "<ISO 8601 UTC>" },
+    "G1": { "status": "pending", "last_ts": "<ISO 8601 UTC>" },
+    "T1": { "status": "pending", "last_ts": "<ISO 8601 UTC>" }
+  }
+}
+```
+
+**Status taxonomy:**
+
+| Status | Persistent? | Meaning |
+|---|---|---|
+| `pending` | yes | not yet decided; eligible for resume |
+| `applied` | yes | `suggested_fix` written to prompt file |
+| `overlay` | yes | written to `inline-suggestions.md` |
+| `dismissed` | yes | user said `atla`; no side-effect |
+| `discussed` | transient | inside the sub-flow; never persisted as final |
+| `revised` | transient | sub-flow recorded a user-typed replacement; followed by `applied` or `overlay` |
+
+When the skill records a transient status, it immediately writes the next persistent status in the same Phase 10 tick. `session.json` on disk only ever contains persistent statuses at rest. Transient statuses appear only in `decisions.jsonl` for full audit trail.
+
+`findings_state` is keyed by finding id. The skill updates the entry's `status` and `last_ts` after each decision is dispatched.
+
+## 7 — Resume contract
+
+`/prompt-check-resume [run-id]` (sister command, defined elsewhere) opens an existing `session.json`:
+
+1. Resolve the run directory: explicit `run-id` argument > `latest` symlink.
+2. Read `session.json` and `findings.json`.
+3. Filter `findings_state` for entries with `status == "pending"`.
+4. Re-render the summary table from §2, restricted to those rows.
+5. Re-prompt with the same free-form decision string (§3).
+6. Phase 10 runs against the filtered set only — already-applied / overlay / dismissed findings are not re-touched.
+
+The session.json schema is forward-compatible: unknown keys are preserved on rewrite. If `schema_version` is greater than the running skill version, abort with: `Session schema version N is newer than this skill (M) supports — upgrade PromptChecker first.`
+
+If no `pending` findings remain, surface: `No pending decisions in run-NNN. Nothing to resume.` and exit cleanly.
