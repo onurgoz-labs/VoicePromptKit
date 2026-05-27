@@ -24,13 +24,16 @@ Your user message is a JSON object split into **read-only inputs** and a single 
     "probes_ref":            "<skills/prompt-check/references/probes.md>",
     "expand_count_override": 3,
     "compact_mode":          false,
-    "max_char_limit":        50000
+    "max_char_limit":        50000,
+    "section_index":         "<$RUN_DIR/section_index.json>"
   },
   "output_path": "<$RUN_DIR/drift.json>"
 }
 ```
 
 Read every file under `inputs` exactly once. **Never read `output_path`** — it does not exist yet and reading it would burn a tool call. Write to `output_path` only at the end of Step 4.
+
+`section_index` is passed for parity with the other runners. Drift findings are scenario-level (`scenario_id`-based, not line-based), so they don't have a single source line to look up. Drift findings emit `section_ref: null` by default. If a verdict's `reasons` reference a specific rule whose line falls inside a numbered section, you MAY include that section in the verdict's reason text for context, but the structured `section_ref` field stays `null`.
 
 `expand_count_override` is the value the user picked in the per-run wizard (Phase 3.5 of SKILL.md). When present and not null, it takes precedence over `frontmatter.expand_count`. When absent or null, fall back to `frontmatter.expand_count` (existing behaviour). When `expand_count_override == 0`, drift is disabled for this run — write `{"scenarios":[],"runs":[],"verdicts":[],"warnings":["expand_count is 0 — drift disabled"]}` to `output_path` and return (mirror the SKILL.md drift skip path).
 
@@ -218,6 +221,24 @@ Write a single JSON file at `output_path` with shape:
 
 The output schema `{scenarios, runs, verdicts, warnings}` gains an optional top-level `compact_mode: true` field when compact-mode policy fired, plus a `compact_policy` array listing which trim policies fired. When `compact_mode == false`, neither field appears (or both are emitted as `compact_mode: false, compact_policy: []` — consumer-friendly).
 
+### Promoted-to-finding view (used by Phase 7)
+
+When Phase 7 of the skill promotes a drift verdict into a finding for the unified `findings.json`, the finding takes this shape:
+
+```json
+{
+  "id": "drift-S3",
+  "lens": "drift",
+  "fix_kind": "advisory",
+  "severity": "<inferred from score>",
+  "line": null,
+  "section_ref": null,
+  "rationale": "..."
+}
+```
+
+Note `line: null` and `section_ref: null` for drift findings — they are behavioural, not positional. The drift runner does NOT compute `section_ref` for its own verdicts; Phase 7 sets `section_ref: null` explicitly when promoting (never absent).
+
 Use pretty JSON (2-space indent). After writing, return a one-line status to the skill: `drift complete (batch): <N> scenarios, <P> passed, <F> failed [compact mode: <ACTIVE | inactive>]`. Nothing else.
 
 ## Batch discipline (mandatory)
@@ -237,4 +258,5 @@ If batch fails (incomplete array, malformed JSON, missing scenarios), retry the 
 
 - If a required input file is missing or unreadable, write `{"scenarios":[],"runs":[],"verdicts":[],"warnings":["could not read <path>"]}` to `output_path` and return.
 - If `scenarios.length == 0` after generation (e.g. the skill called you but the trigger conditions disappeared), write the same empty payload with a warning `"no scenarios generated"`.
+- If `section_index.json` is missing or unreadable, drift continues normally — drift findings already carry `section_ref: null` by default, so the missing index changes nothing. The runner MAY emit a warning `"section_index missing — drift findings carry section_ref: null anyway"` into the output's `warnings` array for downstream visibility. Don't abort.
 - Never crash silently — every early exit must leave a valid `output_path` so the skill can finish Phase 7.
