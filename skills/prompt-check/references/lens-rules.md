@@ -61,7 +61,7 @@ If none, emit `{ "conflicts": [] }`. Empty is a legitimate outcome.
 Schema:
 
 ```json
-{ "conflicts": [{ "id": "C1", "rule_ids": ["R3","R8"], "severity": "low|medium|high", "reasoning": "<≤ 400 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural" }] }
+{ "conflicts": [{ "id": "C1", "rule_ids": ["R3","R8"], "severity": "low|medium|high", "reasoning": "<≤ 400 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "VALUE FRAMING AXES", "subsection_title": "MÜBADELE VALUE HIERARCHY" } }] }
 ```
 
 For the `suggested_fix` in the merged findings.json: propose a concrete rewrite that resolves the contradiction (e.g. "Replace R8 with: 'Stay warm and approachable while preserving professional language.'"). If no clean resolution exists, write `suggested_fix: 'TODO: pick one of (A) <option>, (B) <option>'` so the author has a starting point. Empty `suggested_fix` is no longer allowed.
@@ -83,7 +83,7 @@ Rules that **contradict** but where neither dominates are a *conflict*, not a do
 Schema:
 
 ```json
-{ "dominances": [{ "id": "D1", "dominant_rule_id": "R12", "dominated_rule_id": "R3", "mechanism": "position|length|specificity|recency|role-override", "severity": "low|medium|high", "reasoning": "<≤ 300 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural" }] }
+{ "dominances": [{ "id": "D1", "dominant_rule_id": "R12", "dominated_rule_id": "R3", "mechanism": "position|length|specificity|recency|role-override", "severity": "low|medium|high", "reasoning": "<≤ 300 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "VALUE FRAMING AXES", "subsection_title": "MÜBADELE VALUE HIERARCHY" } }] }
 ```
 
 Severity heuristic for dominance:
@@ -131,7 +131,7 @@ Severity:
 Schema:
 
 ```json
-{ "gaps": [{ "id": "G1", "kind": "undefined_edge_case|ambiguous_term", "description": "<one sentence: the conditional that is incomplete, or the term that is undefined>", "related_rule_ids": ["R5"], "severity": "low|medium|high", "suggested_fix": "<concrete one-sentence resolution or structural action>", "fix_strategy": "substring | structural" }] }
+{ "gaps": [{ "id": "G1", "kind": "undefined_edge_case|ambiguous_term", "description": "<one sentence: the conditional that is incomplete, or the term that is undefined>", "related_rule_ids": ["R5"], "severity": "low|medium|high", "suggested_fix": "<concrete one-sentence resolution or structural action>", "fix_strategy": "substring | structural", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "VALUE FRAMING AXES", "subsection_title": "MÜBADELE VALUE HIERARCHY" } }] }
 ```
 
 For `suggested_fix`: **always populate `suggested_fix` with a concrete one-sentence resolution** — for `undefined_edge_case`, write the missing branch verbatim (e.g. `"Add: 'If the user keeps interrupting after 3 attempts, trigger end-call-tool with a brief apology.'"`). For `ambiguous_term`, anchor the vague word with a specific replacement (e.g. `"Replace 'appropriately formal' with 'address callers by surname and use the formal pronoun form throughout.'"`). Empty `suggested_fix` is no longer allowed — if the runner cannot draft a resolution, it must write `suggested_fix: 'TODO: <one-sentence open question for the author>'` and the human handles it in the konuşalım sub-flow.
@@ -215,7 +215,8 @@ For `step_gap`:
       "rationale": "Section 5 (line 220) is directly followed by Section 7 (line 280). Section 6 is missing.",
       "suggested_fix": "Insert a 'Section 6 — <Placeholder Title>' heading between line 220 and line 280, OR renumber Section 7 → Section 6 and shift subsequent sections down by 1.",
       "fix_strategy": "structural",
-      "rule_ids": []
+      "rule_ids": [],
+      "section_ref": { "section": "7", "subsection": null, "section_title": "VALUE FRAMING AXES", "subsection_title": null }
     }
   ]
 }
@@ -289,3 +290,58 @@ Set `max_char_limit: 0` at any layer to disable compact mode entirely — the au
 ### Not a hard abort
 
 Compact mode does NOT abort the audit on oversize prompts. It runs THROUGH them with cheaper policies. To enforce a hard limit (refuse to audit prompts over N chars), you would add a separate frontmatter field (`hard_limit:`) — that is not part of v0.4.7 and not implemented.
+
+## Section reference (every finding)
+
+Every finding emitted by every lens (conflict, dominance, gap, schema, drift, tr_phonetic) MUST carry a `section_ref` field. This is a structured pointer to the `## SECTION N` (and `### N.M` if applicable) heading that contains the finding's `line`. Built deterministically in Phase 3 of the skill (see `section_index.json`); used by Phase 7 to render section-aware finding headers ("Section 7.2 — L284" instead of bare "L284").
+
+### Field shape
+
+```json
+"section_ref": {
+  "section": "7",
+  "subsection": "7.2",
+  "section_title": "VALUE FRAMING AXES",
+  "subsection_title": "MÜBADELE VALUE HIERARCHY"
+}
+```
+
+OR
+
+```json
+"section_ref": null
+```
+
+The `null` value signals "the finding's line is outside any numbered section" (e.g. a preamble line, a line between sections, or any line in a prompt with no numbered headings at all).
+
+### Per-lens conventions
+
+| Lens | section_ref source |
+|---|---|
+| Conflict / Dominance / Gap | Look up `finding.line` in `section_index.ranges`. Static lenses always operate on rule-anchored lines, so most findings have a real section_ref. |
+| Schema | Same lookup. For `section_gap` or `missing_parent` findings flagging a heading line, the ref points to the section the HEADING introduces (e.g. a finding on line 280 = `## SECTION 7` carries `section_ref.section: "7"`). |
+| Drift | Behavioural, scenario-level. `line: null` AND `section_ref: null` always. Drift findings describe model behaviour, not positional issues. |
+| TR phonetic | Same lookup. Both auto-filed (foreign_word/abbreviation) and apply-eligible (number_readability/punctuation) findings carry section_ref. |
+
+### Backward compatibility
+
+Findings from runs before v0.4.8 do not have the `section_ref` field. Renderers and downstream tools MUST handle:
+- Field present and not null → use it.
+- Field present and null → fall back to bare line marker.
+- Field absent → also fall back to bare line marker (treat as null).
+
+### Rendering rules (Phase 7 and overlay)
+
+When `section_ref.subsection` is not null:
+- TR: `Bölüm 7.2 — Satır 284`
+- EN: `Section 7.2 — L284`
+
+When `section_ref.section` is not null but `subsection` is null:
+- TR: `Bölüm 7 — Satır 284`
+- EN: `Section 7 — L284`
+
+When `section_ref` is null:
+- TR: `Satır 284`
+- EN: `L284`
+
+Section title is NOT included in the inline header (would make the line too long); it appears once in the section-level summary at the top of report.md / inline-suggestions.md.

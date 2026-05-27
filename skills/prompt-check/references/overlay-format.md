@@ -32,7 +32,7 @@ Phase 10 always writes to the **latest** run's overlay (the run that produced th
 
 ## Findings with overlay status
 
-### L<line> [<finding-id> <lens> severity=<low|medium|high>] — status: overlay
+### {{section_marker}} [{{finding_id}} {{lens}} severity={{severity}}] — status: overlay
 - **Current:** `<current_excerpt>`
 - **Diff:** (for substring-style suggestions — render as a ```diff block; see "Rendering mode" below)
   ```diff
@@ -44,7 +44,7 @@ Phase 10 always writes to the **latest** run's overlay (the run that produced th
 - **Decided:** <ISO 8601>
 - **Note:** <user-supplied note or omit>
 
-### L<line> [<finding-id> <lens>] — status: overlay (revised)
+### {{section_marker}} [{{finding_id}} {{lens}}] — status: overlay (revised)
 - **Current:** `<current_excerpt>`
 - **Original suggestion:** `<original suggested_fix from findings.json>`
 - **User-revised:** `<the text the user supplied during konuşalım>` (rendered as a diff block vs. `<current_excerpt>` when substring-style, otherwise as **Action:**)
@@ -60,6 +60,15 @@ Phase 10 always writes to the **latest** run's overlay (the run that produced th
 - `<term>` — rephrase as "<alt_translation>" — <note (if present)>
   - From: seed (prompt's pre-existing pronunciation guide block)
 ```
+
+Where `{{section_marker}}` is:
+- `Section 7.2 — L284` (when section_ref.subsection is set)
+- `Section 7 — L284` (when only section is set)
+- `L284` (when section_ref is null)
+
+(English in inline-suggestions.md regardless of `report_language` — the overlay file is a structured artefact, language switching applies to report.md only.)
+
+The section marker matches `section_ref` from findings.json. When `section_ref: null`, the marker is the bare line number. Schema lens findings that flag a heading itself (e.g. `section_gap` on line 280 = `## SECTION 7`) use the heading's own section as the marker.
 
 ### Rendering mode for the Suggested field
 
@@ -282,13 +291,13 @@ Cross-version pronunciation guide for `<absolute path to prompt file>`.
 
 ## Entries
 
-| Term | Strategy | Phonetic | Alternative | Note | First seen | Last seen | Findings |
-|---|---|---|---|---|---|---|---|
-| `Gaggia Milano` | pronounce | gacca milano | — | Italian brand. Turkish TTS often reads 'Gaggia' letter-literally as 'gag-gia'; the intended Italian reading is closer to 'gacca' (gg+i → /dʒː/). 'Milano' reads naturally in Turkish. | run-001 (2026-05-27) | run-003 (2026-05-30) | T1@run-001, T1@run-002, T1@run-003 |
-| `DHL` | pronounce | de-ha-el | — | English-trained TTS reads "D-H-L"; the Turkish reading is "de-ha-el". | run-002 (2026-05-28) | run-003 (2026-05-30) | T4@run-002, T4@run-003 |
-| `Konstantinopolis` | rephrase | — | Bizans başkenti | Author marked this as high risk; rephrase when possible. | run-001 (2026-05-27) | run-003 (2026-05-30) | seed |
+| Term | Strategy | Phonetic | Alternative | Note | First seen | Last seen | Section | Findings |
+|---|---|---|---|---|---|---|---|---|
+| `Gaggia Milano` | pronounce | gacca milano | — | Italian brand. Turkish TTS often reads 'Gaggia' letter-literally as 'gag-gia'; the intended Italian reading is closer to 'gacca' (gg+i → /dʒː/). 'Milano' reads naturally in Turkish. | run-001 (2026-05-27) | run-003 (2026-05-30) | 1.3 | T1@run-001, T1@run-002, T1@run-003 |
+| `DHL` | pronounce | de-ha-el | — | English-trained TTS reads "D-H-L"; the Turkish reading is "de-ha-el". | run-002 (2026-05-28) | run-003 (2026-05-30) | 3.1 | T4@run-002, T4@run-003 |
+| `Konstantinopolis` | rephrase | — | Bizans başkenti | Author marked this as high risk; rephrase when possible. | run-001 (2026-05-27) | run-003 (2026-05-30) | — | seed |
 
-(One row per unique term, sorted alphabetically. Strategy column: `pronounce` / `rephrase` / `follow_with_translation`. Empty cells render as `—`.)
+(One row per unique term, sorted alphabetically. Strategy column: `pronounce` / `rephrase` / `follow_with_translation`. Empty cells render as `—`. The `Section` column carries `section_ref.subsection` (e.g. `1.3`) if set, else `section_ref.section` (e.g. `1`) if set, else `—`; when the same term appeared in different sections across audits, the values are comma-separated (e.g. `1.3, 3.1`).)
 
 ## VAPI / TTS provider config (copy-paste)
 
