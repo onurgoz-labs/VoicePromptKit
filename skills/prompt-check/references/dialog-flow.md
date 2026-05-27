@@ -79,12 +79,18 @@ After Phase 7 produces `findings.json`, the skill renders a single markdown tabl
 | G2 | gap | medium | 27 | … | … |
 | T1 | tr_phonetic | high | 42 | 100 TL | yüz lira |
 
+_Note: 3 TR pronunciation findings (foreign_word + abbreviation) will be auto-filed to the overlay's Pronunciation map. They are not in the table — no decision needed._
+
 Hangilerini ne yapayım? Örnek:
   C1, C3 düzelt; G2 yorum bırak; T1..T5 konuşalım; gerisini atla
 
 Verbs: düzelt | yorum bırak | atla | konuşalım  (alias: apply | overlay | dismiss | discuss)
 Special: gerisini atla | gerisini yorum | hepsini düzelt | hepsini yorum bırak | hepsini atla | iptal
 ```
+
+> **Note:** TR findings with `kind == "foreign_word"` or `"abbreviation"` (`fix_kind: "advisory"`) are NOT in this table — they auto-file to the overlay's Pronunciation map without a user decision. Only TR findings with `kind == "number_readability"` or `"punctuation"` (`fix_kind: "replace"`) appear here. The `T1` row above is an example of a TR `number_readability` finding (`100 TL` → `yüz lira`), which is `fix_kind: "replace"` and therefore still in the table.
+>
+> The auto-filed banner directly below the table is rendered ONLY when the AUTO_FILED_SET is non-empty (i.e. the audit found one or more TR `foreign_word` / `abbreviation` findings). Otherwise it is omitted.
 
 After the table, render the prompt verbatim and accept free-form text on the next user turn.
 
@@ -169,19 +175,19 @@ Wait for explicit confirmation before any side-effect. If the user says no, retu
 
 TR phonetic findings split into two routing buckets based on `kind`:
 
-- **`foreign_word` / `abbreviation` → force-routed to `overlay`**, regardless of the verb the user typed. These findings carry `fix_kind: "advisory"`; pronunciation hints (DHL → "de-ha-el", Gaggia → "gacca") are voice-design decisions the author owns, and a silent prompt edit would corrupt the visible script.
-- **`number_readability` / `punctuation` → normal apply flow**. These findings carry `fix_kind: "replace"`. `düzelt` modifies the prompt file just like a `conflict` or `gap` finding; `yorum bırak` routes to overlay; `atla` dismisses.
+- **`foreign_word` / `abbreviation` (`fix_kind: "advisory"`) — auto-filed.** These findings are NEVER shown in the Phase 9 summary table, the plan prompt, or any decision view. They are silently routed to the overlay's Pronunciation map section without user input. Wildcard verbs (`hepsini düzelt`, `gerisini X`, `hepsini yorum bırak`, etc.) **ignore them entirely** — they are not part of the decision set. Pronunciation hints (DHL → "de-ha-el", Gaggia → "gacca") are voice-design decisions the author owns, and the user has already indicated they never want to be asked about them; surfacing them as a decision is a UX regression.
+- **`number_readability` / `punctuation` (`fix_kind: "replace"`) — normal flow.** These findings appear in the summary like any other finding. Wildcard verbs apply to them. `düzelt` modifies the prompt file (with substring replace) just like a `conflict` or `gap` finding; `yorum bırak` routes to overlay; `atla` dismisses; `konuşalım` enters the sub-flow.
 
-`atla` always dismisses. `konuşalım` still enters the sub-flow for any TR `kind` — but inside the sub-flow, "kabul et" and "ben revize ediyorum → apply" on a `foreign_word` / `abbreviation` finding redirect to overlay (the advisory rule still holds inside discussion).
+`konuşalım` is unavailable for auto-filed TR findings — they never enter the decision set, so the verb has nothing to attach to. See §5 below for the corner-case handling when the user explicitly references an auto-filed finding's id.
 
-The advisory rule for `foreign_word` / `abbreviation` is non-negotiable. There is no opt-out flag, no frontmatter switch, no env var. The prompt file is the author's curated text; pronunciation belongs in the overlay.
+The auto-file rule for `foreign_word` / `abbreviation` is non-negotiable. There is no opt-out flag, no frontmatter switch, no env var, no override verb. The prompt file is the author's curated text; pronunciation belongs in the overlay; and the decision flow surfaces only findings the user can actually act on.
 
-**Wildcard visibility.** When a wildcard verb (`hepsini düzelt`, `gerisini düzelt`, `apply all`, etc.) hits a TR phonetic finding, the action depends on `kind`:
+**Wildcard visibility.** When a wildcard verb (`hepsini düzelt`, `gerisini düzelt`, `apply all`, etc.) is parsed:
 
-- `foreign_word` / `abbreviation` → auto-route to overlay, surface the redirect explicitly per finding: `T1 TR foreign_word — auto-routed to overlay (voice-design, prompt text never modified).`
-- `number_readability` / `punctuation` → normal apply flow, no special surface line (the finding is applied or routed exactly like a non-TR finding).
+- `foreign_word` / `abbreviation` (`fix_kind: "advisory"`) → skipped by the wildcard. The auto-filed banner already announced these findings below the summary table; the wildcard's effect simply does not extend to them.
+- `number_readability` / `punctuation` (`fix_kind: "replace"`) → normal flow. The verb is applied just like to any non-TR finding (apply / overlay / dismiss / discuss).
 
-This split is mandatory — silent redirects confuse the user (cf. real runtime: user said `hepsini düzelt`, plugin applied 0, user surprised). Always announce the per-category redirect for `foreign_word` / `abbreviation`, then proceed with the rest of the wildcard's effect.
+This split is mandatory — the previous "silent redirect" behaviour caused user confusion (cf. real runtime: user said `hepsini düzelt`, plugin applied 0, user surprised). With auto-file, TR advisory findings never enter the decision set, so wildcards no longer need a special-case redirect message for them; the auto-filed banner is the single explicit surface.
 
 ## 5 — "Konuşalım" sub-flow (Phase 10, for `status: discussed`)
 
@@ -230,6 +236,18 @@ options:
 - After the last discussed finding, surface the final summary (counts per action) and the path to `decisions.jsonl`.
 
 If the user types `iptal` at any point inside the sub-flow, abort the remaining discussions; leave already-processed findings at their final status and the rest at `discussed` (so `/prompt-check-resume` can pick them up).
+
+### 5.5 — Auto-filed TR findings are not eligible for `konuşalım`
+
+Auto-filed TR findings (`foreign_word` + `abbreviation`, `fix_kind: "advisory"`) never enter the decision set, so they cannot reach this sub-flow under normal parsing. If the user explicitly references an auto-filed finding's id in their decision string (e.g. `T1 konuşalım`), DO NOT enter the konuşalım sub-flow for it and DO NOT re-route it through any other verb. Instead, surface a one-line clarifying message:
+
+```
+T1 is a TR pronunciation finding — auto-filed to the Pronunciation map. To
+revise the pronunciation hint, edit the prompt's pronunciation guide block
+manually.
+```
+
+The other segments in the same decision string continue to parse normally. The auto-filed finding stays in AUTO_FILED_SET; its `auto_filed` log line will be appended in Phase 9.6 as planned. No `discussed` line is written for it, no sub-flow runs.
 
 ## 6 — Session bootstrap shape
 

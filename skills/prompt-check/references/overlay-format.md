@@ -94,6 +94,11 @@ def render_overlay_body(current, suggested):
 - **Sort:** entries are ordered by **severity descending** (`high` → `medium` → `low`), then by **lens group** in the fixed order (`conflict`, `dominance`, `gap`, `drift`, `tr_phonetic`), then by **line ascending** within each (severity, lens) bucket. Within a (severity, lens, line) tie, order by finding id (`C1 < D1 < G1 < T1`). This matches the sort applied to `findings.json.findings[]` and to `report.md`.
 - **Subset:** only findings where `status == "overlay"` or `status == "overlay (revised)"` appear here. `applied` and `dismissed` findings DO NOT appear in the overlay file — they live only in `decisions.jsonl`.
 - **Pending findings DO NOT appear either.** A `pending` finding (one the user left without a decision at session end) is surfaced via `/prompt-check-resume`, not this file.
+
+**Excluded from per-finding entries:**
+
+- TR findings with `fix_kind: "advisory"` that were auto-filed (i.e. their most recent `decisions.jsonl` action is `auto_filed`). These appear ONLY in the bottom "Pronunciation map" section. The rationale: auto-filed findings represent background routing, not user decisions; surfacing them as per-finding entries forces the reader to scan past noise the user never asked about. The per-finding section is reserved for findings the user explicitly chose to overlay (action: `overlay`) or revised (action: `revised`).
+- Backward compatibility: for sessions produced before the `auto_filed` action existed, treat any TR finding with `lens == "tr_phonetic"` AND `fix_kind == "advisory"` AND `status == "overlay"` as auto-filed for rendering purposes (per-finding entry skip), even when its decisions.jsonl history lacks an `auto_filed` line. This preserves the new UX behaviour when resuming legacy runs.
 - **Idempotent rewrite, not append.** Phase 10 rebuilds the whole file from the current state of `session.json`. Re-running Phase 10 against the same `session.json` produces byte-identical output (modulo the `Generated:` timestamp). Never `>>` append to this file.
 - **Empty state:** if no findings have overlay status, write the header section only — title, four metadata bullets, the `## Findings with overlay status` heading, and nothing under it. No error, no placeholder text.
 - **Backticks inside excerpts:** if `current_excerpt` or `suggested_fix` contains a backtick, swap the surrounding `` ` `` for `` `` `` (pair of backticks) so markdown renders correctly.
@@ -165,11 +170,13 @@ The `action` field has exactly these values:
 | `discussed` | User entered the `konuşalım` sub-flow for this finding. No file is touched yet — this entry just marks that the conversation started. | — | — |
 | `revised` | During `konuşalım` the user changed the suggested text. | `from` (original `suggested_fix`), `to` (user's revised text) | — |
 | `routed_to_overlay` | TR routing rule fired (or stale-audit guard converted an applied to an overlay). | `reason` (e.g. `"TR phonetic findings never modify the prompt file"`) | — |
+| `auto_filed` | TR pronunciation finding (foreign_word / abbreviation) routed to overlay without user interaction. Logged once per such finding in Phase 9.6. The session.json status is `"overlay"` (same as a user overlay decision); the distinction lives in this action field. | `reason`, `fix_kind` (always `"advisory"`), `kind` (`"foreign_word"` or `"abbreviation"`) | — |
 | `reverted` | Undoes a prior entry. The original entry is **never deleted**; the reversion is its own line. | `reverts` (the `ts` of the entry being undone) | `reason` |
 
 **Sequencing rules:**
 - A `revised` line is always followed by another line — either `applied` or `overlay` — that records the final destination of the revised text.
 - A `routed_to_overlay` line is always followed (in the same Phase 10 pass) by an `overlay` line that records the actual write to `inline-suggestions.md`.
+- An `auto_filed` line stands alone — it is NOT followed by an `overlay` line. The auto-file action conceptually collapses the routing + overlay write into a single audit entry, since the user never made an explicit overlay decision. `session.json.findings_state[<id>].status` is still `"overlay"`, mirroring a user-initiated overlay.
 - A `discussed` line MAY or MAY NOT be followed by `revised` / `applied` / `overlay` / `dismissed`. If a session ends mid-discussion, the finding stays `pending` and `/prompt-check-resume` picks it back up.
 
 ### Example lines
@@ -183,6 +190,7 @@ The `action` field has exactly these values:
 {"ts":"2026-05-27T10:17:20.330Z","finding":"C3","lens":"conflict","action":"overlay","note":"discussed result"}
 {"ts":"2026-05-27T10:18:00.117Z","finding":"T1","lens":"tr_phonetic","action":"routed_to_overlay","reason":"TR phonetic findings never modify the prompt file"}
 {"ts":"2026-05-27T10:18:00.245Z","finding":"T1","lens":"tr_phonetic","action":"overlay"}
+{"ts":"2026-05-27T18:24:39.821Z","finding":"T1","lens":"tr_phonetic","action":"auto_filed","reason":"TR advisory finding — pronunciation hints are filed to inline-suggestions.md without user decision","fix_kind":"advisory","kind":"foreign_word"}
 ```
 
 ### Reading the log
@@ -203,6 +211,8 @@ Common one-liners:
 | `inline-suggestions.md` | Human-readable view of the OVERLAY subset of `session.json`. | Rewritten on every Phase 10 pass (idempotent). | Doc humans actually read. |
 
 If `session.json` is lost or corrupted, `decisions.jsonl` can rebuild it deterministically: replay each line, applying the action to the in-memory state, and the final state matches what `session.json` should hold. The skill MAY use this as a recovery path; it is not required in the normal flow.
+
+**`auto_filed` and user-`overlay` collapse to the same session status.** Both the `auto_filed` action (Phase 9.6 background routing for TR advisory findings) and the user-initiated `overlay` action result in `session.json.findings_state[<id>].status: "overlay"`. The distinction is purely audit-trail (decisions.jsonl). For replay purposes, the FIRST action ever logged for a TR advisory finding determines whether it was auto-filed or user-routed — replay the log line by line and the first `auto_filed` / `overlay` entry per finding sets the origin. This origin is preserved in `decisions.jsonl` even when `session.json` is rebuilt from scratch.
 
 ## 4. Phase 10 ordering when both `apply` and `overlay` decisions land in the same pass
 
