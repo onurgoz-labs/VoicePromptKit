@@ -121,6 +121,99 @@ The section index is built deterministically in Phase 3 of the audit (no LLM cos
 
 All six lenses live in `skills/prompt-check/SKILL.md` and its `references/`.
 
+## Two more skills — `/prompt-chat` + `/prompt-test`
+
+Voice agent developers test prompts by **calling the bot**: trigger Vapi, listen to a turn, hang up, edit the prompt, call again. Slow (each test is a real call), expensive (per-minute Vapi billing), manual, and the lessons learned in one iteration are lost on the next.
+
+PromptChecker adds two skills that move that loop into text:
+
+- `/prompt-chat <prompt>` — opens an interactive text simulator. The prompt acts as the simulated system prompt for a `chat-simulator` subagent; you converse with the persona turn by turn. In-chat slash commands let you save interesting turns as test anchors.
+- `/prompt-test <prompt>` — runs the saved anchors as regression tests. Each anchor becomes one scenario for the existing `drift-runner` (in `regression_only: true` mode), and you get a pass/fail table — one row per anchor.
+
+They share one contract: `frontmatter.anchors[]`. `/prompt-chat` writes anchors via `/commit`; `/prompt-test` reads them. The two skills never need to talk to each other directly.
+
+### `/prompt-chat` — converse, save, commit
+
+```
+/prompt-chat path/to/prompt.md
+```
+
+Phase 0 sets up `.promptcheck/<basename>/chat-NNN/`. Phase 1 asks how to isolate the chat session — new window (`osascript` on macOS, `tmux` or `gnome-terminal` on Linux), in-session (the skill enters its own loop in the main session), or setup-only (you open a new window manually). Then the welcome screen, then the chat loop.
+
+Every user message dispatches the `chat-simulator` subagent, which produces one assistant turn faithful to the prompt's persona. The output goes into `chat.jsonl` (append-only, atomic per turn). Slash commands while you chat:
+
+| Command | Action |
+|---|---|
+| `/save` | Capture the last user→assistant turn as an anchor. Four AskUserQuestion prompts collect `expect_contains`, `expect_not_contains`, `rubric`, and (when prior turns exist) whether to attach the prior conversation as `context`. Staged in `saved_anchors.json`, not yet on disk. |
+| `/history` | Pretty-print the conversation so far. |
+| `/reset` | Move `chat.jsonl` aside and start fresh. `saved_anchors.json` is untouched. |
+| `/commit` | Atomic-write the staged anchors into the prompt's `frontmatter.anchors[]`. Validation runs post-write; rollback on YAML parse fail. Archived to `committed-<UTC>.json`. |
+| `/quit` | Final summary. Offers to commit any uncommitted staged anchors before exit. |
+
+### `/prompt-test` — replay anchors, report pass/fail
+
+```
+/prompt-test path/to/prompt.md
+```
+
+Reads `frontmatter.anchors[]`, dispatches `drift-runner` with `regression_only: true`. The runner skips every probe template except regression, ignores `expand_count`, accepts null static-lens inputs. Each anchor becomes one scenario; `anchor.context` (when present) is replayed as conversation history before the `anchor.input` is sent as the next user turn (this closes the state-machine gap in single-turn anchors).
+
+Output goes to `.promptcheck/<basename>/test-NNN/drift.json`. The skill renders a markdown table:
+
+```
+PromptChecker test — test-001
+
+| id | input (kısa) | geçti | puan | sebepler |
+|---|---|---|---|---|
+| S1 | Merhaba | ✅ | 1.00 | mekanik contains 'Merve' geçti; ... |
+| S2 | Evet müsaitim, dinliyorum | ✅ | 1.00 | mekanik contains 'e-Devlet' geçti; ... |
+| S3 | İptal etmek istiyorum | ❌ | 0.50 | mekanik not_contains 'tekrar bağlanacağım' kaldı |
+
+Toplam: 3 anchor, 2 geçti, 1 kaldı.
+```
+
+If any anchor fails, the skill offers a follow-up: see verdict details, investigate the failing turn in `/prompt-chat`, audit with `/prompt-check`, or close. Commands are printed but not auto-dispatched — you run them yourself.
+
+### Anchor schema
+
+```yaml
+anchors:
+  # Single-turn anchor (no prior context — fresh conversation)
+  - input: "Merhaba"
+    expect_contains: ["Merve", "Millenicom"]
+    expect_not_contains: ["tekrar bağlanacağım"]
+    rubric: "Bot kendi kimliğini ve çağrı amacını belirtmeli"
+
+  # Anchor with prior context — drift-runner replays context, then sends input as next user turn
+  - input: "İptal etmek istiyorum"
+    context:
+      - role: assistant
+        content: "Merhaba, ben Millenicom dijital asistanı Merve..."
+      - role: user
+        content: "Tamam dinliyorum"
+      - role: assistant
+        content: "Şu an e-Devlet onayınız bekleniyor..."
+    expect_not_contains: ["tekrar bağlanacağım"]
+    rubric: "Bot iptal isteğini doğru ele almalı — handoff yapmamalı"
+```
+
+Existing single-turn anchors keep working unchanged. `context` is optional and additive. Multi-turn anchors (a whole scripted conversation with assertions at every step) are not part of v0.5.0 — single user turn + optional prior context covers the most common voice-agent state-machine tests.
+
+### Workflow loop
+
+```
+1. /prompt-chat your-prompt.md
+2. Converse with the persona until something interesting happens.
+3. /save — stage that turn as an anchor.
+4. (repeat 2-3 for more scenarios)
+5. /commit — write staged anchors to frontmatter.anchors[].
+6. Edit the prompt body.
+7. /prompt-test your-prompt.md — does the persona still behave?
+8. If anchors fail, /prompt-chat again to investigate, OR /prompt-check to audit for new conflicts.
+```
+
+The bridge is `frontmatter.anchors[]`. Stay on text, iterate fast, only call Vapi when you're confident.
+
 ## Output layout
 
 Every run gets its own directory. Older runs are preserved so you can diff audits across prompt edits.
