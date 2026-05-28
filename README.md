@@ -21,15 +21,17 @@ The plugin auto-loads in every Claude Code session after that. No API keys, no S
 /prompt-check path/to/your/prompt.md
 ```
 
-PromptChecker opens an interactive session. First it asks which lenses you want to apply (multi-select: conflict, dominance, gap, drift, TR phonetic — pre-checked based on your repo defaults). For `drift`, it asks `expand_count`. Then it dispatches the selected lenses as parallel subagents and shows you a single summary table:
+PromptChecker opens an interactive session. First it asks which lenses you want to apply (multi-select: conflict, dominance, gap, drift, TR phonetic — pre-checked based on your repo defaults). For `drift`, it asks `expand_count`. Then it dispatches the selected lenses as parallel subagents. After parallel lens dispatch completes, you see a summary table:
 
-| id | lens | sev | section | line | summary |
+| id | mercek | önem | bölüm / satır | açıklama | düzeltme |
 |---|---|---|---|---|---|
-| C1 | conflict | high | 7.2 | 284 | Tone contradiction (R3↔R2) → **Maintain a professional but warm register.** |
-| S1 | schema | high | 7 | 280 | Section 5 → 7: Section 6 missing → **Insert Section 6 — Placeholder, OR renumber.** |
-| ...
+| C2 | çelişki | yüksek | Bölüm 5 / Satır 326 | R78 ile R80 sms_retry_count değerleri çelişiyor | R80'i max=1 yap VEYA R78'i max=2 yap |
+| G5 | boşluk | orta | Bölüm 0.1 / Satır 7 | R4 "step instructions require it" tanımsız | R4'ü "verbatim scripts muaftır" diye netleştir |
+| drift-S1 | davranışsal sapma | düşük | — / — | regression senaryosu geçti (0.93) | (geçti — düzeltme yok) |
 
-The `summary` column combines short_rationale + short_fix in one line for fast scanning. The full text is in findings.json — Phase 10's konuşalım sub-flow shows it unabridged.
+Set `report_language: "en"` in `.promptchecker.json` for English columns (`lens | sev | section / line | rationale | fix`).
+
+The table is the primary output — both in `report.md` and Phase 9. Runners write rationale + fix directly in your chosen language (≤200 chars rationale, ≤150 chars fix — compact by design). No truncation; what you see is what the lens wrote.
 
 Then it asks: **"Hangilerini ne yapayım?"** You answer free-form:
 
@@ -338,7 +340,7 @@ Phase 9 and Phase 10 are the interactive layer — they run automatically after 
    - `tr-phonetic-runner` × 1 (conditional on user_intent.tr_phonetic_enabled)
    The skill awaits all five before proceeding. Schema lens auto-skips on flat prompts with no numbered headings.
 6. **Phase 5 — Drift (downstream of static lenses).** Triggered as soon as conflicts.json + gaps.json + dominances.json land. Runs in parallel with schema and tr-phonetic if those are still working. Conditional: skipped when expand_count == 0 or no anchors/conflicts/role-overrides.
-7. **Phase 7 — Render.** Awaits all six lens outputs. Builds findings.json + report.md (line numbers translated back to the original prompt file; `prompt_sha256` carried through). Each finding renders as ONE LINE in report.md / inline-suggestions.md / Phase 9 summary table: `**Section 7.2 — L284** [C1 conflict, high] — short rationale → **short fix**`. The full rationale + suggested_fix stay verbatim in findings.json — truncation is render-only.
+7. **Phase 7 — Render.** Awaits all six lens outputs. Builds findings.json + report.md (line numbers translated back to the original prompt file; `prompt_sha256` carried through). Phase 7 renders findings as a markdown TABLE with columns `id | mercek | önem | bölüm / satır | açıklama | düzeltme` (TR) or `id | lens | sev | section / line | rationale | fix` (EN). Runners self-cap rationale at ≤200 chars and fix at ≤150 chars — render uses full text verbatim, no truncation.
 8. **Phase 8** — Update `latest` symlink (commit point), print terminal summary.
 9. **Phase 9** — Render summary table from `findings.json`. Bootstrap `session.json` (all findings start `pending`). Accept free-form decision string from the user, parse it, apply TR routing rule, append each decision to `decisions.jsonl`.
 10. **Phase 10** — Process decisions: dismissed (log only), overlay (rebuild `inline-suggestions.md`), applied (SHA256-guarded prompt edits, with auto-conversion to overlay on stale audit or ambiguous occurrences), discussed (per-finding sub-dialogue with accept / revise / overlay / dismiss). Re-render `session.json` snapshot. Print Phase 10 summary. Phase 10's konuşalım sub-flow (per-finding deep dialogue) MANDATES `AskUserQuestion` for the four-option choice (kabul / revize / overlay / atla). Free-text follow-ups (revised suggestion text) use plain conversational input — that's intentional. The four-option choice itself is always AskUserQuestion.

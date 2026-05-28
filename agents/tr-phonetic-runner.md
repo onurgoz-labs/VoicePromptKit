@@ -21,11 +21,14 @@ Your user message is a JSON object split into **read-only inputs** and a single 
     "user_intent_tr_phonetic": true,
     "compact_mode":           false,
     "max_char_limit":         50000,
-    "section_index":          "<$RUN_DIR/section_index.json>"
+    "section_index":          "<$RUN_DIR/section_index.json>",
+    "report_language":        "tr"
   },
   "output_path":              "<$RUN_DIR/tr_phonetic.json>"
 }
 ```
+
+`report_language` is the user's chosen output language. Every `rationale` and `pronunciation_entry.note` field you emit MUST be written in this language. `suggested_fix` (for `number_readability` + `punctuation` findings) also follows `report_language`. When absent/null, fall back to `en` and warn.
 
 Read every file under `inputs` exactly once. **Never read `output_path`** — it does not exist yet and reading it would burn a tool call. Write to `output_path` only at the end of Step 3.
 
@@ -184,11 +187,16 @@ When `compact_mode == true`, emit a top-level `compact_mode: true` field in the 
 
 When the finding's `line` has no section context (it falls outside every numbered range, or `section_index.applicable == false`), emit explicit `section_ref: null` (not absent).
 
-Use pretty JSON (2-space indent). After writing, return a one-line status to the skill:
+Use pretty JSON (2-space indent). After writing, return a one-line status to the skill, in the user's `report_language`:
 
-```
-tr phonetic complete: <N> findings, <S> seed entries
-```
+- TR mode (`report_language == "tr"`):
+  ```
+  türkçe fonetik tamam: <N> bulgu, <S> mevcut kayıt
+  ```
+- EN mode (`report_language == "en"` or default fallback):
+  ```
+  tr phonetic complete: <N> findings, <S> seed entries
+  ```
 
 (Compact mode is not surfaced in the status line since no behaviour changed.) Nothing else.
 
@@ -217,6 +225,29 @@ If `section_index.json` is missing, default to `section_ref: null` on every find
 
 Self-correction: if you find yourself emitting a finding WITHOUT `section_ref` (absent field, not explicit null), that's a runner error — re-emit with explicit `section_ref: null`.
 
+## Compact writing (mandatory)
+
+Every emitted `rationale` / `suggested_fix` / `pronunciation_entry.note` field MUST be compact:
+
+- **rationale:** ≤ 200 characters. ONE sentence, no preamble. Direct identification of the issue.
+- **suggested_fix** (when populated): ≤ 150 characters. Imperative action.
+- **pronunciation_entry.note:** ≤ 200 characters. Compact context for the term (why TR TTS struggles, intended reading).
+
+Examples in TR mode:
+
+✅ rationale (number_readability, 92 chars):
+   "'100 TL' rakamla yazılı; TTS dijital okuyor — sözlü cümlede 'yüz lira' formatı tercih edilmeli."
+
+✅ suggested_fix (punctuation, 78 chars):
+   "Sebebiyle'den sonra virgül ekle: 'Kurban Bayramı tatili sebebiyle, yirmi altı...'"
+
+✅ pronunciation_entry.note for Gaggia (148 chars TR):
+   "İtalyan marka. TR TTS 'Gaggia'yı harf-harf 'gag-gia' okuyabilir; doğru telaffuz 'gacca' (gg+i → /dʒː/). 'Milano' doğal okunur."
+
+EN equivalents stay under the same caps.
+
+Self-correction: > 200 chars rationale OR > 150 chars fix is a runner error. Simplify or split.
+
 ## Failure modes
 
 - If any required input file is missing or unreadable, write `{"findings":[], "seed_entries":[], "warnings":["could not read <path>"]}` to `output_path` and return.
@@ -224,4 +255,5 @@ Self-correction: if you find yourself emitting a finding WITHOUT `section_ref` (
 - If `inputs.user_intent_tr_phonetic` is absent or null (legacy callers): fall back to `frontmatter.tr_phonetic`. If THAT is also false, write `{"findings":[], "seed_entries":[], "warnings":["tr_phonetic disabled in frontmatter (no per-run override)"]}` to `output_path` and return. The skill normally only dispatches you when the user kept TR enabled, so this guard is purely defensive.
 - If `body.txt` parses to zero non-skipped lines, write `{"findings":[], "seed_entries":[<any seeds>], "warnings":["body has no scannable lines"]}` and return.
 - If `section_index.json` is missing or unreadable, emit `section_ref: null` on every finding plus a warning `"section_index missing — section_ref defaulted to null for every finding"` in the output's `warnings` array. Don't abort the audit — TR findings remain valid without section context.
+- If `inputs.report_language` is absent/null/unrecognized, default to `en` and warn in `warnings[]`: 'report_language defaulted to en — caller did not specify'.
 - Never crash silently — every early exit must leave a valid JSON payload at `output_path` so the skill can finish Phase 7.
