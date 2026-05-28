@@ -346,59 +346,86 @@ When `section_ref` is null:
 
 Section title is NOT included in the inline header (would make the line too long); it appears once in the section-level summary at the top of report.md / inline-suggestions.md.
 
-## Render contract — compact one-line summary
+## Render contract — table format + compact writing
 
-Every finding emitted by every lens — conflict, dominance, gap, schema,
-drift, tr_phonetic — is rendered downstream as a ONE-LINE summary in
-report.md, inline-suggestions.md, and Phase 9's summary table. Lens
-runners produce the full rationale + suggested_fix; the render layer
-truncates for display.
+Every finding emitted by every lens (conflict, dominance, gap, schema, drift, tr_phonetic) is rendered downstream as a row in a markdown TABLE. Phase 7 of the skill produces `report.md` with one table per severity bucket (or one combined table sorted by severity); the same table format appears in Phase 9's summary view shown to the user.
 
-### Truncation algorithm (deterministic, applied by Phase 7)
+### Table columns
 
-For `short_rationale`:
-1. Split the rationale on sentence boundaries (`. ` / `! ` / `? `).
-2. Take the first sentence.
-3. If length ≤ 120 chars: use as-is.
-4. If length > 120: truncate to 117 chars + `...`.
+| Language | id | lens | severity | section/line | rationale | fix |
+|---|---|---|---|---|---|---|
+| TR | `id` | `mercek` | `önem` | `bölüm / satır` | `açıklama` | `düzeltme` |
+| EN | `id` | `lens` | `sev` | `section / line` | `rationale` | `fix` |
 
-For `short_fix`:
-1. For substring fix_strategy: take the full suggested_fix if ≤ 100 chars,
-   else truncate to 97 + `...`.
-2. For structural fix_strategy: extract the first imperative sentence
-   (Rewrite / Add / Move / Remove / Reword / Replace ...). If the
-   imperative + first object is ≤ 100 chars, use it; else truncate.
-3. For TODO sentinel (`TODO: ...`): use the TODO text verbatim (max 100 chars).
-4. For Intentional sentinel: render as `Intentional — dismiss this finding`.
+### Column content rules
 
-### Lens runner responsibilities
+- **id**: finding id verbatim (`C1`, `D3`, `G2`, `S1`, `T1`, `drift-S1`).
+- **lens / mercek**: translated lens name. Lookup table:
 
-Lens runners produce ONLY the full unabridged fields. They do NOT
-pre-truncate, pre-summarize, or generate "short" variants. Render-side
-truncation is the render layer's job (Phase 7).
+  | English | Türkçe |
+  |---|---|
+  | conflict | çelişki |
+  | dominance | baskınlık |
+  | gap | boşluk |
+  | schema | şema |
+  | drift | davranışsal sapma |
+  | tr phonetic | türkçe fonetik |
 
-This separation lets the same findings.json drive multiple output
-formats: compact one-line summary for humans, full structured payload
-for tools that consume findings.json directly (LSP plugins, CI gates,
-external dashboards).
+- **severity / önem**: translated severity. Lookup table:
 
-### Severity / lens / line-marker rendering
+  | English | Türkçe |
+  |---|---|
+  | high | yüksek |
+  | medium | orta |
+  | low | düşük |
 
-The render layer translates severity and lens names per `report_language`:
-- TR: yüksek / orta / düşük (severity); çelişki / baskınlık / boşluk / şema / davranışsal sapma / türkçe fonetik (lens).
-- EN: high / medium / low; conflict / dominance / gap / schema / drift / tr phonetic.
+  For drift findings, severity is inferred from the verdict score: `score ≤ 0.5` → high, `score ≤ 0.75` → medium, else low.
 
-Section marker uses `section_ref`:
-- subsection set: `Section 7.2 — L284` / `Bölüm 7.2 / Satır 284`
-- section only: `Section 7 — L284` / `Bölüm 7 / Satır 284`
-- null: `L284` / `Satır 284`
+- **section/line**: composite cell derived from `section_ref` + `line`:
 
-### Final rendered finding (canonical example)
+  | section_ref state | line state | TR render | EN render |
+  |---|---|---|---|
+  | subsection set | line set | `Bölüm 7.2 / Satır 284` | `Section 7.2 / L284` |
+  | section only | line set | `Bölüm 7 / Satır 284` | `Section 7 / L284` |
+  | null | line set | `— / Satır 284` | `— / L284` |
+  | null | null (drift only) | `— / —` | `— / —` |
 
-TR mode:
-> - **Bölüm 7.2 / Satır 284** [C1 çelişki, yüksek] — Tonla ilgili çelişki (R3↔R2): "always formal" ile "casual ve friendly" birlikte uygulanabilir değil → **Maintain a professional but warm register.**
+- **rationale / açıklama**: the runner-emitted `rationale` field verbatim — NO TRUNCATION. Runners self-cap at ≤200 chars per the compact writing invariant; render uses full text. Multi-sentence rationales are rare (compact writing prefers one sentence) but acceptable when needed.
 
-EN mode:
-> - **Section 7.2 — L284** [C1 conflict, high] — Tone contradiction (R3↔R2): "always formal" and "casual and friendly" cannot coexist → **Maintain a professional but warm register.**
+- **fix / düzeltme**: the runner-emitted `suggested_fix` field. Renders directly. Sentinel suggestions:
+  - `TODO: <text>` → renders as italic `_TODO: <text>_`
+  - `Intentional — dismiss this finding` → renders as italic `_Intentional — atla_` (TR) / `_Intentional — dismiss_` (EN)
+  - Drift findings with no fix: `(geçti — düzeltme yok)` (TR) / `(passed — no fix)` (EN)
+  - Empty/null fix for other lenses: `_(see rationale)_` / `_(bkz. açıklama)_`
 
-The `**...**` bold wraps the section marker AND the suggested fix to anchor visual scanning. The `→` separator marks the transition from "what's wrong" to "what to do".
+### Sort order (unchanged from v0.4.9)
+
+Severity descending (high → medium → low) → lens group → line ascending. Tied (same severity, same lens, same line): order by finding id.
+
+### Compact writing — runner-side invariant (also documented per-lens-runner)
+
+Every runner MUST write `rationale` ≤ 200 characters and `suggested_fix` ≤ 150 characters. One sentence preferred. No preamble ("This finding indicates..."). Direct identification + reason + actionable fix.
+
+The render layer assumes runners obey this invariant. If a runner emits oversized text, the render still uses it verbatim (no truncation) but the report becomes ugly — runners are responsible for the contract.
+
+### No truncation in render
+
+v0.4.9 had `≤120 chars rationale, ≤100 chars fix` truncation at the render layer with ellipsis. v0.4.10 REMOVES this. The new contract: runner self-caps; render uses full text. Truncation cut sentences mid-clause and made reports unreadable; pushing the constraint to the runner ensures the output is meaningful within the limit.
+
+### Canonical example — TR
+
+```markdown
+| id | mercek | önem | bölüm / satır | açıklama | düzeltme |
+|---|---|---|---|---|---|
+| C2 | çelişki | yüksek | Bölüm 5 / Satır 326 | R78 sms_retry_count max=1 ile R80 max=2 çelişiyor; aynı sayaç iki değer alamaz. | R80'i (satır 590) max=1 yap VEYA R78'i max=2 yap — tek değerde birleştir. |
+| G5 | boşluk | orta | Bölüm 0.1 / Satır 7 | R4 "step instructions require it" tanımsız; hangi step'lerin 35 kelimeye gittiği belirsiz. | R4'ü "Verbatim mandatory scripts muaftır, kısa tutulamaz" diye netleştir. |
+| drift-S1 | davranışsal sapma | düşük | — / — | regression senaryosu geçti (0.93). | (geçti — düzeltme yok) |
+```
+
+### Canonical example — EN
+
+```markdown
+| id | lens | sev | section / line | rationale | fix |
+|---|---|---|---|---|---|
+| C2 | conflict | high | Section 5 / L326 | R78 sets sms_retry_count max=1 but R80 says max=2; same counter cannot be both. | Change R80 (line 590) to max=1 OR R78 to max=2 — pick one canonical value. |
+```
