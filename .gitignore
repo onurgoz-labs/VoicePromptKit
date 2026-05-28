@@ -13,7 +13,8 @@ Thumbs.db
 !.vscode/settings.json
 !.vscode/extensions.json
 
-# Plugin output
+# Plugin output — per-run dirs (.promptcheck/<prompt>/run-NNN/) and the
+# content-addressable cache (.promptcheck/_cache/<key>/{lens}.json).
 .promptcheck/
 
 # Notes worktree

@@ -515,6 +515,7 @@ Ask the user via `AskUserQuestion`:
 
 2. **If `drift` is included in the selection:** ask an integer follow-up for `expand_count`. Default = `frontmatter.expand_count` (which already merges per-prompt → env → project → 3). Range 0–20. If the user picks 0, drift is effectively disabled even though the lens was selected — Phase 5's existing `expand_count == 0` kill switch handles this.
 3. **If `tr_phonetic` is included AND `frontmatter.tr_phonetic` was `false`:** ask a yes/no confirmation "Türkçe sesli ajan için TTS denetimi yapılsın mı?". If the user says no, drop `tr_phonetic` from the selection.
+4. **If `drift` is included AND a prior cache entry exists for this prompt+config (`$CACHE_DIR/drift.json` is present):** ask a yes/no follow-up "Önceki drift çıktısını yeniden kullanayım mı? (LLM nondeterministic — varsayılan: hayır)". Default = `no`. Surface the cache existence detection in the prompt body so the user knows the offer is genuine, not speculative. Skip this question when no cached drift exists for the current cache key.
 
 The exact wording and option labels live in `references/dialog-flow.md`. Refer to that file for the prompt strings — do not inline copy them here.
 
@@ -526,11 +527,18 @@ Persist the answer in memory as `user_intent`:
   "expand_count": 3,
   "anchors": [],
   "tr_phonetic_enabled": true,
+  "drift_reuse": false,
   "asked_at": "<ISO 8601 UTC>"
 }
 ```
 
 `anchors` is copied verbatim from `frontmatter.anchors` (no per-run question for anchors; they live in frontmatter only).
+
+`drift_reuse` is the runtime authoritative flag for reusing cached drift output (see Phase 5's drift cache opt-in). Default `false` — drift always re-runs unless the user explicitly opts in. The Phase 3.5 follow-up #4 above only asks when `$CACHE_DIR/drift.json` already exists for this prompt's cache key; otherwise the field defaults silently to `false`.
+
+**Persist `user_intent.json` to disk** at the end of Phase 3.5, before Phase 3.6 runs. Phase 3.6 reads the file to hash the runtime selection into the cache key; Phase 9 reads it again when bootstrapping `session.json`. One write, two readers.
+
+After collecting all wizard answers, write the in-memory `user_intent` block to `$RUN_DIR/user_intent.json` using the Write tool (or a heredoc'd JSON). The file is pretty-printed (2-space indent), atomic write (write to `.user_intent.json.tmp` then `mv`). The skill MUST produce the file before Phase 3.6's Python block runs — Phase 3.6 reads it for cache-key composition. If the file is missing at Phase 3.6 entry, Phase 3.6 substitutes an empty `user_intent_keys` set into the cache key (degraded mode — cache effectively disabled for this run; subsequent runs that DO write the file get full cache benefits).
 
 `tr_phonetic_enabled` is the **runtime authoritative** value for whether to run the TR phonetic lens this pass — computed as `("tr_phonetic" in selected_lenses)` after the wizard answers + Phase 3.5 confirmation. Frontmatter's `tr_phonetic` is only the **default** that pre-selects the checkbox; once the user has answered, `user_intent.tr_phonetic_enabled` overrides it for this run.
 
@@ -547,6 +555,116 @@ Phase 7 already handles missing per-lens JSON files as "lens disabled" — no ch
 ```bash
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_5_end" >> "$TIMING_LOG"
 ```
+
+## Phase 3.6 — Cache key compute (skip when bodies + config + refs are unchanged)
+
+Same prompt body + same wizard config + same reference docs ⇒ same lens output. This phase computes a content-addressable cache key that lets Phase 4 / 5 / 6 reuse prior `{lens}.json` artefacts instead of re-dispatching runners.
+
+**Cache scope:** four static lenses + tr_phonetic are cached unconditionally. Drift is cached but reused ONLY when `user_intent.drift_reuse == true` (LLM-nondeterministic; default off).
+
+**Cache directory:** `.promptcheck/_cache/<cache_key>/{lens}.json`. Repo-scoped (under `$REPO_ROOT`), not run-scoped. Run dirs (`run-NNN`) keep their full artefacts — cache hits copy from `_cache/` into `$RUN_DIR/` so the run dir remains self-contained.
+
+```bash
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_6_start" >> "$TIMING_LOG"
+
+CACHE_ROOT="$REPO_ROOT/.promptcheck/_cache"
+mkdir -p "$CACHE_ROOT"
+
+# Inputs to the cache key — change any one and the key changes, forcing a miss.
+# Resolved frontmatter (config_warnings excluded — warnings don't affect lens output).
+python3 - "$RUN_DIR" "$REPO_ROOT" "$CACHE_ROOT" <<'PY'
+import sys, os, json, hashlib, pathlib
+
+run_dir, repo_root, cache_root = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def sha256_file(path):
+    try:
+        return hashlib.sha256(open(path, 'rb').read()).hexdigest()
+    except (FileNotFoundError, IsADirectoryError):
+        return "missing"
+
+def sha256_bytes(data):
+    return hashlib.sha256(data if isinstance(data, bytes) else data.encode('utf-8')).hexdigest()
+
+# 1. Body hash (post-frontmatter strip).
+body_sha = sha256_file(os.path.join(run_dir, 'body.txt'))
+
+# 2. Resolved frontmatter (deterministic JSON; drop volatile keys).
+fm = json.load(open(os.path.join(run_dir, 'frontmatter.json'), encoding='utf-8'))
+fm_for_cache = {k: v for k, v in fm.items() if k not in ('config_warnings', 'prompt_sha256')}
+# prompt_sha256 already encodes body+frontmatter content; we want stable config-only here.
+fm_canonical = json.dumps(fm_for_cache, sort_keys=True, ensure_ascii=False)
+
+# 3. user_intent from Phase 3.5 — pulled by the skill before this block runs and
+#    written to $RUN_DIR/user_intent.json so it can be hashed deterministically.
+ui_path = os.path.join(run_dir, 'user_intent.json')
+if os.path.exists(ui_path):
+    ui = json.load(open(ui_path, encoding='utf-8'))
+    # Drop volatile fields (timestamps, transient flags); keep selection + counts.
+    ui_for_cache = {
+        'selected_lenses': sorted(ui.get('selected_lenses', [])),
+        'expand_count':    ui.get('expand_count'),
+        'tr_phonetic_enabled': ui.get('tr_phonetic_enabled'),
+        'drift_reuse':     ui.get('drift_reuse', False),
+        'anchors':         ui.get('anchors', []),
+    }
+else:
+    ui_for_cache = {}
+ui_canonical = json.dumps(ui_for_cache, sort_keys=True, ensure_ascii=False)
+
+# 4. Reference docs + runner specs — any edit to these invalidates cached lens output.
+ref_files = [
+    'skills/prompt-check/SKILL.md',
+    'skills/prompt-check/references/lens-rules.md',
+    'skills/prompt-check/references/probes.md',
+    'skills/prompt-check/references/tr-phonetic.md',
+    'agents/static-lens-runner.md',
+    'agents/drift-runner.md',
+    'agents/tr-phonetic-runner.md',
+]
+ref_hashes = {f: sha256_file(os.path.join(repo_root, f)) for f in ref_files}
+ref_canonical = json.dumps(ref_hashes, sort_keys=True, ensure_ascii=False)
+
+# 5. Compose the cache key. 16 hex chars is enough collision safety for a repo-local cache.
+parts = [body_sha, fm_canonical, ui_canonical, ref_canonical]
+cache_key = sha256_bytes('\n'.join(parts))[:16]
+
+cache_dir = os.path.join(cache_root, cache_key)
+pathlib.Path(cache_dir).mkdir(parents=True, exist_ok=True)
+
+print(f"CACHE_KEY={cache_key}")
+print(f"CACHE_DIR={cache_dir}")
+# Persist for downstream phases.
+with open(os.path.join(run_dir, 'cache_meta.json'), 'w', encoding='utf-8') as f:
+    json.dump({
+        'cache_key': cache_key,
+        'cache_dir': cache_dir,
+        'inputs': {
+            'body_sha': body_sha,
+            'frontmatter_keys': sorted(fm_for_cache.keys()),
+            'user_intent_keys': sorted(ui_for_cache.keys()),
+            'reference_files': ref_files,
+        }
+    }, f, indent=2, ensure_ascii=False)
+PY
+
+# Source the printed CACHE_KEY / CACHE_DIR for use in Phase 4 / 5 / 6 / 8.
+eval $(python3 -c "import json,os; m=json.load(open('$RUN_DIR/cache_meta.json'));print(f\"CACHE_KEY={m['cache_key']}\\nCACHE_DIR={m['cache_dir']}\")")
+
+[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_6_end (cache_key=$CACHE_KEY)" >> "$TIMING_LOG"
+```
+
+**Persistence contract:** before Phase 3.6 runs, the skill writes `user_intent.json` to `$RUN_DIR` (the in-memory `user_intent` block from Phase 3.5). This file is the deterministic input to the user_intent portion of the cache key. The same file is read by Phase 9 when it bootstraps `session.json`, so the write is reused — no extra IO.
+
+**Cache invariants:**
+
+- Body change ⇒ `body_sha` changes ⇒ miss.
+- Wizard answers change (lens selection, expand_count, drift_reuse, tr_phonetic) ⇒ `ui_canonical` changes ⇒ miss.
+- Frontmatter / `.promptchecker.json` resolved values change (target_model, report_language, compact_mode, etc.) ⇒ `fm_canonical` changes ⇒ miss.
+- Any reference doc or runner spec edited ⇒ `ref_canonical` changes ⇒ miss.
+- SKILL.md itself edited ⇒ included in `ref_canonical` ⇒ miss. No manual version-bump discipline required.
+
+If the cache is corrupt (parse error reading a cached `{lens}.json`), Phase 4 treats it as a miss and dispatches the runner fresh; the corrupt entry is overwritten on Phase 8 cache write.
 
 ## Phases 4 + 6 — Parallel lens dispatch (5 concurrent Agent calls)
 
@@ -569,10 +687,51 @@ If the user deselected some lenses in Phase 3.5, dispatch ONLY the selected
 ones. For each unselected static lens, write the skipped-placeholder JSON
 directly (no Agent call needed for skipped lenses).
 
+**Cache lookup (Phase 3.6 cache key).** Before dispatching any Agent, check
+`$CACHE_DIR/{lens}.json` for each selected lens. On hit, copy the cached
+artefact into `$RUN_DIR/{lens}.json` and exclude that lens from the
+dispatch list — the runner is not invoked. On miss, the lens stays in the
+dispatch list and runs normally. Cache hits also apply to `tr_phonetic` (when
+the lens is selected via `user_intent.tr_phonetic_enabled == true`).
+
 ```bash
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_4_dispatch_start" >> "$TIMING_LOG"
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_6_dispatch_start" >> "$TIMING_LOG"
+
+# Cache lookup: for each selected static lens, copy cached artefact into $RUN_DIR if present.
+# CACHE_DIR is exported by Phase 3.6. SELECTED_LENSES comes from user_intent.selected_lenses.
+for lens_file in conflicts dominances gaps schema tr_phonetic; do
+  # Map artefact filename to user_intent lens label (singular vs plural divergence).
+  case "$lens_file" in
+    conflicts)   lens_label=conflict ;;
+    dominances)  lens_label=dominance ;;
+    gaps)        lens_label=gap ;;
+    schema)      lens_label=schema ;;
+    tr_phonetic) lens_label=tr_phonetic ;;
+  esac
+  if grep -q "\"$lens_label\"" "$RUN_DIR/user_intent.json" 2>/dev/null \
+     && [ -f "$CACHE_DIR/$lens_file.json" ]; then
+    # Validate JSON before trusting the cache entry.
+    if python3 -c "import json; json.load(open('$CACHE_DIR/$lens_file.json'))" 2>/dev/null; then
+      cp "$CACHE_DIR/$lens_file.json" "$RUN_DIR/$lens_file.json"
+      [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] cache_hit: $lens_file" >> "$TIMING_LOG"
+    else
+      [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] cache_corrupt: $lens_file (will re-dispatch)" >> "$TIMING_LOG"
+    fi
+  fi
+done
 ```
+
+**Dispatch filter.** After the cache-lookup block, before emitting Agent
+calls: for each selected static lens, check whether `$RUN_DIR/{lens}.json`
+already exists. If yes (cache hit just copied it), skip that lens's Agent
+call. If no, emit the Agent call as documented below. Same rule applies to
+the tr_phonetic dispatch: if `$RUN_DIR/tr_phonetic.json` exists, skip the
+fifth call.
+
+If every selected lens hits the cache, NO Agent calls are dispatched — Phase
+4 + 6 finish in milliseconds (just the bash lookup loop above). Phase 5
+(drift) gating is evaluated separately; see Phase 5 for its cache rules.
 
 Detection criteria for the four static lenses (conflict, dominance, gap, schema) live in `references/lens-rules.md` — `static-lens-runner` reads that document. The TR phonetic criteria live in `references/tr-phonetic.md` — `tr-phonetic-runner` reads that document. The skill itself does no lens analysis.
 
@@ -706,6 +865,25 @@ In either skip case the file shape is `{"scenarios": [], "runs": [], "verdicts":
 ```bash
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_5_skip" >> "$TIMING_LOG"
 ```
+
+**Drift cache opt-in (Phase 3.6 cache key).** Drift output depends on LLM
+nondeterminism (scenario generation + judging), so cache reuse is OFF by
+default. Reuse fires ONLY when `user_intent.drift_reuse == true` AND
+`$CACHE_DIR/drift.json` exists AND parses as JSON. Otherwise dispatch
+drift-runner fresh.
+
+```bash
+if grep -q '"drift_reuse": *true' "$RUN_DIR/user_intent.json" 2>/dev/null \
+   && [ -f "$CACHE_DIR/drift.json" ] \
+   && python3 -c "import json; json.load(open('$CACHE_DIR/drift.json'))" 2>/dev/null; then
+  cp "$CACHE_DIR/drift.json" "$RUN_DIR/drift.json"
+  [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] cache_hit: drift (opt-in)" >> "$TIMING_LOG"
+  # Skip the drift-runner dispatch below.
+fi
+```
+
+If the cache hit copied `$RUN_DIR/drift.json`, skip the drift-runner Agent
+call. Otherwise dispatch as documented below.
 
 Otherwise dispatch the `drift-runner` subagent (it is the only subagent this skill uses). Pass inputs and the output path as **separate** top-level fields so the subagent does not accidentally read its own future output:
 
@@ -1230,12 +1408,39 @@ Each row is built by `render_finding_row` (see "Table-format finding render" abo
 
 ## Phase 8 — Terminal summary
 
-After all writes succeed, **update the `latest` symlink** so it points at this run (the run is now durable), then print the summary:
+After all writes succeed, **mirror per-lens artefacts into the content-addressable cache, then update the `latest` symlink** so it points at this run (the run is now durable), then print the summary:
 
 ```bash
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_8_start" >> "$TIMING_LOG"
+
+# Cache write: mirror this run's per-lens artefacts into the content-addressable cache.
+# Atomic via temp-then-rename. Idempotent — overwriting an existing entry is fine
+# because the cache_key already encodes every invalidating input.
+if [ -n "$CACHE_DIR" ] && [ -d "$CACHE_DIR" ]; then
+  for lens_file in conflicts dominances gaps schema tr_phonetic drift; do
+    src="$RUN_DIR/$lens_file.json"
+    if [ -f "$src" ]; then
+      # Skip skipped/empty placeholders — only cache real lens outputs.
+      # Heuristic: if the JSON contains "skipped": true, it's a placeholder.
+      if grep -q '"skipped": *true' "$src" 2>/dev/null; then
+        continue
+      fi
+      tmp="$CACHE_DIR/.$lens_file.json.tmp.$$"
+      cp "$src" "$tmp" && mv "$tmp" "$CACHE_DIR/$lens_file.json"
+    fi
+  done
+  [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] cache_write_complete (key=$CACHE_KEY)" >> "$TIMING_LOG"
+fi
+
 ln -sfn "$RUN_NAME" "$PROMPT_DIR/latest"
 ```
+
+**Cache write semantics:**
+
+- Only **real** lens output is cached. Placeholder JSONs (`{"skipped": true, ...}` written when a lens was deselected in the wizard) stay out of the cache — caching them would force a miss on the next run if the user re-selects the lens.
+- Drift IS written to cache even though reuse is opt-in. The cached drift artefact is available next run, but only consumed when `user_intent.drift_reuse == true` (Phase 5 gate).
+- Cache write is best-effort: a failed `cp` does not abort the run. The user still sees a successful audit; only the cache miss on the next run is the cost.
+- The atomic temp-then-rename pattern (`.lens.json.tmp.$$`) prevents partial writes from being read as valid cache entries on a concurrent run.
 
 If `frontmatter.config_warnings[]` is non-empty, include them in the summary so the user notices typos / removed fields.
 

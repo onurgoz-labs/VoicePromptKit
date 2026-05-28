@@ -45,6 +45,21 @@ options:
 
 If `Other` is chosen, follow up with a free-form prompt: `Type an integer 0–20:` and validate. Out-of-range answers re-prompt; do not crash.
 
+**Follow-up — drift cache reuse (conditional).** If `drift` was selected AND a prior cached drift artefact exists for this prompt's cache key (i.e. `$CACHE_DIR/drift.json` is present after Phase 3.6's key compute), offer the cache-reuse option:
+
+```
+question: "Önceki drift çalıştırmasının çıktısını yeniden kullanayım mı? (LLM nondeterministik — varsayılan: hayır)"
+header:   "Drift cache"
+multiSelect: false
+options:
+  - label: "Hayır"  description: "Drift'i sıfırdan çalıştır (önerilen — adversarial senaryolar her zaman taze)"
+  - label: "Evet"   description: "Cached drift bulgularını yeniden kullan (token tasarruf, ama nondeterministic sonuçlar)"
+```
+
+Skip this question when `$CACHE_DIR/drift.json` does not exist — there is nothing to offer. Default = `Hayır`. The answer maps to `user_intent.drift_reuse` (boolean).
+
+Drift is the only lens whose cache reuse is opt-in. Conflict / dominance / gap / schema / tr_phonetic all reuse cached output automatically when the cache key matches — their output is deterministic given the same body + config + reference docs. Drift's `scenarios[]` generation and judge rubric evaluation pass through LLM calls that can produce different outputs on each run, so silent reuse would mask regressions; the question exposes the trade-off explicitly.
+
 **Follow-up — all runs (advisory).** After lens selection, regardless of which lenses were picked:
 
 ```
