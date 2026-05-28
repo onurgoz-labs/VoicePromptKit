@@ -216,14 +216,17 @@ total = len(scenarios)
 passed = sum(1 for v in verdicts.values() if v.get('pass'))
 failed = total - passed
 
-# Table headers per report_language.
+# Table headers per report_language. v0.5.1 gains a `type` column to
+# distinguish single-turn anchors (tek/single) from flow anchors (akış/flow).
 if report_language == 'tr':
-    headers = ['id', 'input (kısa)', 'geçti', 'puan', 'sebepler']
+    headers = ['id', 'tür', 'input / name', 'geçti', 'puan', 'sebepler']
+    type_label = {'regression': 'tek', 'flow_regression': 'akış'}
     title = f"PromptChecker test — {os.path.basename(run_dir)}"
     totals_line = f"Toplam: {total} anchor, {passed} geçti, {failed} kaldı."
     detail_hint = f"Detay: {os.path.basename(run_dir)}/drift.json"
 else:
-    headers = ['id', 'input (short)', 'pass', 'score', 'reasons']
+    headers = ['id', 'type', 'input / name', 'pass', 'score', 'reasons']
+    type_label = {'regression': 'single', 'flow_regression': 'flow'}
     title = f"PromptChecker test — {os.path.basename(run_dir)}"
     totals_line = f"Total: {total} anchors, {passed} passed, {failed} failed."
     detail_hint = f"Details: {os.path.basename(run_dir)}/drift.json"
@@ -232,25 +235,53 @@ def short(s, n=60):
     s = (s or '').replace('\n', ' ').strip()
     return (s[:n] + '…') if len(s) > n else s
 
+def display_label(scenario):
+    """Flow scenarios show their `name` (or the first user_input turn's content)
+    instead of `input`. Single-turn scenarios keep showing `input`."""
+    if scenario.get('kind') == 'flow_regression':
+        name = scenario.get('name')
+        if name:
+            return name
+        # Fallback: first user_input turn's content
+        for turn in scenario.get('turns', []) or []:
+            if turn.get('kind') == 'user_input':
+                return short(turn.get('content', ''))
+        return '(unnamed flow)'
+    return short(scenario.get('input', ''))
+
 print(title)
 print()
 print('| ' + ' | '.join(headers) + ' |')
 print('|' + '|'.join(['---'] * len(headers)) + '|')
 for s in scenarios:
     sid = s.get('id', '?')
-    inp = short(s.get('input', ''))
+    skind = s.get('kind', 'regression')
+    type_col = type_label.get(skind, skind)
+    label = display_label(s)
     v = verdicts.get(sid, {})
     p = '✅' if v.get('pass') else '❌'
     score = f"{v.get('score', 0):.2f}"
     reasons_list = v.get('reasons') or []
     reasons = short('; '.join(reasons_list), 120) if reasons_list else '-'
     # Escape pipes for markdown table.
-    inp = inp.replace('|', '\\|')
+    label = label.replace('|', '\\|')
     reasons = reasons.replace('|', '\\|')
-    print(f"| {sid} | {inp} | {p} | {score} | {reasons} |")
+    print(f"| {sid} | {type_col} | {label} | {p} | {score} | {reasons} |")
 print()
 print(totals_line)
 print(detail_hint)
+
+# Surface anchor source + warnings (v0.5.1).
+anchors_source = fm.get('anchors_source')
+if anchors_source == 'frontmatter':
+    if report_language == 'tr':
+        print()
+        print(f"⚠ Anchor'lar frontmatter'dan okundu — <prompt>.anchors.yaml dosyasına taşımayı düşün.")
+    else:
+        print()
+        print(f"⚠ Anchors read from frontmatter — consider migrating to <prompt>.anchors.yaml.")
+for w in (fm.get('anchor_warnings') or []):
+    print(f"  - {w}")
 PY
 ```
 
