@@ -22,7 +22,8 @@ Your user message is a JSON object split into **read-only inputs** and four **ou
     "selected_lenses": ["conflict", "dominance", "gap", "schema"],
     "compact_mode":    false,
     "max_char_limit":  50000,
-    "section_index":   "<$RUN_DIR/section_index.json>"
+    "section_index":   "<$RUN_DIR/section_index.json>",
+    "report_language": "tr"
   },
   "output_paths": {
     "conflicts":  "<$RUN_DIR/conflicts.json>",
@@ -40,6 +41,8 @@ Read every file under `inputs` exactly once. **Never read any path under `output
 `selected_lenses` is the subset of the four static lenses (`["conflict", "dominance", "gap", "schema"]`) that the user kept enabled in the per-run wizard. Possible values: any non-empty subset. **For backward compatibility, if the input field is absent OR null OR empty, treat it as `["conflict", "dominance", "gap", "schema"]` (all four) — the existing behaviour, now including the schema lens.** See the "Selected-lenses dispatch" section below for the per-lens skip protocol.
 
 `compact_mode` is `true` when the prompt body exceeds `max_char_limit` (as measured in Phase 2 of the skill). When `true`, the runner applies cheaper analysis policies — see the "Compact mode policy" section below. When absent / null / false, the runner runs full-depth analysis (backward compat).
+
+`report_language` is the user's chosen output language for THIS run. Every `rationale`, `suggested_fix`, `reasoning`, `description`, `rubric`, and `pronunciation_entry.note` field you emit MUST be written in this language. When absent/null/unrecognized, fall back to `en` (backward compat) and emit a warning per the Failure modes section.
 
 The `lens_rules_ref` file is the canonical specification for every lens criterion below. Do not internalise those rules from memory — read the document at runtime so the criteria stay in one source of truth.
 
@@ -135,10 +138,16 @@ After applying every selected lens, write each output file as documented above:
 
 Audit every finding's `suggested_fix` per the concrete-fix invariant below. Empty values are runner errors, not lens outputs.
 
-Use pretty JSON (2-space indent) for all four output files. After all four writes succeed, return exactly one line to the skill:
+Use pretty JSON (2-space indent) for all four output files. After all four writes succeed, return exactly one line to the skill. The status line itself follows `inputs.report_language`:
 
+EN (`report_language: "en"` or default):
 ```
 static lenses complete: <C> conflicts, <D> dominances, <G> gaps, <SCH> schema [<S>/4 skipped] (schema applicability: <APPLICABLE | NOT APPLICABLE | SKIPPED>) [compact mode: <ACTIVE | inactive>]
+```
+
+TR (`report_language: "tr"`):
+```
+statik mercekler tamam: <C> çelişki, <D> baskınlık, <G> boşluk, <SCH> şema [<S>/4 atlandı] (şema uygulanabilirliği: <UYGULANABİLİR | UYGULANAMAZ | ATLANDI>) [yoğun mod: <AKTİF | inaktif>]
 ```
 
 When compact mode is active, the status surfaces it so the skill (and any downstream tooling) knows the cheaper policies fired.
@@ -253,8 +262,171 @@ Every output file (conflicts.json, dominances.json, gaps.json, schema.json) gain
 
 When `compact_mode == false`, neither field appears (or both are emitted as `compact_mode: false, compact_policy: []` — consumer-friendly).
 
+## Compact writing (mandatory)
+
+Every emitted `rationale` / `reasoning` / `suggested_fix` / `description` field MUST be compact:
+
+- **rationale / reasoning / description:** ≤ 200 characters. ONE sentence, no preamble. Direct identification of what is wrong + why it matters.
+- **suggested_fix:** ≤ 150 characters. Imperative action: "Rewrite X to Y" / "Add: ..." / "Remove R<n>". For structural fixes with embedded "Suggested: '...'" replacement text, keep the replacement under 50 chars or omit it (point to the line instead).
+- **First sentence rule:** the field IS one sentence. No multi-clause walls. If you can't say it in one sentence under the cap, simplify the finding or split it into multiple findings.
+
+Examples (good vs bad):
+
+BAD (304 chars, English, multi-clause):
+   "R78 declares `sms_retry_count` default 0, max 1 (line 326). R80 declares STATE 15 'Max retries: 2 (for SMS resend)' (line 590). The same SMS-resend counter cannot have both a max of 1 and a max of 2 — runtime behavior will diverge depending on which rule the agent honours."
+
+GOOD TR (158 chars):
+   "R78 sms_retry_count max=1 (satır 326) ile R80 'Max retries: 2' (satır 590) çelişiyor; aynı sayaç hem 1 hem 2 olamaz."
+
+GOOD EN (155 chars):
+   "R78 sets sms_retry_count max=1 (line 326) but R80 says 'Max retries: 2' (line 590); the same counter can't be both."
+
+BAD suggested_fix (273 chars):
+   "Reconcile by rewriting R80 (line 590) to 'Max retries: 1 (for SMS resend; matches sms_retry_count cap in State Variables table)' OR raise R78 (line 326) to 'Max: 2' — pick one canonical value across both locations."
+
+GOOD suggested_fix TR (132 chars):
+   "R80'i (satır 590) 'Max retries: 1' yap VEYA R78'i (satır 326) 'Max: 2' yap — tek değerde birleştir."
+
+GOOD suggested_fix EN (124 chars):
+   "Change R80 (line 590) to 'Max retries: 1' OR raise R78 (line 326) to 'Max: 2' — pick one canonical value."
+
+Self-correction: if you find yourself writing > 200 chars of rationale or > 150 chars of fix, you're either being verbose (rewrite) or trying to bundle multiple findings (split into separate ones).
+
+The full structured payload (`current_excerpt`, `pronunciation_entry`, `related_lines`, `section_ref`) is unchanged — those carry context, not narrative. Only `rationale` / `reasoning` / `description` / `suggested_fix` are capped.
+
+## Language switching (mandatory)
+
+Every `reasoning` (conflict, dominance), `description` (gap), `rationale` (schema), and `suggested_fix` (all four lenses) field MUST be emitted in `inputs.report_language`. Rule IDs (`R12`, `R80`), line numbers, severity tokens (`high|medium|low`), and structural artefacts (section numbers like `1.3`, finding IDs like `C1`, `D1`, `G1`) stay neutral — they are not prose.
+
+### Conflict lens — example pair
+
+TR (`report_language: "tr"`):
+```json
+{
+  "id": "C1",
+  "rule_ids": ["R78", "R80"],
+  "severity": "high",
+  "reasoning": "R78 sms_retry_count max=1 (satır 326) ile R80 'Max retries: 2' (satır 590) çelişiyor; aynı sayaç hem 1 hem 2 olamaz.",
+  "suggested_fix": "R80'i (satır 590) 'Max retries: 1' yap VEYA R78'i (satır 326) 'Max: 2' yap — tek değerde birleştir.",
+  "fix_strategy": "structural"
+}
+```
+
+EN (`report_language: "en"`):
+```json
+{
+  "id": "C1",
+  "rule_ids": ["R78", "R80"],
+  "severity": "high",
+  "reasoning": "R78 sets sms_retry_count max=1 (line 326) but R80 says 'Max retries: 2' (line 590); the same counter can't be both.",
+  "suggested_fix": "Change R80 (line 590) to 'Max retries: 1' OR raise R78 (line 326) to 'Max: 2' — pick one canonical value.",
+  "fix_strategy": "structural"
+}
+```
+
+### Dominance lens — example pair
+
+TR:
+```json
+{
+  "id": "D1",
+  "dominant_rule_id": "R45",
+  "dominated_rule_id": "R12",
+  "mechanism": "role-override",
+  "severity": "high",
+  "reasoning": "R45 (satır 412) 'her durumda yanıtla' diyerek R12'nin (satır 88) güvenlik reddini örtük olarak iptal ediyor.",
+  "suggested_fix": "R45'i 'güvenlik istisnaları hariç her durumda' olarak değiştir veya R12'yi son söz olarak taşı.",
+  "fix_strategy": "structural"
+}
+```
+
+EN:
+```json
+{
+  "id": "D1",
+  "dominant_rule_id": "R45",
+  "dominated_rule_id": "R12",
+  "mechanism": "role-override",
+  "severity": "high",
+  "reasoning": "R45 (line 412) 'always respond' silently overrides R12's safety refusal (line 88) via role-override.",
+  "suggested_fix": "Reword R45 to 'always respond except safety exceptions' or move R12 to the last-word position.",
+  "fix_strategy": "structural"
+}
+```
+
+### Gap lens — example pair
+
+TR:
+```json
+{
+  "id": "G1",
+  "kind": "undefined_edge_case",
+  "description": "R23 SMS gönderir ama hat yoksa ne olacağı tanımsız.",
+  "related_rule_ids": ["R23"],
+  "severity": "medium",
+  "suggested_fix": "R23'e ekle: 'Hat yoksa kullanıcıya 'şu an SMS gönderemiyorum' de ve geri dön.'",
+  "fix_strategy": "structural"
+}
+```
+
+EN:
+```json
+{
+  "id": "G1",
+  "kind": "undefined_edge_case",
+  "description": "R23 sends SMS but does not define behaviour when carrier is unavailable.",
+  "related_rule_ids": ["R23"],
+  "severity": "medium",
+  "suggested_fix": "Add to R23: 'If carrier unavailable, tell user 'cannot send SMS right now' and return.'",
+  "fix_strategy": "structural"
+}
+```
+
+### Schema lens — rationale templates per kind
+
+For schema findings, use the per-`kind` rationale templates below. Substitute the live numbers/letters but keep the wording in `report_language`:
+
+| kind | TR rationale template | EN rationale template |
+|---|---|---|
+| section_gap | "Bölüm N → Bölüm N+2: Bölüm N+1 eksik." | "Section N → Section N+2: Section N+1 missing." |
+| subsection_gap | "N.M → N.M+2: N.(M+1) eksik." | "N.M → N.M+2: N.(M+1) missing." |
+| out_of_order | "Bölüm/altbölüm sırasız: B önce A geliyor." | "Section/subsection out of order: B before A." |
+| subsection_orphan | "Altbölüm B.X, Bölüm A'nın altında — uyumsuz." | "Subsection B.X under Section A — mismatched." |
+| heading_style_inconsistent | "Başlık stili tutarsız: bazıları BÜYÜK, bazıları Başlık formatında." | "Heading style inconsistent: some ALL CAPS, some Title Case." |
+| missing_parent | "Altbölüm N.M var ama '## SECTION N' başlığı yok." | "Subsection N.M exists but no '## SECTION N' parent." |
+| step_gap | "STEP N → STEP N+2: STEP N+1 eksik." | "STEP N → STEP N+2: STEP N+1 missing." |
+
+Schema `suggested_fix` strings follow the same compact-writing cap (≤ 150 chars) and the same language switch. Example:
+
+TR schema finding (section_gap):
+```json
+{
+  "id": "SCH1",
+  "kind": "section_gap",
+  "severity": "medium",
+  "rationale": "Bölüm 5 → Bölüm 7: Bölüm 6 eksik.",
+  "suggested_fix": "Bölüm 6 başlığını ekle veya 7'yi 6 olarak yeniden numaralandır.",
+  "fix_strategy": "structural"
+}
+```
+
+EN schema finding (section_gap):
+```json
+{
+  "id": "SCH1",
+  "kind": "section_gap",
+  "severity": "medium",
+  "rationale": "Section 5 → Section 7: Section 6 missing.",
+  "suggested_fix": "Insert a Section 6 heading or renumber 7 down to 6.",
+  "fix_strategy": "structural"
+}
+```
+
+Self-correction: if `inputs.report_language == "tr"` but you wrote English prose in any `reasoning` / `description` / `rationale` / `suggested_fix` field, that's a runner bug — rewrite before output.
+
 ## Failure modes
 
+- If `inputs.report_language` is absent / null / unrecognized, default to `en` and emit a warning in EVERY output file's `warnings[]`: `"report_language defaulted to en — caller did not specify"`.
 - If any input file is missing, unreadable, or fails to parse as JSON / text, write empty payloads to **all four** output paths and return early:
   - `output_paths.conflicts`  → `{"conflicts":  [], "warnings": ["could not read <path>"]}`
   - `output_paths.dominances` → `{"dominances": [], "warnings": ["could not read <path>"]}`

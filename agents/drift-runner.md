@@ -25,7 +25,8 @@ Your user message is a JSON object split into **read-only inputs** and a single 
     "expand_count_override": 3,
     "compact_mode":          false,
     "max_char_limit":        50000,
-    "section_index":         "<$RUN_DIR/section_index.json>"
+    "section_index":         "<$RUN_DIR/section_index.json>",
+    "report_language":       "tr"
   },
   "output_path": "<$RUN_DIR/drift.json>"
 }
@@ -38,6 +39,8 @@ Read every file under `inputs` exactly once. **Never read `output_path`** — it
 `expand_count_override` is the value the user picked in the per-run wizard (Phase 3.5 of SKILL.md). When present and not null, it takes precedence over `frontmatter.expand_count`. When absent or null, fall back to `frontmatter.expand_count` (existing behaviour). When `expand_count_override == 0`, drift is disabled for this run — write `{"scenarios":[],"runs":[],"verdicts":[],"warnings":["expand_count is 0 — drift disabled"]}` to `output_path` and return (mirror the SKILL.md drift skip path).
 
 `compact_mode` is `true` when the body exceeds `max_char_limit`. When `true`, the runner halves the final scenario budget (see "Compact mode policy" below). When absent / null / false, full-depth simulation.
+
+`report_language` is the user's chosen output language for THIS run. Every `reasons[]` entry and any natural-language judgement text the runner emits MUST be written in this language. Anchors and scenario inputs from the prompt frontmatter stay in their original language — they are author content, not runner content. When absent / null / unrecognized, fall back to `en` (backward compat) and emit a warning per the Failure modes section.
 
 ## Step 1 — Generate scenarios
 
@@ -254,8 +257,71 @@ Step 2 and Step 3 are SINGLE-PASS batch operations. Common failure modes when an
 
 If batch fails (incomplete array, malformed JSON, missing scenarios), retry the step ONCE before falling back to writing whatever is complete plus a warning in the `output_path` JSON: `"warnings": ["batch incomplete: scenarios X, Y not simulated"]`.
 
+## Compact writing (mandatory)
+
+Every emitted `reasons[]` entry, any rubric judgement line, and any natural-language `rationale` the runner produces MUST be compact:
+
+- **reasons entries / rationale:** ≤ 200 characters per entry. ONE sentence, no preamble. Direct identification of what passed or failed + why.
+- **suggested_fix-style narrative** (when emitted in promoted findings via Phase 7): ≤ 150 characters. Imperative action.
+- **First sentence rule:** the field IS one sentence. If you can't say it in one sentence under the cap, simplify or split.
+
+Examples (good vs bad):
+
+BAD (262 chars, multi-clause):
+   "The simulated model produced an output that mentioned the 30-day refund policy as required by the assertion contains 'policy', however it also expanded into an exception list that the system prompt explicitly forbids in R12, so the rubric verdict is mixed."
+
+GOOD TR (148 chars):
+   "Çıktıda 'policy' anahtar kelimesi geçti ama R12'nin yasakladığı istisna listesi de eklenmiş; rubrik kısmi geçti."
+
+GOOD EN (146 chars):
+   "Output mentioned 'policy' as required but also added the exception list R12 forbids; rubric partially passed."
+
+Self-correction: if a `reasons[]` entry exceeds 200 chars, you're bundling multiple judgements into one — split into separate entries.
+
+The structured payload (`scenarios`, `runs`, `verdicts`, `violated_assertions`, `score`) is unchanged — those carry mechanics, not narrative. Only `reasons[]` and any free-text rationale are capped.
+
+## Language switching (mandatory)
+
+Each verdict's `reasons[]` array entries follow `inputs.report_language`. Anchors and scenario inputs from the prompt frontmatter stay in their original language (they are author-supplied; never translate them). The rubric body itself stays in whatever language the prompt's anchors used — but the runner's verdict text (`reasons[]`) MUST be in `report_language`.
+
+Per-language reason templates:
+
+| event | TR template | EN template |
+|---|---|---|
+| mechanical assertion pass | "mekanik <kind> '<value>' geçti" | "mechanical <kind> '<value>' passed" |
+| mechanical assertion fail | "mekanik <kind> '<value>' kaldı" | "mechanical <kind> '<value>' failed" |
+| rubric verdict | "rubrik: <bir cümle yargı>" | "rubric: <one-line judgement>" |
+| rubric inconclusive (empty output) | "rubrik sonuçsuz (boş çıktı)" | "rubric inconclusive (empty output)" |
+
+Example verdict pair:
+
+TR:
+```json
+{
+  "scenario_id": "S1",
+  "pass": true,
+  "score": 0.85,
+  "reasons": ["mekanik contains 'policy' geçti", "rubrik: model reddetti ve 30 günlük politikayı belirtti"],
+  "violated_assertions": []
+}
+```
+
+EN:
+```json
+{
+  "scenario_id": "S1",
+  "pass": true,
+  "score": 0.85,
+  "reasons": ["mechanical contains 'policy' passed", "rubric: model declined and cited 30-day policy"],
+  "violated_assertions": []
+}
+```
+
+Self-correction: if `inputs.report_language == "tr"` and any `reasons[]` entry is written in English, that's a runner bug — rewrite before output.
+
 ## Failure modes
 
+- If `inputs.report_language` is absent / null / unrecognized, default to `en` and emit a warning in the output's `warnings[]`: `"report_language defaulted to en — caller did not specify"`.
 - If a required input file is missing or unreadable, write `{"scenarios":[],"runs":[],"verdicts":[],"warnings":["could not read <path>"]}` to `output_path` and return.
 - If `scenarios.length == 0` after generation (e.g. the skill called you but the trigger conditions disappeared), write the same empty payload with a warning `"no scenarios generated"`.
 - If `section_index.json` is missing or unreadable, drift continues normally — drift findings already carry `section_ref: null` by default, so the missing index changes nothing. The runner MAY emit a warning `"section_index missing — drift findings carry section_ref: null anyway"` into the output's `warnings` array for downstream visibility. Don't abort.
