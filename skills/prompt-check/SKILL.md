@@ -651,7 +651,9 @@ git worktree. Output JSONs land at the per-lens path; the runner returns
 when its single output file is written. The skill awaits all five returns
 before Phase 5's drift gate.
 
-**Per-lens runner contract.** The `static-lens-runner` accepts the `inputs` schema (`body`, `frontmatter`, `rules`, `lens_rules_ref`, `selected_lenses`, `compact_mode`, `max_char_limit`, `section_index`, `report_language`) and the same `output_paths` shape (any subset of `conflicts`, `dominances`, `gaps`, `schema`). The runner still handles a multi-lens `selected_lenses` array (backward compat) — singleton-per-call is the RECOMMENDED dispatch shape, not a breaking change. `report_language` is the new field (v0.4.10+) — it tells the runner which language to emit `rationale` and `suggested_fix` in directly, so Phase 7 never has to translate content fields.
+**Per-lens runner contract.** The `static-lens-runner` accepts the same `inputs` schema (`body`, `frontmatter`, `rules`, `lens_rules_ref`, `selected_lenses`, `compact_mode`, `max_char_limit`, `section_index`, `report_language`) and `output_paths` (any subset of `conflicts`, `dominances`, `gaps`, `schema`). The change is in HOW the skill calls it: FOUR singleton dispatches instead of one combined call with all four lenses in `selected_lenses`. The runner still handles a multi-lens `selected_lenses` array (backward compat) — singleton-per-call is the new RECOMMENDED dispatch shape.
+
+**`report_language` propagation (mandatory).** Every Phase 4 / 5 / 6 Agent call MUST pass `report_language` from `frontmatter.report_language` in its `inputs` block. Runners write `rationale` + `suggested_fix` (and TR `pronunciation_entry.note`) directly in this language — there is NO post-render translation in Phase 7. Skipping this field on dispatch forces the runner into the EN fallback with a warning.
 
 `compact_mode` and `max_char_limit` are additive — the runner uses them when `compact_mode == true`, ignores them otherwise (backward compat). `tr-phonetic-runner` is already line-level / cheap, so `compact_mode` has no effect on its analysis; the fields are passed for symmetry.
 
@@ -842,7 +844,7 @@ Apply this to every `findings[].line` and `findings[].related_lines[]`. After tr
 
 For backward compatibility: if `section_index.json` does not exist (older run dirs from before this feature), set `section_ref: null` for every finding without crashing. The renderer below also falls back to bare line markers when `section_ref` is null.
 
-**Language switching (mandatory):** Load `frontmatter.report_language` (`tr` or `en`; default `tr` — Phase 2 already normalised it). Use this as the key into `TEMPLATE_STRINGS` (defined below). Apply throughout the report.md render: title, top metadata labels, summary heading + column headers + lens row labels, findings heading, severity sub-headings, lens-group sub-headings, "none" marker, section/line prefixes inside finding headers, and the per-finding inline lens + severity labels (used in the compact one-line render).
+**Language switching (mandatory):** Load `frontmatter.report_language` (`tr` or `en`; default `tr` — Phase 2 already normalised it). Use this as the key into `TEMPLATE_STRINGS` (defined below). Apply throughout the report.md render: title, top metadata labels, summary heading + column headers + lens row labels, findings heading, findings-table column headers, section/line cell prefixes, per-row lens + severity labels, drift `— / —` no-line marker, drift `passed — no fix` cell, and TODO / Intentional sentinel cell replacements.
 
 ```
 TEMPLATE_STRINGS = {
@@ -955,99 +957,107 @@ TEMPLATE_STRINGS = {
 
 Lens-generated content (`rationale`, `suggested_fix`, `current_excerpt`) is NOT translated — it stays in whatever language the runner produced. Only the skill-side template strings above switch language. So an English conflict rationale remains English in a TR report; the surrounding section headings and labels translate.
 
-**One-line finding render (compact summary, mandatory).** Each finding renders as ONE LINE — no separate Current / Suggested / Action / Diff / Rationale labels. The template:
+**Table-format finding render (mandatory).** Findings render as a markdown TABLE — one row per finding. NO bullet lists, NO blockquote sentinel lines under bullets, NO `→` arrow separators. The table is the primary output of Phase 7 and Phase 9.
 
-```
-TR mode (default):
-  - **{section_marker}** [{id} {lens}, {severity}] — {short_rationale} → **{short_fix}**
+**Columns per `report_language`:**
 
-EN mode:
-  - **{section_marker}** [{id} {lens}, {severity}] — {short_rationale} → **{short_fix}**
-```
+- `tr` (default):
+  ```
+  | id | mercek | önem | bölüm / satır | açıklama | düzeltme |
+  ```
+- `en`:
+  ```
+  | id | lens | sev | section / line | rationale | fix |
+  ```
 
-Where:
+The column header strings come from `TEMPLATE_STRINGS[lang]` (`table_id_column`, `table_lens_column`, `table_severity_column`, `table_section_line_column`, `table_rationale_column`, `table_fix_column`).
 
-- `{section_marker}` is the section-aware location:
-  - When `section_ref.subsection` is present (most common case):
-    - `tr` → `Bölüm 7.2 / Satır 284`
-    - `en` → `Section 7.2 — L284`
-  - When `section_ref` is non-null but `section_ref.subsection` is null (line in a section but not in a subsection):
-    - `tr` → `Bölüm 7 / Satır 284`
-    - `en` → `Section 7 — L284`
-  - When `section_ref` is null (line outside any numbered section, e.g. preamble):
-    - `tr` → `Satır 284`
-    - `en` → `L284`
-  - The prefixes (`Bölüm` / `Section`, `Satır` / `L`) come from `TEMPLATE_STRINGS[lang]["section_prefix"]` and `TEMPLATE_STRINGS[lang]["line_prefix"]`.
-- `{id}` is the finding id (`C1`, `D3`, `G2`, `S1`, `T1`, `drift-S3`).
-- `{lens}` translates per `TEMPLATE_STRINGS[lang]["lens_label_<lens>"]`:
+**Per-cell content rules:**
+
+- **`id`** — the finding id verbatim (`C1`, `D3`, `G2`, `S1`, `T1`, `drift-S3`).
+- **`lens`** (= `mercek` in TR) — translated per `TEMPLATE_STRINGS[lang]["lens_label_<lens>"]`:
   - `conflict` → `çelişki` (tr) / `conflict` (en)
   - `dominance` → `baskınlık` / `dominance`
   - `gap` → `boşluk` / `gap`
   - `schema` → `şema` / `schema`
   - `drift` → `davranışsal sapma` / `drift`
   - `tr_phonetic` → `türkçe fonetik` / `tr phonetic`
-- `{severity}` translates per `TEMPLATE_STRINGS[lang]["severity_label_<sev>"]`:
+- **`sev`** (= `önem` in TR) — translated per `TEMPLATE_STRINGS[lang]["severity_label_<sev>"]`:
   - `high` → `yüksek` / `high`
   - `medium` → `orta` / `medium`
   - `low` → `düşük` / `low`
-- `{short_rationale}` is the finding's `rationale` field TRUNCATED to ≤ 120 characters. Take the first sentence (split on `. ` / `? ` / `! `); if the first sentence is still longer than 120 chars, ellipsis at 117 chars + `...`.
-- `{short_fix}` is the `suggested_fix` field TRUNCATED to ≤ 100 characters. Same ellipsis rule. For structural fixes (multi-clause action descriptions), extract the first imperative sentence. If `suggested_fix` is null or empty, omit the `→ **{short_fix}**` suffix entirely.
+- **`section / line`** (= `bölüm / satır` in TR) — the section-aware location, single cell:
+  - When `section_ref.subsection` is present: `Bölüm 7.2 / Satır 284` (tr) / `Section 7.2 / L284` (en)
+  - When `section_ref` is non-null but `subsection` is null: `Bölüm 7 / Satır 284` (tr) / `Section 7 / L284` (en)
+  - When `section_ref` is null AND `finding.line` is non-null (line outside numbered section, e.g. preamble): `Satır 284` (tr) / `L284` (en)
+  - **Drift `— / —` rule:** when BOTH `finding.line == null` AND `finding.section_ref == null` (drift findings are behavioural — they have no anchored line), render this cell as the literal string `TEMPLATE_STRINGS[lang]["no_line_marker"]` (= `— / —`). NEVER `Satır 1` / `L1`. The em-dash + slash + em-dash signals "no anchor".
+  - The prefixes (`Bölüm` / `Section`, `Satır` / `L`) come from `TEMPLATE_STRINGS[lang]["section_prefix"]` and `TEMPLATE_STRINGS[lang]["line_prefix"]`.
+- **`rationale`** (= `açıklama` in TR) — the finding's `rationale` field VERBATIM. NO truncation. NO ellipsis. NO first-sentence extraction. Runners are responsible for keeping rationale ≤ 200 characters (per their own "Compact writing" invariants); the renderer uses the full text as-is. If the runner exceeded the cap, that is a runner error — surface as-is, do not paper over it.
+- **`fix`** (= `düzeltme` in TR) — the finding's `suggested_fix` field VERBATIM. NO truncation. Special-case rendering:
+  - When `suggested_fix` is null or empty AND the finding is a drift verdict (`lens == "drift"`) — render `TEMPLATE_STRINGS[lang]["drift_passed_no_fix"]` (= `(geçti — düzeltme yok)` / `(passed — no fix)`).
+  - When `suggested_fix` starts with `"TODO:"` — render `TEMPLATE_STRINGS[lang]["sentinel_todo_render"]` (= `TODO — yazar çözmeli` / `TODO — author must resolve`).
+  - When `suggested_fix` starts with `"Intentional —"` or `"Intentional -"` — render `TEMPLATE_STRINGS[lang]["sentinel_intentional_render"]` (= `Bilinçli — atla` / `Intentional — dismiss`).
+  - Otherwise — render `suggested_fix` verbatim. Runners cap fix text at ≤ 150 chars; renderer uses the full text.
 
-**Findings without a suggested_fix (drift verdicts, advisory TR, no_concrete_fix):**
+**Markdown table escaping:** pipe characters (`|`) inside a cell value would break the table layout. Escape every `|` in rationale / fix / current_excerpt content as `\|` (or substitute with `│` if you prefer the cosmetic Unicode bar). Apply line breaks (`\n`) inside a cell as `<br>`. These escapes are render-only; `findings.json` keeps the raw text.
 
-```
-- **{section_marker}** [{id} {lens}, {severity}] — {short_rationale}
-```
+**Sort order inside the table** follows the global sort (severity descending, then lens group, then line ascending). Severity groups are NOT broken into separate sub-tables — the single table is sorted, and the column values speak for themselves.
 
-No `→` arrow + fix when there is nothing concrete to apply.
-
-**Sentinel suggestions (TODO / Intentional):**
-
-```
-- **{section_marker}** [{id} {lens}, {severity}] — {short_rationale}
-    > _TODO: <open question>_     (when suggested_fix starts with TODO:)
-    > _Intentional — dismiss_      (when suggested_fix starts with Intentional)
-```
-
-The sentinel marker renders as an indented blockquote line under the main one-liner — preserves the "needs human" signal without polluting the compact main line.
-
-**The full rationale + suggested_fix remain available in findings.json (no truncation in the structured artefact). Truncation applies ONLY to the human-readable report.md / inline-suggestions.md / Phase 9 summary table.** Downstream tooling that needs the verbatim text reads findings.json.
+**The full rationale + suggested_fix remain available in findings.json verbatim (no escaping there).** The runner emits compact text; the renderer pipes it through pipe-escape + line-break-escape for the markdown table only.
 
 Python helper:
 
 ```python
-def truncate(text, limit):
+def escape_cell(text):
     if not text:
         return ""
-    # Take the first sentence boundary, if any, before the char limit.
-    first_sentence = re.split(r'(?<=[.!?])\s+', text.strip(), maxsplit=1)[0]
-    s = first_sentence if first_sentence else text
-    if len(s) <= limit:
-        return s
-    return s[:limit - 3] + "..."
+    return text.replace("|", "\\|").replace("\n", "<br>")
 
-def render_finding_oneline(f, lang):
+def build_section_line_cell(f, T):
+    sref = f.get("section_ref")
+    line = f.get("line")
+    # Drift "— / —" rule: both line and section_ref are null.
+    if line is None and sref is None:
+        return T["no_line_marker"]
+    sec_p = T["section_prefix"]
+    line_p = T["line_prefix"]
+    if sref is not None and sref.get("subsection"):
+        return f"{sec_p} {sref['subsection']} / {line_p}{line}"
+    if sref is not None and sref.get("section"):
+        return f"{sec_p} {sref['section']} / {line_p}{line}"
+    # section_ref null but line present (preamble line)
+    return f"{line_p}{line}"
+
+def render_fix_cell(f, T):
+    suggested = f.get("suggested_fix") or ""
+    if not suggested.strip():
+        if f.get("lens") == "drift":
+            return T["drift_passed_no_fix"]
+        return ""
+    if suggested.startswith("TODO:"):
+        return T["sentinel_todo_render"]
+    if suggested.startswith("Intentional —") or suggested.startswith("Intentional -"):
+        return T["sentinel_intentional_render"]
+    return suggested  # verbatim — no truncation
+
+def render_finding_row(f, lang):
     T = TEMPLATE_STRINGS[lang]
-    section_marker = build_section_marker(f.get("section_ref"), f["line"], T)  # see section-marker rules above
     lens_label = T[f"lens_label_{f['lens']}"]
     sev_label = T[f"severity_label_{f.get('severity','low')}"]
-    rationale = truncate(f.get("rationale", ""), 120)
-    suggested = f.get("suggested_fix") or ""
+    section_line = build_section_line_cell(f, T)
+    rationale = escape_cell(f.get("rationale", ""))
+    fix = escape_cell(render_fix_cell(f, T))
+    return f"| {f['id']} | {lens_label} | {sev_label} | {section_line} | {rationale} | {fix} |"
 
-    # Sentinel marker (rendered as a blockquote line under the main one-liner).
-    sentinel = None
-    if suggested.startswith("TODO:"):
-        sentinel = f"> _TODO: {suggested[5:].strip()}_"
-    elif suggested.startswith("Intentional —") or suggested.startswith("Intentional -"):
-        sentinel = "> _Intentional — dismiss_"
-
-    if sentinel:
-        return (f"- **{section_marker}** [{f['id']} {lens_label}, {sev_label}] — {rationale}\n"
-                f"    {sentinel}")
-    if not suggested.strip():
-        return f"- **{section_marker}** [{f['id']} {lens_label}, {sev_label}] — {rationale}"
-    short_fix = truncate(suggested, 100)
-    return f"- **{section_marker}** [{f['id']} {lens_label}, {sev_label}] — {rationale} → **{short_fix}**"
+def render_findings_table(findings, lang):
+    T = TEMPLATE_STRINGS[lang]
+    header = (
+        f"| {T['table_id_column']} | {T['table_lens_column']} | {T['table_severity_column']} "
+        f"| {T['table_section_line_column']} | {T['table_rationale_column']} | {T['table_fix_column']} |"
+    )
+    sep = "|---|---|---|---|---|---|"
+    rows = [render_finding_row(f, lang) for f in findings]
+    return "\n".join([header, sep] + rows)
 ```
 
 ### `$RUN_DIR/findings.json`
@@ -1089,7 +1099,7 @@ def render_finding_oneline(f, lang):
       "current_excerpt": "<verbatim from body.txt>",
       "suggested_fix": "<concrete edit — populated only for fix_kind: replace>",
       "pronunciation_entry": null,
-      "rationale": "<one paragraph, ≤ 240 chars>",
+      "rationale": "<runner-emitted, ≤ 200 chars per the runner's Compact writing invariant>",
       "rule_ids": ["R3","R8"]
     }
   ],
@@ -1158,7 +1168,7 @@ For each finding:
 
 ### `$RUN_DIR/report.md`
 
-The template skeleton below is shown in `en` (English) for readability; the actual rendered output uses `TEMPLATE_STRINGS[frontmatter.report_language]` for every label. The structural layout (heading levels, table columns, severity grouping, lens grouping) is identical across both languages — only the text translates.
+The template skeleton below is shown in `en` (English) for readability; the actual rendered output uses `TEMPLATE_STRINGS[frontmatter.report_language]` for every label. The structural layout (heading levels, summary table columns, findings table columns, row sort order) is identical across both languages — only the text translates.
 
 ```markdown
 # <report_title — TEMPLATE_STRINGS.report_title with {basename} interpolation>
@@ -1181,54 +1191,26 @@ The template skeleton below is shown in `en` (English) for readability; the actu
 
 <findings_heading>
 
-(Grouped by severity, then by lens. Within each (severity, lens) group, findings are line-ordered.)
-
-<high_severity_heading>
-
-<conflicts_subheading>
-- **<section_prefix> 7.2 / <line_prefix>284** [<id> <lens_label>, <severity_label>] — <short_rationale> → **<short_fix>**
-- (or "<none_marker>" if no high-severity conflicts)
-
-<dominances_subheading>
-- ...
-
-<gaps_subheading>
-- ...
-
-<schema_subheading>
-- ...
-- (or "_Not applicable — no numbered section headings detected._" / "_Şema uygulanabilir değil — numaralandırılmış başlık yok._" when `summary.schema.applicable == false`)
-- (or "_Skipped — lens deselected in wizard._" / "_Atlandı — mercek sihirbazda seçilmedi._" when `summary.schema.applicable == null && summary.schema.skipped == true`)
-
-<drift_subheading>
-- ...
-
-<tr_phonetic_subheading>
-- ...
-
-<medium_severity_heading>
-
-<conflicts_subheading>
-- ...
-
-(etc.)
-
-<low_severity_heading>
-
-(etc.)
+| <table_id_column> | <table_lens_column> | <table_severity_column> | <table_section_line_column> | <table_rationale_column> | <table_fix_column> |
+|---|---|---|---|---|---|
+| C1 | <lens_label_conflict> | <severity_label_high> | <section_prefix> 7.2 / <line_prefix>284 | <rationale verbatim> | <suggested_fix verbatim> |
+| drift-S1 | <lens_label_drift> | <severity_label_low> | — / — | <rationale verbatim> | <drift_passed_no_fix> |
+| ... |
 ```
 
-If an entire severity bucket has zero findings across all lenses, omit that bucket entirely (don't render the severity heading followed by "_None._"). If a (severity, lens) pair has zero findings, render the lens sub-heading with `none_marker` (TEMPLATE_STRINGS-driven) so the structure stays consistent.
+Findings render as a **single markdown table**, sorted by (severity desc, lens group order, line asc). NO bullet lists, NO severity sub-headings, NO per-lens sub-headings, NO `none_marker` placeholders — empty severity / lens combinations simply produce no row.
 
-Each finding line uses the **one-line compact render** documented above (`render_finding_oneline`). No separate Current / Suggested / Action / Diff / Rationale blocks. The section-marker prefix follows the same `section_ref.subsection` / `section_ref.section` / null cascade as before — only the body of the bullet collapses to one line with truncated rationale + truncated fix.
+Each row is built by `render_finding_row` (see "Table-format finding render" above). Cells are populated VERBATIM from the runner's `rationale` / `suggested_fix` text; pipe (`|`) and newline (`\n`) characters are escaped for markdown table safety but otherwise the text is unchanged. Runners are responsible for keeping rationale ≤ 200 chars and fix ≤ 150 chars (per their "Compact writing" invariants) — the renderer does NOT truncate.
 
-**Drift section special-case:** when drift was skipped at the run level (`drift.json.skipped_reason` is set), render a single `_Skipped — <skipped_reason>._` line under whichever severity bucket the drift scenarios would have landed in, OR under HIGH if no severity context exists. Per-scenario rendering uses the same one-line compact form as other lenses:
+**Drift row special-cases:**
+- When `drift.json.skipped_reason` is set (drift skipped at run level), do NOT add per-scenario rows. Instead append a single italic line ABOVE the table: `_<drift_subheading>: skipped — <skipped_reason>._`
+- When a drift scenario has BOTH `line == null` AND `section_ref == null`, the `section / line` cell renders as `— / —` (= `no_line_marker`). NEVER `Satır 1` / `L1`.
+- When a drift scenario passed AND `suggested_fix` is empty, the `fix` cell renders as `<drift_passed_no_fix>` (= `(geçti — düzeltme yok)` / `(passed — no fix)`).
+- Treat drift `fail` as high severity, `pass` as low severity for sort placement inside the table.
 
-```
-- **{section_marker}** [drift-S1 davranışsal sapma / drift, yüksek / high] — <short_rationale> → **<short_fix>**
-```
-
-Where the rationale captures the scenario kind + pass/fail + score (e.g. "hostile-input scenario failed, score 0.32"), and short_fix carries the verdict's `suggested_fix` if the runner produced one. Treat drift `fail` as high severity, `pass` as low severity for bucketing purposes.
+**Schema lens applicability special-cases (one italic line above the table, NOT a row):**
+- When `summary.schema.applicable == false`: prepend `_Schema: not applicable — no numbered section headings detected._` (TR: `_Şema uygulanabilir değil — numaralandırılmış başlık yok._`)
+- When `summary.schema.applicable == null && summary.schema.skipped == true`: prepend `_Schema: skipped — lens deselected in wizard._` (TR: `_Şema atlandı — mercek sihirbazda seçilmedi._`)
 
 `report.md` is the canonical user-facing artefact. If `frontmatter.output` contains `findings_json` but not `markdown`, still write `report.md` — it costs nothing and is the doc humans read. If `output` contains `json`, write the merged report as `$RUN_DIR/report.json` (same shape as findings.json plus a `body_lines` field with the numbered body).
 
@@ -1391,9 +1373,14 @@ All timestamps are ISO 8601 UTC with millisecond precision, e.g. `2026-05-27T14:
 
 The summary table renders **DECISION_SET only**. The auto_filed processing (see Phase 9.4 stage 1) operates on **AUTO_FILED_SET**.
 
-Print a single markdown table containing every finding in DECISION_SET. The table is the **tabular form of the Phase 7 one-line render** — one row per finding with the same compact content. Columns: `id | lens | severity | section | short_rationale | short_fix`. Sort by `line` ascending, then by `severity` descending (`high > medium > low`; drift findings are surfaced with their `kind` instead of severity — treat `fail` as `high`, `pass` as `low`).
+Print a single markdown table containing every finding in DECISION_SET. The table uses the **same format as Phase 7's report.md table** (`render_findings_table` helper) — one row per finding with the same six columns. Columns per `report_language`:
 
-`section` is the `{section_marker}` string from Phase 7's render (e.g. `Bölüm 7.2 / Satır 284` in TR mode, `Section 7.2 — L284` in EN mode, or the bare line marker when `section_ref` is null). `short_rationale` is `rationale` truncated to ≤ 120 chars per the Phase 7 rule. `short_fix` is `suggested_fix` truncated to ≤ 100 chars per the Phase 7 rule (empty cell when `suggested_fix` is null / empty / sentinel). For TR phonetic findings still in DECISION_SET (i.e. `number_readability` / `punctuation`), `short_fix` is the truncated `suggested_fix` — `pronunciation_entry` rendering is no longer needed in the table because TR advisory findings are filtered out by the partition.
+- `tr`: `| id | mercek | önem | bölüm / satır | açıklama | düzeltme |`
+- `en`: `| id | lens | sev | section / line | rationale | fix |`
+
+Sort by the global Phase 7 order (severity desc → lens group → line asc). For drift findings without a severity, treat `fail` as `high` and `pass` as `low` for sort placement.
+
+Cells are populated VERBATIM from the runner's text via the Phase 7 helpers (`build_section_line_cell`, `render_fix_cell`, `escape_cell`). NO truncation, NO `short_*` derivations. The `section / line` cell renders as `— / —` when both `line` and `section_ref` are null (drift). For TR phonetic findings still in DECISION_SET (`number_readability` / `punctuation`), the `fix` cell is the verbatim `suggested_fix` — `pronunciation_entry` rendering is no longer needed in the table because TR advisory findings are filtered out by the partition.
 
 If `AUTO_FILED_SET` is non-empty, append a single line directly below the summary table (before the decision prompt):
 
@@ -2057,5 +2044,6 @@ Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. 
 - Don't treat compact mode as a hard abort. The audit STILL runs — it just runs with cheaper-per-lens policies. Severity floors, pair budgets, and drift halving are the contract; never use compact mode as an excuse to skip a lens entirely.
 - Don't translate lens-generated content (rationale, suggested_fix, current_excerpt) in Phase 7. Only skill-side template strings translate. A lens runner that wrote an English rationale stays English in a TR report.
 - Don't omit `section_ref: null` from findings.json — emit it explicitly (null is a valid value, signalling "line outside any numbered section"). Absent field is ambiguous; explicit null is clear.
-- Don't render Current / Suggested / Action labels as separate blocks in Phase 7. Compact each finding to ONE LINE with section_marker, id, lens, severity, short_rationale, and short_fix.
-- Don't truncate findings.json fields. Truncation is RENDER-ONLY (report.md + inline-suggestions.md + Phase 9 summary). findings.json carries the full rationale + suggested_fix verbatim.
+- Don't render Current / Suggested / Action labels as separate blocks in Phase 7. Phase 7 emits a single markdown TABLE (id | lens | sev | section / line | rationale | fix) — one row per finding.
+- Don't truncate rationale or suggested_fix in the renderer. Runners self-cap at ≤200 chars rationale and ≤150 chars fix (per their "Compact writing" invariants); the renderer uses the runner's text VERBATIM. If a runner exceeded the cap, that's a runner error — surface it as-is.
+- Don't render `Satır 1` / `L1` for drift findings whose `line` and `section_ref` are both null. Use the literal `— / —` marker (= `TEMPLATE_STRINGS[lang]["no_line_marker"]`) so behavioural findings are visually distinct from anchored ones.
