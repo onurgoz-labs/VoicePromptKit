@@ -351,25 +351,195 @@ User typed something starting with `/`. Parse the command (lowercase, strip lead
 | `quit` | Phase 8 — final summary + optional commit prompt (filled in Phase C) |
 | anything else | Print "Bilinmeyen komut: `/<x>`. Mevcut: /save /history /reset /commit /quit" and return |
 
-For MVP (this commit), the following commands are stubs that print a placeholder until Phase C lands:
-
-- `save` → "Phase 5 henüz implementasyon bekliyor. Bu çağrı no-op."
-- `commit` → "Phase 7 henüz implementasyon bekliyor. Bu çağrı no-op."
-- `quit` → directly print Phase 8 summary (turns count, run dir path) and exit the skill. saved_anchors handling skipped.
-
-`history` and `reset` are fully implemented in this MVP — they don't depend on save/commit logic.
+All five commands are implemented: `/save` dispatches to Phase 5, `/commit` to Phase 7, `/quit` to Phase 8 (with optional commit prompt for any staged anchors). `/history` and `/reset` execute inline in this phase as they are simple state operations.
 
 ## Phase 5 — Anchor save sub-flow
 
-**[Implementation deferred to Phase C of the rollout. See plan: /Users/onur/.claude/plans/immutable-riding-moth.md]**
+User typed `/save`. Capture the most recent user → assistant exchange as a test anchor staged in `saved_anchors.json`. The user fills in expected behaviour via four AskUserQuestion prompts; we never write to the prompt file in this phase (frontmatter changes happen only in Phase 7 / `/commit`).
 
-Outline for forward reference:
+### Step 5.1 — Locate the last turn
 
-1. Read last user + assistant turns from chat.jsonl
-2. AskUserQuestion (4 steps): expect_contains, expect_not_contains, rubric, preview-and-confirm
-3. Option to include prior context (single-turn vs prior-context anchor)
-4. Atomic append to saved_anchors.json
-5. Inform user: "Anchor #N kaydedildi (staging). /commit ile frontmatter'a yazılır."
+```bash
+python3 - "$RUN_DIR" <<'PY'
+import sys, json, os
+run_dir = sys.argv[1]
+entries = []
+with open(os.path.join(run_dir, 'chat.jsonl'), encoding='utf-8') as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+# Find the last user→assistant pair. Walk back to the most recent assistant
+# entry whose immediate predecessor is a user entry.
+last_assistant = None
+last_user = None
+for i in range(len(entries) - 1, -1, -1):
+    if entries[i].get('role') == 'assistant' and i > 0 and entries[i-1].get('role') == 'user':
+        last_assistant = entries[i]
+        last_user = entries[i-1]
+        prior_context = entries[:i-1]  # everything before the user turn we're saving
+        break
+
+if last_user is None:
+    print("ERROR: no completed user→assistant turn yet — converse at least once before /save", file=sys.stderr)
+    sys.exit(1)
+
+print(json.dumps({
+    "user_content": last_user.get('content', ''),
+    "assistant_content": last_assistant.get('content', ''),
+    "prior_context_count": len(prior_context),
+    "prior_context": prior_context,
+}, ensure_ascii=False))
+PY
+```
+
+If the script exits non-zero (no user→assistant exchange yet), surface to user:
+
+- TR: `Henüz tam bir tur yok. Önce bir mesaj yaz, bot cevap versin, sonra /save kullan.`
+- EN: `No complete user→assistant turn yet. Send a message and wait for the bot's reply before /save.`
+
+…and return to the chat loop.
+
+### Step 5.2 — Ask: expect_contains
+
+`AskUserQuestion` (free-form):
+
+```
+question (TR): "Yanıtta hangi sözcükler / ifadeler bulunmalı? (virgülle ayır, boş bırakılabilir)"
+question (EN): "What words / phrases SHOULD the reply contain? (comma-separated, may be empty)"
+header:        "expect_contains"
+```
+
+Parse the user's free-form answer: split on `,`, trim whitespace, drop empty entries. Result is a string list. Store as `expect_contains`.
+
+### Step 5.3 — Ask: expect_not_contains
+
+```
+question (TR): "Yanıtta hangi sözcükler / ifadeler bulunmamalı? (virgülle ayır, boş bırakılabilir)"
+question (EN): "What words / phrases SHOULD NOT the reply contain? (comma-separated, may be empty)"
+header:        "expect_not_contains"
+```
+
+Same parsing as 5.2. Store as `expect_not_contains`.
+
+### Step 5.4 — Ask: rubric
+
+```
+question (TR): "LLM judge'a verilecek davranış kuralı (opsiyonel, ≤ 200 karakter)"
+question (EN): "Rubric for the LLM judge (optional, ≤ 200 chars)"
+header:        "rubric"
+```
+
+Single string, may be empty. Store as `rubric`.
+
+### Step 5.5 — Ask: context inclusion (single-turn vs prior-context)
+
+This is the codex-recommended escape hatch from the single-turn-only limitation.
+
+```
+question (TR): "Bu anchor'ı nasıl kaydedeyim?"
+question (EN): "How should I save this anchor?"
+header:        "context"
+multiSelect:   false
+options:
+  - label: "Sadece bu turu" | "Just this turn"  
+    description: "Stateless test — drift-runner sadece bu input'u gönderecek. (önerilen) (Recommended)"
+  - label: "Önceki turları bağlam olarak ekle" | "Include prior turns as context"
+    description: "State-aware test — drift-runner önceki <N> turu conversation history olarak verir, sonra input'u son user turn olarak ekler."
+```
+
+If `prior_context_count == 0`, skip this question (no prior context exists) — default to "Just this turn".
+
+If user picks "Include prior", construct the `context` array from `prior_context`: each entry becomes `{role: "user" | "assistant", content: "..."}` (drop `ts`).
+
+If "Just this turn", set `context = []` (or omit the field entirely — drift-runner treats missing/empty as single-turn).
+
+### Step 5.6 — Preview and confirm
+
+Render the staged anchor:
+
+```
+Önizleme (Anchor #<N>):
+  input: "<user_content>"
+  context: <"yok" | "<K> prior turn">
+  expect_contains: [<items>] | (none)
+  expect_not_contains: [<items>] | (none)
+  rubric: "<rubric>" | (none)
+```
+
+```
+question (TR): "Kaydedeyim mi?"
+question (EN): "Save?"
+header:        "Confirm"
+multiSelect:   false
+options:
+  - label: "Evet, kaydet" | "Yes, save"
+    description: "Stage this anchor in saved_anchors.json. /commit will write it to frontmatter later."
+  - label: "Düzenle" | "Edit"
+    description: "Re-run the 4 questions to fix the fields."
+  - label: "İptal" | "Cancel"
+    description: "Discard this attempt; nothing is staged."
+```
+
+- **Yes** → Step 5.7
+- **Edit** → loop back to Step 5.2
+- **Cancel** → no-op, return to chat loop
+
+### Step 5.7 — Atomic append to saved_anchors.json
+
+```bash
+python3 - "$RUN_DIR" "$USER_CONTENT" "$EXPECT_CONTAINS_JSON" "$EXPECT_NOT_CONTAINS_JSON" "$RUBRIC" "$CONTEXT_JSON" <<'PY'
+import sys, json, os
+run_dir = sys.argv[1]
+user_content = sys.argv[2]
+expect_contains = json.loads(sys.argv[3])         # list[str]
+expect_not_contains = json.loads(sys.argv[4])     # list[str]
+rubric = sys.argv[5]
+context = json.loads(sys.argv[6])                 # list[{role,content}] or []
+
+staged_path = os.path.join(run_dir, 'saved_anchors.json')
+staged = json.load(open(staged_path, encoding='utf-8'))
+
+anchor = {"input": user_content}
+if context:
+    anchor["context"] = context
+if expect_contains:
+    anchor["expect_contains"] = expect_contains
+if expect_not_contains:
+    anchor["expect_not_contains"] = expect_not_contains
+if rubric:
+    anchor["rubric"] = rubric
+
+staged.append(anchor)
+
+tmp = staged_path + '.tmp.' + str(os.getpid())
+with open(tmp, 'w', encoding='utf-8') as f:
+    json.dump(staged, f, indent=2, ensure_ascii=False)
+os.rename(tmp, staged_path)
+
+# Update session.json staged count.
+session_path = os.path.join(run_dir, 'session.json')
+session = json.load(open(session_path, encoding='utf-8'))
+session['saved_anchors'] = len(staged)
+tmp = session_path + '.tmp.' + str(os.getpid())
+with open(tmp, 'w', encoding='utf-8') as f:
+    json.dump(session, f, indent=2, ensure_ascii=False)
+os.rename(tmp, session_path)
+
+print(len(staged))
+PY
+```
+
+Print to user (in `report_language`):
+
+- TR: `Anchor #<N> kaydedildi (staging). Toplam: <N> staged. /commit ile frontmatter'a yazılır.`
+- EN: `Anchor #<N> staged. Total: <N>. Use /commit to write them to frontmatter.`
+
+Return to chat loop.
 
 ## Phase 6 — `chat-simulator` agent invocation
 
@@ -406,32 +576,188 @@ If the subagent reports an error (its status line starts with `chat-simulator er
 
 ## Phase 7 — Frontmatter commit (`/commit`)
 
-**[Implementation deferred to Phase C.]**
+User typed `/commit`. Atomic-write the staged anchors from `saved_anchors.json` into the prompt file's `frontmatter.anchors[]`. The body of the prompt is NEVER touched — only the YAML header.
 
-Outline:
+### Step 7.1 — Load staged anchors
 
-1. Load `saved_anchors.json`
-2. If empty, print "Staged anchor yok. Önce /save kullan." and return
-3. Atomic write to prompt file's frontmatter (yaml.safe_dump + temp+rename)
-4. Validate post-write parse (rollback on fail)
-5. Rename `saved_anchors.json` → `committed-<timestamp>.json`
-6. Print "N anchor frontmatter'a yazıldı. /prompt-test ile çalıştırabilirsin."
+```bash
+STAGED_COUNT=$(python3 -c "import json; print(len(json.load(open('$RUN_DIR/saved_anchors.json'))))")
+```
+
+If `STAGED_COUNT == 0`:
+
+- TR: `Staged anchor yok. Önce /save kullan.`
+- EN: `No staged anchors. Use /save first.`
+
+…and return to chat loop.
+
+### Step 7.2 — Atomic frontmatter write
+
+The write is in three stages: build the new file content, write to a temp file, validate the temp by parsing it back, then atomically rename. Rollback on any failure.
+
+```bash
+python3 - "$ABS_PROMPT" "$RUN_DIR/saved_anchors.json" <<'PY'
+import sys, os, re, json, yaml, datetime, shutil
+
+prompt_path, staged_path = sys.argv[1], sys.argv[2]
+staged = json.load(open(staged_path, encoding='utf-8'))
+if not staged:
+    print("WARN: nothing to commit", file=sys.stderr)
+    sys.exit(0)
+
+text = open(prompt_path, encoding='utf-8').read()
+
+# Parse existing frontmatter (or none).
+m = re.match(r'^---\r?\n(.*?)\r?\n---\r?\n?(.*)$', text, re.DOTALL)
+if m:
+    fm_raw, body = m.group(1), m.group(2)
+    try:
+        fm = yaml.safe_load(fm_raw) or {}
+    except yaml.YAMLError as e:
+        print(f"ERROR: existing frontmatter unparseable — aborting commit. {e}", file=sys.stderr)
+        sys.exit(2)
+else:
+    fm, body = {}, text  # no frontmatter; we'll create one
+
+existing_anchors = fm.get('anchors') or []
+fm['anchors'] = existing_anchors + staged
+
+# Emit with allow_unicode=True (TR characters), sort_keys=False (preserve author's
+# key order — anchors appended to the end of whatever keys exist), default_flow_style=False
+# (block style for readability).
+new_fm = yaml.safe_dump(fm, allow_unicode=True, sort_keys=False, default_flow_style=False)
+new_text = f"---\n{new_fm}---\n{body}"
+
+# Write temp, validate, rename.
+tmp = prompt_path + '.chat-commit.tmp.' + str(os.getpid())
+with open(tmp, 'w', encoding='utf-8') as f:
+    f.write(new_text)
+
+# Validation: re-parse temp file's frontmatter. If we can't, do not commit.
+try:
+    check_text = open(tmp, encoding='utf-8').read()
+    check_m = re.match(r'^---\r?\n(.*?)\r?\n---\r?\n?(.*)$', check_text, re.DOTALL)
+    if not check_m:
+        raise ValueError("temp file has no frontmatter delimiter")
+    check_fm = yaml.safe_load(check_m.group(1)) or {}
+    if not isinstance(check_fm.get('anchors'), list):
+        raise ValueError("temp file's anchors field is not a list")
+    if len(check_fm['anchors']) != len(existing_anchors) + len(staged):
+        raise ValueError(f"anchor count mismatch: got {len(check_fm['anchors'])}, expected {len(existing_anchors)+len(staged)}")
+except Exception as e:
+    os.remove(tmp)
+    print(f"ERROR: post-write validation failed — rollback complete. {e}", file=sys.stderr)
+    sys.exit(3)
+
+# Validation passed — atomic rename.
+os.rename(tmp, prompt_path)
+
+# Archive saved_anchors.json with a committed timestamp prefix.
+ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+committed_path = os.path.join(os.path.dirname(staged_path), f'committed-{ts}.json')
+shutil.move(staged_path, committed_path)
+
+# Re-create empty saved_anchors.json so subsequent /save calls in the same chat
+# session can stage fresh anchors without confusion.
+with open(staged_path, 'w', encoding='utf-8') as f:
+    json.dump([], f, indent=2)
+
+# Update session.json (saved_anchors back to 0; record the commit).
+run_dir = os.path.dirname(staged_path)
+session_path = os.path.join(run_dir, 'session.json')
+session = json.load(open(session_path, encoding='utf-8'))
+session['saved_anchors'] = 0
+session.setdefault('commits', []).append({
+    "ts": ts,
+    "count": len(staged),
+    "archived_to": os.path.basename(committed_path),
+})
+stmp = session_path + '.tmp.' + str(os.getpid())
+with open(stmp, 'w', encoding='utf-8') as f:
+    json.dump(session, f, indent=2, ensure_ascii=False)
+os.rename(stmp, session_path)
+
+print(f"OK: {len(staged)} anchor(s) committed; archived to {os.path.basename(committed_path)}")
+PY
+```
+
+Exit codes:
+- `0` — success
+- `2` — existing frontmatter unparseable (do not touch the prompt file; surface to user)
+- `3` — post-write validation failed (temp removed; prompt file is unchanged)
+
+### Step 7.3 — Surface result
+
+On success, print to user (in `report_language`):
+
+- TR: `<N> anchor frontmatter'a yazıldı. Prompt: <basename>. /prompt-test ile çalıştırabilirsin.`
+- EN: `<N> anchors written to frontmatter. Prompt: <basename>. Use /prompt-test to run them.`
+
+On error (exit 2 or 3), print the stderr message verbatim and return to chat loop. The user can investigate the prompt file's existing frontmatter (likely a manual YAML syntax issue) and try again.
+
+### Why staged-then-commit (not instant-write)
+
+Staged saves let the user iterate fast and discard mistakes. Instant writes would mutate the prompt file on every `/save`, invalidating any cached `/prompt-check` audit (the SHA256 stale-audit guard) — and a typo'd anchor would require a frontmatter edit to remove. The two-step flow (`/save` × N → `/commit`) is friction worth one extra command for the safety it buys.
 
 ## Phase 8 — `/quit` final
 
-**[Full implementation deferred to Phase C; MVP stub below.]**
+User typed `/quit`. Offer to commit any uncommitted staged anchors, then print the session summary and exit.
 
-MVP stub:
+### Step 8.1 — Check staged anchors
 
-```
-/prompt-chat oturumu kapatıldı — chat-NNN
-- <N> turn konuşma (chat.jsonl)
-- Run dir: .promptcheck/<basename>/chat-NNN/
+```bash
+STAGED_COUNT=$(python3 -c "import json; print(len(json.load(open('$RUN_DIR/saved_anchors.json'))))")
 ```
 
-Phase C adds: if `saved_anchors.json` non-empty, ask "Frontmatter'a yazayım mı?" before exit.
+If `STAGED_COUNT > 0`, ask the user:
 
-After printing the summary, the skill exits. If isolation_mode was `in_session`, the main session's normal asistan resumes.
+```
+question (TR): "<N> staged anchor var ama henüz commit edilmedi. Frontmatter'a yazayım mı?"
+question (EN): "<N> staged anchors are uncommitted. Write them to frontmatter now?"
+header:        "Commit on exit"
+multiSelect:   false
+options:
+  - label: "Evet, yaz" | "Yes, commit"
+    description: "Run Phase 7 commit before exit. Anchors written to frontmatter.anchors[]."
+  - label: "Hayır, sonra commit ederim" | "No, I'll commit later"
+    description: "saved_anchors.json kept. Next /prompt-chat run on this prompt can pick it up via --resume (future)."
+  - label: "Hepsini sil" | "Discard all"
+    description: "Drop staged anchors. saved_anchors.json reset to []."
+```
+
+Dispatch:
+- **Yes** → execute Phase 7 inline, then proceed to Step 8.2.
+- **No** → leave `saved_anchors.json` untouched. Proceed to Step 8.2.
+- **Discard** → reset `saved_anchors.json` to `[]` (atomic write). Proceed to Step 8.2.
+
+If `STAGED_COUNT == 0`, skip directly to Step 8.2.
+
+### Step 8.2 — Final summary
+
+Read `session.json` for stats. Compute totals and print (in `report_language`):
+
+**TR:**
+```
+/prompt-chat oturumu kapatıldı — <chat-NNN>
+
+- Konuşma turu: <N>
+- Kaydedilen anchor: <M staged + K committed = total>
+- İzolasyon: <yeni pencere | in-session | setup-only>
+- Run dir: .promptcheck/<basename>/<chat-NNN>/
+
+Sonraki adım: <one of>
+  - /prompt-test <prompt> ile committed anchor'ları çalıştır (M > 0 ise)
+  - /prompt-check <prompt> ile audit yap
+  - frontmatter'ı manuel düzenle
+```
+
+**EN:** same structure, English labels.
+
+If isolation_mode was `in_session`, the main asistan resumes after the skill exits. If `new_window` or `setup_only`, this is the final message in that window (window can be closed manually).
+
+### Step 8.3 — Exit
+
+Skill returns. No further user input is consumed by `/prompt-chat`. Main session control returns to the user.
 
 ## Invariants
 
