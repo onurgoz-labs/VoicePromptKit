@@ -1,13 +1,13 @@
 ---
 name: prompt-chat
-description: Interactive chat simulator for a prompt file. Loads the prompt as the simulated system prompt, lets you converse with its persona via text, and lets you save interesting turns as test anchors. Use when the user runs /prompt-chat, asks to "chat with this prompt", "test the prompt by talking to it", or wants to iterate on a voice-agent prompt without calling Vapi. Produces chat.jsonl + optional anchors written to frontmatter.anchors[]. Never modifies the prompt body — only the frontmatter, and only on explicit /commit.
+description: Interactive chat simulator for a prompt file. Loads the prompt as the simulated system prompt, lets you converse with its persona via text, and lets you save interesting turns as test anchors. Use when the user runs /prompt-chat, asks to "chat with this prompt", "test the prompt by talking to it", or wants to iterate on a voice-agent prompt without calling Vapi. Produces chat.jsonl + optional anchors written to <prompt>.anchors.yaml (a sidecar file alongside the prompt). The prompt file itself is never touched.
 ---
 
 # prompt-chat
 
 You give a prompt file `$1` and a conversation. The skill loads the prompt as the simulated system prompt, spawns a `chat-simulator` subagent per turn to produce the persona's reply, accumulates the conversation, and lets you save turns as test anchors that `/prompt-test` can later replay.
 
-`/prompt-chat` is an exploratory tool. It is intentionally separate from `/prompt-check` (audit) and `/prompt-test` (regression) — different mental model, different state, different artefacts. The bridge between them is `frontmatter.anchors[]` (single source of truth for test scenarios).
+`/prompt-chat` is an exploratory tool. It is intentionally separate from `/prompt-check` (audit) and `/prompt-test` (regression) — different mental model, different state, different artefacts. The bridge between them is `<prompt>.anchors.yaml` (the sidecar file — single source of truth for test scenarios; v0.5.1 moved this out of the prompt's frontmatter).
 
 ## Inputs you have
 
@@ -122,7 +122,7 @@ Bootstrap empty state files (atomic, idempotent):
 
 # saved_anchors.json — staging area for anchors captured via /save.
 # Empty array on bootstrap. Phase 7 (/commit) drains this into the prompt
-# file's frontmatter.anchors[]; Phase 8 (/quit) offers to commit if non-empty.
+# sidecar file at <prompt>.anchors.yaml; Phase 8 (/quit) offers to commit if non-empty.
 printf '[]' > "$RUN_DIR/saved_anchors.json"
 
 # session.json — durable record of the chat session.
@@ -272,7 +272,7 @@ Komutlar:
   /save           — son turu anchor olarak kaydet (staging)
   /history        — bu oturumdaki turları göster
   /reset          — geçmişi sil, baştan başla
-  /commit         — staged anchor'ları frontmatter'a yaz
+  /commit         — staged anchor'ları sidecar'a (<prompt>.anchors.yaml) yaz
   /quit           — çıkış + final summary
 ```
 
@@ -365,7 +365,7 @@ User typed something starting with `/`. Parse the command (lowercase, strip lead
 | `save` | Phase 5 — anchor save sub-flow (filled in Phase C of the implementation) |
 | `history` | Pretty-print `chat.jsonl` (turn N · role · first 80 chars), then return to chat loop |
 | `reset` | Move `chat.jsonl` to `chat-N-discarded.jsonl`, create fresh empty `chat.jsonl`, update `session.json.turns = 0`. Inform user. saved_anchors.json is NOT touched. |
-| `commit` | Phase 7 — frontmatter write (filled in Phase C) |
+| `commit` | Phase 7 — sidecar write (<prompt>.anchors.yaml) |
 | `quit` | Phase 8 — final summary + optional commit prompt (filled in Phase C) |
 | anything else | Print "Bilinmeyen komut: `/<x>`. Mevcut: /save /history /reset /commit /quit" and return |
 
@@ -373,9 +373,29 @@ All five commands are implemented: `/save` dispatches to Phase 5, `/commit` to P
 
 ## Phase 5 — Anchor save sub-flow
 
-User typed `/save`. Capture the most recent user → assistant exchange as a test anchor staged in `saved_anchors.json`. The user fills in expected behaviour via four AskUserQuestion prompts; we never write to the prompt file in this phase (frontmatter changes happen only in Phase 7 / `/commit`).
+User typed `/save`. Capture either (a) the most recent user → assistant exchange as a single-turn anchor, OR (b) the entire chat conversation as a flow anchor. The user picks the kind via AskUserQuestion; the per-kind sub-flows differ but both end with staging in `saved_anchors.json` (never touching the sidecar — sidecar write only happens in Phase 7 / `/commit`).
 
-### Step 5.1 — Locate the last turn
+### Step 5.0 — Anchor kind selector (v0.5.1)
+
+Before collecting assertions, ask the user which kind of anchor they want to save:
+
+```
+question (TR): "Hangi tür anchor kaydedelim?"
+question (EN): "Which anchor kind to save?"
+header:        "Anchor kind"
+multiSelect:   false
+options:
+  - label: "Tek tur (son user → assistant)" | "Single turn (last user → assistant)"
+    description: "Mevcut + opsiyonel context (v0.5.0 davranışı; sade test)"
+  - label: "Akış (tüm konuşma)" | "Flow (entire conversation)"
+    description: "chat.jsonl'in tamamını multi-turn anchor olarak kaydet — greeting, sessizlik, kapanış dahil"
+```
+
+Dispatch:
+- **Single turn** → continue with Steps 5.1 → 5.7 (existing v0.5.0 flow, single-turn schema)
+- **Flow** → jump to Step 5.F1 (flow capture sub-flow, v0.5.1)
+
+### Step 5.1 — Locate the last turn (single-turn path)
 
 ```bash
 python3 - "$RUN_DIR" <<'PY'
@@ -496,7 +516,7 @@ header:        "Confirm"
 multiSelect:   false
 options:
   - label: "Evet, kaydet" | "Yes, save"
-    description: "Stage this anchor in saved_anchors.json. /commit will write it to frontmatter later."
+    description: "Stage this anchor in saved_anchors.json. /commit will write it to the sidecar later."
   - label: "Düzenle" | "Edit"
     description: "Re-run the 4 questions to fix the fields."
   - label: "İptal" | "Cancel"
@@ -554,8 +574,150 @@ PY
 
 Print to user (in `report_language`):
 
-- TR: `Anchor #<N> kaydedildi (staging). Toplam: <N> staged. /commit ile frontmatter'a yazılır.`
-- EN: `Anchor #<N> staged. Total: <N>. Use /commit to write them to frontmatter.`
+- TR: `Anchor #<N> kaydedildi (staging). Toplam: <N> staged. /commit ile sidecar'a yazılır.`
+- EN: `Anchor #<N> staged. Total: <N>. Use /commit to write them to the sidecar.`
+
+Return to chat loop.
+
+### Step 5.F1 — Flow capture sub-flow (v0.5.1)
+
+The user picked "Flow" in Step 5.0. Convert the entire `chat.jsonl` into a flow anchor — every user entry becomes a `user_input` (or `silence_input` if it matches the silence pattern); every assistant entry becomes an `assistant_expect` whose assertions the user fills in turn by turn.
+
+If `chat.jsonl` is empty or has zero assistant turns, surface:
+- TR: `Konuşma çok kısa — flow anchor için en az bir user→assistant turu gerekli.`
+- EN: `Conversation too short — flow anchor needs at least one user→assistant turn.`
+…and return to chat loop.
+
+**Step 5.F2 — Anchor name.** Free-form AskUserQuestion (single-line input):
+- TR: `Bu flow için bir ad ver (ör. "happy path booking", boş bırakılabilir):`
+- EN: `Give this flow a name (e.g. "happy path booking", may be empty):`
+
+Trim whitespace. Empty → `None` (the reader/runner will fall back to the first user_input's content).
+
+**Step 5.F3 — Read and pre-process chat.jsonl.**
+
+```bash
+python3 - "$RUN_DIR" <<'PY'
+import json, os, re, sys
+run_dir = sys.argv[1]
+
+SILENCE_PATTERN = re.compile(r'^\[silence\s+for\s+(\d+)\s+seconds?\]\s*$', re.IGNORECASE)
+
+entries = []
+with open(os.path.join(run_dir, 'chat.jsonl'), encoding='utf-8') as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+turns = []
+for e in entries:
+    role = e.get('role')
+    content = e.get('content', '')
+    if role == 'user':
+        m = SILENCE_PATTERN.match(content)
+        if m:
+            turns.append({'kind': 'silence_input', 'duration_seconds': int(m.group(1))})
+        else:
+            turns.append({'kind': 'user_input', 'content': content})
+    elif role == 'assistant':
+        # placeholder — user fills assertions per turn in Step 5.F4
+        turns.append({
+            'kind': 'assistant_expect',
+            '_actual': content,  # transient; stripped before staging
+        })
+
+# Write transient turn skeleton to a scratch file the skill iterates over.
+with open(os.path.join(run_dir, '_flow_capture.json'), 'w', encoding='utf-8') as f:
+    json.dump({'turns': turns}, f, indent=2, ensure_ascii=False)
+
+print(json.dumps({
+    'turn_count': len(turns),
+    'assistant_turn_count': sum(1 for t in turns if t['kind'] == 'assistant_expect'),
+    'silence_count': sum(1 for t in turns if t['kind'] == 'silence_input'),
+}, ensure_ascii=False))
+PY
+```
+
+Surface a one-line summary:
+- TR: `<N> tur (kullanıcı: <U>, asistan: <A>, sessizlik: <S>). Şimdi her asistan turu için beklenen davranışı sorayım.`
+- EN: `<N> turns (user: <U>, assistant: <A>, silences: <S>). Now asking expected behaviour per assistant turn.`
+
+**Step 5.F4 — Per-turn assistant_expect questions.** For each `assistant_expect` turn in `_flow_capture.json.turns[]`, in chat order, ask three AskUserQuestion prompts using the same free-form text shape from Steps 5.2–5.4. Render a preview before the questions:
+
+```
+Asistan turu #<k> (toplam <A>):
+> <_actual content of that turn, truncated to 200 chars>
+
+(User filled fields go here)
+```
+
+Then ask:
+1. `expect_contains` — TR: `Bu turda hangi sözcükler / ifadeler bulunmalı? (virgülle ayır, boş bırakılabilir)` / EN: same as Step 5.2.
+2. `expect_not_contains` — same as Step 5.3.
+3. `rubric` — TR: `Bu tur için rubrik (opsiyonel, ≤ 200 karakter)` / EN: same as Step 5.4.
+
+**Skip option per turn.** Add a 4th question after the three above:
+```
+question: "Bu turu test etmek istiyor musun, yoksa atlayayım mı?"
+header:   "Per-turn skip"
+options:
+  - label: "Test et" | "Test it"          (Recommended when at least one assertion was filled)
+  - label: "Atla — sadece kayıt için" | "Skip — log only"
+```
+
+If "Skip", drop the assertions; the turn becomes a `user_input` follow-on instead of an `assistant_expect` (the assistant turn is still part of the conversation but unverified). Practical: if the user only cares about the closing turn, they can skip middle turns.
+
+**Step 5.F5 — Optional `end_call_expect` terminal step.**
+
+```
+question (TR): "Bu akış bir kapanış (end_call) ile bitiyor mu?"
+question (EN): "Does this flow end with a call closure?"
+header:        "End call"
+multiSelect:   false
+options:
+  - label: "Evet — kapanış turu ekle" | "Yes — append end_call_expect"
+    description: "Son asistan turunu end_call_expect olarak işaretle; örtük 'session closed' rubric'i uygulanır."
+  - label: "Hayır" | "No"
+    description: "Akış mevcut son turla biter (varsa assistant_expect; yoksa user_input)."
+```
+
+If "Yes": find the LAST `assistant_expect` in `turns[]` (after Step 5.F4 finalisation) and change its `kind` to `end_call_expect`. Also ask one more rubric question specific to the closing (default empty, the implicit "session closed" rubric still applies).
+
+**Step 5.F6 — Preview and confirm.**
+
+Render the staged flow anchor with all turns + per-turn assertions + optional end_call rubric. Use AskUserQuestion `Confirm` (same 3 options as Step 5.6: Yes / Edit / Cancel). On Edit, jump back to Step 5.F4 (re-run per-turn questions). On Cancel, no-op.
+
+**Step 5.F7 — Stage the flow anchor.**
+
+Strip transient `_actual` fields from each turn. Atomic append to `saved_anchors.json` (same pattern as Step 5.7). Remove `_flow_capture.json`. Update `session.json.saved_anchors`.
+
+The staged anchor shape mirrors the sidecar schema verbatim:
+
+```yaml
+- kind: flow
+  name: "<from Step 5.F2 or null>"
+  turns:
+    - kind: user_input
+      content: "Merhaba"
+    - kind: assistant_expect
+      expect_contains: [...]    # only present if user filled
+      expect_not_contains: [...]
+      rubric: "..."
+    - kind: silence_input       # if matched
+      duration_seconds: 6
+    - kind: assistant_expect
+      rubric: "..."
+    - kind: end_call_expect     # if user picked Yes in Step 5.F5
+      rubric: "..."
+```
+
+Surface to user:
+- TR: `Flow anchor #<N> kaydedildi (staging — <T> tur, <A> assistant_expect). /commit ile sidecar'a yazılır.`
+- EN: `Flow anchor #<N> staged (<T> turns, <A> assistant_expects). Use /commit to write to sidecar.`
 
 Return to chat loop.
 
@@ -594,7 +756,7 @@ If the subagent reports an error (its status line starts with `chat-simulator er
 
 ## Phase 7 — Frontmatter commit (`/commit`)
 
-User typed `/commit`. Atomic-write the staged anchors from `saved_anchors.json` into the prompt file's `frontmatter.anchors[]`. The body of the prompt is NEVER touched — only the YAML header.
+User typed `/commit`. Atomic-write the staged anchors from `saved_anchors.json` into `<prompt>.anchors.yaml` (the sidecar). The prompt file is NEVER touched in v0.5.1 — neither body nor frontmatter. The sidecar lives alongside the prompt; its content is `{schema_version: 1, anchors: [...]}`.
 
 ### Step 7.1 — Load staged anchors
 
@@ -609,13 +771,13 @@ If `STAGED_COUNT == 0`:
 
 …and return to chat loop.
 
-### Step 7.2 — Atomic frontmatter write
+### Step 7.2 — Atomic sidecar write
 
-The write is in three stages: build the new file content, write to a temp file, validate the temp by parsing it back, then atomically rename. Rollback on any failure.
+The write is in three stages: build the new sidecar content, write to a temp file, validate the temp by parsing it back, then atomically rename. Rollback on any failure. **The prompt file itself is never touched** — only `<prompt>.anchors.yaml` is created or modified, so the prompt SHA256 stays stable and any cached `/prompt-check` audits remain valid.
 
 ```bash
 python3 - "$ABS_PROMPT" "$RUN_DIR/saved_anchors.json" <<'PY'
-import sys, os, re, json, yaml, datetime, shutil
+import sys, os, json, yaml, datetime, shutil
 
 prompt_path, staged_path = sys.argv[1], sys.argv[2]
 staged = json.load(open(staged_path, encoding='utf-8'))
@@ -623,52 +785,56 @@ if not staged:
     print("WARN: nothing to commit", file=sys.stderr)
     sys.exit(0)
 
-text = open(prompt_path, encoding='utf-8').read()
+sidecar_path = prompt_path + ".anchors.yaml"
 
-# Parse existing frontmatter (or none).
-m = re.match(r'^---\r?\n(.*?)\r?\n---\r?\n?(.*)$', text, re.DOTALL)
-if m:
-    fm_raw, body = m.group(1), m.group(2)
+# Read existing sidecar if any. Refuse to overwrite an unknown schema_version.
+if os.path.exists(sidecar_path):
     try:
-        fm = yaml.safe_load(fm_raw) or {}
+        sidecar = yaml.safe_load(open(sidecar_path, encoding='utf-8')) or {}
     except yaml.YAMLError as e:
-        print(f"ERROR: existing frontmatter unparseable — aborting commit. {e}", file=sys.stderr)
+        print(f"ERROR: existing sidecar unparseable — aborting commit. {e}", file=sys.stderr)
         sys.exit(2)
+    if sidecar.get('schema_version') != 1:
+        print(
+            f"ERROR: sidecar schema_version mismatch: got {sidecar.get('schema_version')!r}, "
+            f"expected 1. Aborting commit to avoid clobbering a future schema.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    existing_anchors = sidecar.get('anchors') or []
 else:
-    fm, body = {}, text  # no frontmatter; we'll create one
+    sidecar = {'schema_version': 1, 'anchors': []}
+    existing_anchors = []
 
-existing_anchors = fm.get('anchors') or []
-fm['anchors'] = existing_anchors + staged
+sidecar['schema_version'] = 1
+sidecar['anchors'] = existing_anchors + staged
 
-# Emit with allow_unicode=True (TR characters), sort_keys=False (preserve author's
-# key order — anchors appended to the end of whatever keys exist), default_flow_style=False
-# (block style for readability).
-new_fm = yaml.safe_dump(fm, allow_unicode=True, sort_keys=False, default_flow_style=False)
-new_text = f"---\n{new_fm}---\n{body}"
+# Emit with allow_unicode=True (TR characters in input/expected fields),
+# sort_keys=False (schema_version first, anchors next — readable order),
+# default_flow_style=False (block style for readability of nested turns[]).
+new_text = yaml.safe_dump(sidecar, allow_unicode=True, sort_keys=False, default_flow_style=False)
 
 # Write temp, validate, rename.
-tmp = prompt_path + '.chat-commit.tmp.' + str(os.getpid())
+tmp = sidecar_path + '.chat-commit.tmp.' + str(os.getpid())
 with open(tmp, 'w', encoding='utf-8') as f:
     f.write(new_text)
 
-# Validation: re-parse temp file's frontmatter. If we can't, do not commit.
+# Validation: re-parse temp file. If we can't, do not commit.
 try:
-    check_text = open(tmp, encoding='utf-8').read()
-    check_m = re.match(r'^---\r?\n(.*?)\r?\n---\r?\n?(.*)$', check_text, re.DOTALL)
-    if not check_m:
-        raise ValueError("temp file has no frontmatter delimiter")
-    check_fm = yaml.safe_load(check_m.group(1)) or {}
-    if not isinstance(check_fm.get('anchors'), list):
-        raise ValueError("temp file's anchors field is not a list")
-    if len(check_fm['anchors']) != len(existing_anchors) + len(staged):
-        raise ValueError(f"anchor count mismatch: got {len(check_fm['anchors'])}, expected {len(existing_anchors)+len(staged)}")
+    check = yaml.safe_load(open(tmp, encoding='utf-8')) or {}
+    if check.get('schema_version') != 1:
+        raise ValueError(f"schema_version not 1 after write: got {check.get('schema_version')!r}")
+    if not isinstance(check.get('anchors'), list):
+        raise ValueError("anchors field is not a list")
+    if len(check['anchors']) != len(existing_anchors) + len(staged):
+        raise ValueError(f"anchor count mismatch: got {len(check['anchors'])}, expected {len(existing_anchors)+len(staged)}")
 except Exception as e:
     os.remove(tmp)
     print(f"ERROR: post-write validation failed — rollback complete. {e}", file=sys.stderr)
     sys.exit(3)
 
 # Validation passed — atomic rename.
-os.rename(tmp, prompt_path)
+os.rename(tmp, sidecar_path)
 
 # Archive saved_anchors.json with a committed timestamp prefix.
 ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -701,21 +867,23 @@ PY
 
 Exit codes:
 - `0` — success
-- `2` — existing frontmatter unparseable (do not touch the prompt file; surface to user)
-- `3` — post-write validation failed (temp removed; prompt file is unchanged)
+- `2` — existing sidecar unparseable or has unknown schema_version (sidecar untouched; surface to user)
+- `3` — post-write validation failed (temp removed; sidecar unchanged)
 
 ### Step 7.3 — Surface result
 
 On success, print to user (in `report_language`):
 
-- TR: `<N> anchor frontmatter'a yazıldı. Prompt: <basename>. /prompt-test ile çalıştırabilirsin.`
-- EN: `<N> anchors written to frontmatter. Prompt: <basename>. Use /prompt-test to run them.`
+- TR: `<N> anchor sidecar'a yazıldı (<basename>.anchors.yaml). /prompt-test ile çalıştırabilirsin.`
+- EN: `<N> anchors written to sidecar (<basename>.anchors.yaml). Use /prompt-test to run them.`
 
-On error (exit 2 or 3), print the stderr message verbatim and return to chat loop. The user can investigate the prompt file's existing frontmatter (likely a manual YAML syntax issue) and try again.
+On error (exit 2 or 3), print the stderr message verbatim and return to chat loop. The user can investigate the sidecar file (manual YAML edits, schema_version drift) and try again.
 
-### Why staged-then-commit (not instant-write)
+### Why sidecar (v0.5.1) — staged-then-commit (unchanged)
 
-Staged saves let the user iterate fast and discard mistakes. Instant writes would mutate the prompt file on every `/save`, invalidating any cached `/prompt-check` audit (the SHA256 stale-audit guard) — and a typo'd anchor would require a frontmatter edit to remove. The two-step flow (`/save` × N → `/commit`) is friction worth one extra command for the safety it buys.
+The anchors live in a sibling file `<prompt>.anchors.yaml`, not in the prompt's frontmatter. This keeps the prompt SHA256 stable across anchor edits — cached `/prompt-check` audits remain valid, the prompt body and frontmatter stay author-content-only, and the test configuration has a single file the user can edit / diff / commit independently.
+
+Staged saves still gate the write: `/save` × N → `/commit` writes all staged anchors at once. The friction is small (one extra command) and the safety is worth it: a typo'd anchor can be discarded by `/quit → Discard all` without ever touching the sidecar file.
 
 ## Phase 8 — `/quit` final
 
@@ -730,13 +898,13 @@ STAGED_COUNT=$(python3 -c "import json; print(len(json.load(open('$RUN_DIR/saved
 If `STAGED_COUNT > 0`, ask the user:
 
 ```
-question (TR): "<N> staged anchor var ama henüz commit edilmedi. Frontmatter'a yazayım mı?"
+question (TR): "<N> staged anchor var ama henüz commit edilmedi. Sidecar'a (<prompt>.anchors.yaml) yazayım mı?"
 question (EN): "<N> staged anchors are uncommitted. Write them to frontmatter now?"
 header:        "Commit on exit"
 multiSelect:   false
 options:
   - label: "Evet, yaz" | "Yes, commit"
-    description: "Run Phase 7 commit before exit. Anchors written to frontmatter.anchors[]."
+    description: "Run Phase 7 commit before exit. Anchors written to the sidecar (<prompt>.anchors.yaml)."
   - label: "Hayır, sonra commit ederim" | "No, I'll commit later"
     description: "saved_anchors.json kept. Next /prompt-chat run on this prompt can pick it up via --resume (future)."
   - label: "Hepsini sil" | "Discard all"
