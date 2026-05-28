@@ -48,9 +48,9 @@ echo "BASENAME=$BASENAME"
 Then parse frontmatter + body. Reuse the exact Python heredoc pattern from `skills/prompt-check/SKILL.md` Phase 2 (don't re-derive it — same parsing, same atomic write):
 
 ```bash
-python3 - "$ABS_PROMPT" "$RUN_DIR" <<'PY'
-import sys, re, json, os, hashlib
-prompt_path, run_dir = sys.argv[1], sys.argv[2]
+python3 - "$ABS_PROMPT" "$RUN_DIR" "$REPO_ROOT" <<'PY'
+import sys, re, json, os, hashlib, subprocess
+prompt_path, run_dir, repo_root = sys.argv[1], sys.argv[2], sys.argv[3]
 text = open(prompt_path, encoding='utf-8').read()
 
 prompt_sha256 = hashlib.sha256(text.encode('utf-8')).hexdigest()
@@ -76,6 +76,23 @@ except Exception:
             k, v = line.split(':', 1)
             fm[k.strip()] = v.strip()
 
+# v0.5.1: count existing anchors via the sidecar reader so the session metadata
+# reflects sidecar + frontmatter combined (sidecar wins) — same source of truth
+# the rest of the pipeline uses.
+existing_anchors_count = 0
+anchors_source = 'none'
+try:
+    _r = subprocess.run(
+        [sys.executable, os.path.join(repo_root, 'bin', 'read-anchors.py'), prompt_path],
+        capture_output=True, text=True, timeout=30,
+    )
+    if _r.returncode == 0:
+        _p = json.loads(_r.stdout)
+        existing_anchors_count = len(_p.get('anchors', []))
+        anchors_source = _p.get('source', 'none')
+except Exception:
+    pass
+
 # Resolve defaults (target_model, report_language) the same way /prompt-check does.
 # We keep this minimal — the chat skill only needs target_model + report_language.
 resolved = {
@@ -84,7 +101,8 @@ resolved = {
     'body_char_count':  len(body),
     'body_line_offset': body_line_offset,
     'prompt_sha256':    prompt_sha256,
-    'existing_anchors_count': len(fm.get('anchors') or []),
+    'existing_anchors_count': existing_anchors_count,
+    'anchors_source':   anchors_source,
 }
 if resolved['report_language'] not in ('tr', 'en'):
     resolved['report_language'] = 'tr'

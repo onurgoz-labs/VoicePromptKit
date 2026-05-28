@@ -48,9 +48,9 @@ echo "BASENAME=$BASENAME"
 Parse frontmatter + body. The full pattern is in `/prompt-check` Phase 2; the minimal subset `/prompt-test` needs:
 
 ```bash
-python3 - "$ABS_PROMPT" "$RUN_DIR" <<'PY'
-import sys, re, json, os, hashlib
-prompt_path, run_dir = sys.argv[1], sys.argv[2]
+python3 - "$ABS_PROMPT" "$RUN_DIR" "$REPO_ROOT" <<'PY'
+import sys, re, json, os, hashlib, subprocess
+prompt_path, run_dir, repo_root = sys.argv[1], sys.argv[2], sys.argv[3]
 text = open(prompt_path, encoding='utf-8').read()
 prompt_sha256 = hashlib.sha256(text.encode('utf-8')).hexdigest()
 
@@ -71,7 +71,31 @@ try:
 except Exception:
     fm = {}
 
-anchors = fm.get('anchors') or []
+# v0.5.1: read anchors from sidecar (<prompt>.anchors.yaml), falling back to
+# frontmatter.anchors[] with deprecation warning. Helper handles schema
+# validation, silence_input sugar expansion, and turn alternation checks.
+anchors = []
+anchors_source = 'none'
+anchor_warnings = []
+try:
+    _r = subprocess.run(
+        [sys.executable, os.path.join(repo_root, 'bin', 'read-anchors.py'), prompt_path],
+        capture_output=True, text=True, timeout=30,
+    )
+    if _r.returncode == 0:
+        _p = json.loads(_r.stdout)
+        anchors = _p.get('anchors', [])
+        anchors_source = _p.get('source', 'none')
+        anchor_warnings = _p.get('warnings', [])
+    else:
+        anchors = fm.get('anchors') or []
+        anchors_source = 'frontmatter' if anchors else 'none'
+        anchor_warnings = [f"anchor reader failed (exit {_r.returncode}): {_r.stderr.strip()}"]
+except Exception as _e:
+    anchors = fm.get('anchors') or []
+    anchors_source = 'frontmatter' if anchors else 'none'
+    anchor_warnings = [f"anchor reader exception: {_e}"]
+
 resolved = {
     'target_model':     fm.get('target_model') or 'claude-opus-4-7',
     'report_language':  (fm.get('report_language') or 'tr').lower(),
@@ -81,6 +105,8 @@ resolved = {
     'body_line_offset': body_line_offset,
     'prompt_sha256':    prompt_sha256,
     'anchors':          anchors,
+    'anchors_source':   anchors_source,
+    'anchor_warnings':  anchor_warnings,
 }
 if resolved['report_language'] not in ('tr', 'en'):
     resolved['report_language'] = 'tr'

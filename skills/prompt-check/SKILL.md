@@ -154,9 +154,9 @@ Extract YAML frontmatter and merge it against env vars + project config + built-
 
 ```bash
 [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_2_start" >> "$TIMING_LOG"
-python3 - "$ABS_PROMPT" "$RUN_DIR" "$CONFIG_PATH" <<'PY'
-import sys, re, json, os, hashlib
-prompt_path, run_dir, config_path = sys.argv[1], sys.argv[2], sys.argv[3]
+python3 - "$ABS_PROMPT" "$RUN_DIR" "$CONFIG_PATH" "$REPO_ROOT" <<'PY'
+import sys, re, json, os, hashlib, subprocess
+prompt_path, run_dir, config_path, repo_root = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 text = open(prompt_path, encoding='utf-8').read()
 
 # D1: snapshot the prompt content hash for stale-audit detection in Phase 10's
@@ -231,7 +231,34 @@ if ec is None:
             ec = 3
 resolved['expand_count'] = int(ec)
 
-resolved['anchors'] = fm.get('anchors') or []
+# v0.5.1: read anchors from sidecar file (<prompt>.anchors.yaml), falling back to
+# frontmatter.anchors[] with a deprecation warning. The helper at bin/read-anchors.py
+# also validates schema_version, expands silence_input sugar, and drops invalid
+# flow anchors per turn-alternation rules.
+_anchors_warnings = []
+try:
+    _reader_result = subprocess.run(
+        [sys.executable, os.path.join(repo_root, 'bin', 'read-anchors.py'), prompt_path],
+        capture_output=True, text=True, timeout=30,
+    )
+    if _reader_result.returncode == 0:
+        _payload = json.loads(_reader_result.stdout)
+        resolved['anchors'] = _payload.get('anchors', [])
+        resolved['anchors_source'] = _payload.get('source', 'none')
+        for w in _payload.get('warnings', []):
+            _anchors_warnings.append(f"anchors: {w}")
+    else:
+        # Reader exited non-zero (e.g. prompt file unreadable). Fall back to
+        # the legacy in-heredoc parse to avoid losing pre-v0.5.1 anchors.
+        resolved['anchors'] = fm.get('anchors') or []
+        resolved['anchors_source'] = 'frontmatter' if resolved['anchors'] else 'none'
+        _anchors_warnings.append(
+            f"anchor reader failed (exit {_reader_result.returncode}): {_reader_result.stderr.strip()}"
+        )
+except Exception as _e:
+    resolved['anchors'] = fm.get('anchors') or []
+    resolved['anchors_source'] = 'frontmatter' if resolved['anchors'] else 'none'
+    _anchors_warnings.append(f"anchor reader exception: {_e}")
 
 tr = fm.get('tr_phonetic')
 if tr is None:
@@ -314,6 +341,12 @@ if 'html' in resolved['output']:
     resolved['output'] = [o for o in resolved['output'] if o != 'html']
     if not resolved['output']:
         resolved['output'] = ['markdown', 'findings_json']
+
+# v0.5.1: propagate anchor-reader warnings (sidecar parse errors, deprecation
+# notices, dual-existence, etc.) into the same config_warnings stream so they
+# surface in Phase 8's terminal summary alongside other config issues.
+warnings.extend(_anchors_warnings)
+
 resolved['config_warnings'] = warnings
 
 with open(os.path.join(run_dir, 'frontmatter.json'), 'w', encoding='utf-8') as f:
