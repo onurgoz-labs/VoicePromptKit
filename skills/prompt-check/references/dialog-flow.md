@@ -64,38 +64,29 @@ This question is **advisory only** — anchors live in the prompt file's frontma
 
 After Phase 7 produces `findings.json`, the skill renders a single markdown table covering every finding from every selected lens. This is the user's one-shot view of the audit.
 
-**Sort order:** `line` ascending, then `severity` descending (`high` → `medium` → `low`). Stable sort — preserve `findings.json` order on ties.
+**Sort order:** severity descending (`high` → `medium` → `low`) → lens group → `line` ascending. Stable sort — preserve `findings.json` order on ties.
 
-**Columns:**
+**Columns:** the table matches `report.md` exactly — six columns, translated per `report_language`. See `lens-rules.md` "Render contract — table format + compact writing" for the canonical column definitions, content rules, and translations.
 
-| Column | Source | Truncation |
-|---|---|---|
-| `id` | `findings[].id` | none |
-| `lens` | `findings[].lens` | none |
-| `sev` | `findings[].severity` | none |
-| `section` | `findings[].section_ref.subsection` if set, else `findings[].section_ref.section` if set, else `—` | none |
-| `line` | `findings[].line` (original-file) | none |
-| `summary` | composed: `{short_rationale} → **{short_fix}**` (drift / advisory-only finding: rationale only) | rationale ≤ 120 chars · fix ≤ 100 chars (see below) |
+| Language | id | lens | severity | section/line | rationale | fix |
+|---|---|---|---|---|---|---|
+| TR | `id` | `mercek` | `önem` | `bölüm / satır` | `açıklama` | `düzeltme` |
+| EN | `id` | `lens` | `sev` | `section / line` | `rationale` | `fix` |
 
-The `section` column anchors findings in their containing prompt section. Useful when a 1758-line prompt has dozens of findings — the user can quickly group them by section/subsection mentally. Findings with no section context show `—`.
+No render-side truncation. Runners self-cap at ≤200 chars rationale, ≤150 chars suggested_fix (compact writing invariant); the table uses full text verbatim.
 
-The `summary` column combines:
-
-- A short **rationale** (truncated to ≈ 80–90 chars; first sentence).
-- The arrow `→` separator.
-- The short **fix** (truncated to ≈ 50–60 chars; first imperative).
-
-**Rendered shape:**
+**Rendered shape (TR — default):**
 
 ```markdown
 ## Findings — run-NNN
 
-| id | lens | sev | section | line | summary |
+| id | mercek | önem | bölüm / satır | açıklama | düzeltme |
 |---|---|---|---|---|---|
-| C1 | conflict | high | 7.2 | 284 | Tone contradiction (R3↔R2): "always formal" vs "casual ve friendly" → **Maintain a professional but warm register.** |
-| S1 | schema | high | 7 | 280 | Section 5 → Section 7: Section 6 missing → **Insert Section 6 — Placeholder, OR renumber 7 → 6.** |
-| G2 | gap | medium | 3.4 | 27 | R7 silence threshold hedged as "e.g. 5 seconds" → **Pin a concrete duration (e.g. 5 or 7 seconds).** |
-| T3 | tr_phonetic | low | 1.3 | 17 | Long sentence carrying date range needs pacing → **Comma after "sebebiyle".** |
+| C2 | çelişki | yüksek | Bölüm 5 / Satır 326 | R78 sms_retry_count max=1 ile R80 max=2 çelişiyor | R80'i max=1 yap VEYA R78'i max=2 yap |
+| D1 | baskınlık | orta | Bölüm 0.3 / Satır 21 | R10 yasak ifade flow içinde 4.6 Step 3 kullanıyor | Satır 295'i farklı ifadeyle yeniden yaz |
+| G5 | boşluk | orta | Bölüm 0.1 / Satır 7 | R4 "step instructions require it" tanımsız | R4'ü netleştir: "verbatim scripts muaftır" |
+| S1 | şema | düşük | Bölüm 0.1 / Satır 3 | Bölüm 0 alt başlıkları BÜYÜK, diğerleri Başlık | Tüm alt başlıkları tek stile normalleştir |
+| drift-S1 | davranışsal sapma | düşük | — / — | regression senaryosu geçti (0.93) | (geçti — düzeltme yok) |
 
 _Note: 3 TR pronunciation findings (foreign_word + abbreviation) will be auto-filed to the overlay's Pronunciation map. They are not in the table — no decision needed._
 
@@ -106,22 +97,11 @@ Verbs: düzelt | yorum bırak | atla | konuşalım  (alias: apply | overlay | di
 Special: gerisini atla | gerisini yorum | hepsini düzelt | hepsini yorum bırak | hepsini atla | iptal
 ```
 
-For findings where `suggested_fix` is null (drift, advisory TR with only `pronunciation_entry`), the `summary` cell carries the rationale alone:
+The summary table matches `report.md` exactly — same columns, same row format, same translations per `report_language`. Findings are full-text (no truncation); runners self-cap at ≤200 chars rationale / ≤150 chars fix. The decision prompt that follows references findings by id only: `C1, C3 düzelt; G2 yorum bırak; drift-S1..drift-S7 atla; gerisini atla`.
 
-```markdown
-| drift-S3 | drift | medium | — | — | Model refuses to acknowledge the conflict between R3 and R8 in adversarial scenario. |
-```
+For findings where `suggested_fix` is null/empty (drift, advisory TR with only `pronunciation_entry`), the `düzeltme` / `fix` cell renders a sentinel — `(geçti — düzeltme yok)` for passed drift findings, `_(bkz. açıklama)_` / `_(see rationale)_` for other lenses with no concrete fix.
 
-The `id | lens | sev | section | line | summary` header row stays the same in both TR and EN modes — the labels follow `report_language` but the column NAMES are language-agnostic data anchors.
-
-The `summary` column is a ONE-LINE compact view: `short_rationale → short_fix`.
-Truncation algorithm matches `overlay-format.md` (first sentence, ≤ 120 chars
-rationale, ≤ 100 chars fix). The full rationale + fix remain in `findings.json`
-for downstream tooling and Phase 10 application.
-
-Goal: the user can scan the table and immediately see "what" and "what to do"
-without expanding each row. The decision prompt that follows the table
-references findings by id only (`"C1, C3 düzelt; G2 yorum bırak..."`).
+For drift findings, both `section_ref` and `line` are null, so the `bölüm / satır` cell renders `— / —`. This is the v0.4.10 contract — earlier versions incorrectly rendered `Satır 1` for drift findings.
 
 > **Note:** TR findings with `kind == "foreign_word"` or `"abbreviation"` (`fix_kind: "advisory"`) are NOT in this table — they auto-file to the overlay's Pronunciation map without a user decision. Only TR findings with `kind == "number_readability"` or `"punctuation"` (`fix_kind: "replace"`) appear here. The `T1` row above is an example of a TR `number_readability` finding (`100 TL` → `yüz lira`), which is `fix_kind: "replace"` and therefore still in the table.
 >

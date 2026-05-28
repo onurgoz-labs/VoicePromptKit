@@ -34,38 +34,49 @@ Phase 10 always writes to the **latest** run's overlay (the run that produced th
 
 ### {section_marker} [{finding_id} {lens}, {severity}] — status: overlay
 
-> {short_rationale} → **{short_fix}**
+> {rationale_full}
+
+**Düzeltme:** {suggested_fix_full}
 
 - _Decided:_ {timestamp} · _Note:_ {note (omit when absent)} · _Decision:_ overlay
 ```
 
+(Translations of "Düzeltme" / "Note" / "Decision" follow report_language.)
+
 Where:
 
 - `{section_marker}` is `Section 7.2 — L284` (when `section_ref.subsection` is set), `Section 7 — L284` (when only `section_ref.section` is set), or `L284` (when `section_ref` is null). English in the overlay regardless of `report_language` — the overlay file is a structured artefact, language switching applies to `report.md` only.
-- `{short_rationale}` is the finding's `rationale` truncated to ≤ 120 chars (first sentence; ellipsis at 117 + `"..."` if longer).
-- `{short_fix}` is the `suggested_fix` truncated to ≤ 100 chars. For sentinel suggestions (`TODO: ...` / `Intentional —`) the `→` arrow is omitted and the body line shows `> {short_rationale}` only; the sentinel surfaces in the third metadata line as `_Decision: overlay (sentinel: TODO)_` (or `sentinel: Intentional`).
-- For **drift findings** (`suggested_fix == null` / `line == null`): `### [drift-S3 drift, high] — status: overlay` (no `section_marker`, no `→ fix`), then the rationale line, then the metadata.
-- For **advisory TR findings** with `pronunciation_entry` populated and `suggested_fix == null`: the body line surfaces the pronunciation hint instead of `→ fix`: `> {short_rationale} → **{pronunciation_entry.term} → "{pronunciation_entry.phonetic}"** (strategy: {strategy})`.
+- `{rationale_full}` is the finding's `rationale` field verbatim from `findings.json`. No truncation — runners self-cap at ≤200 chars (compact writing invariant).
+- `{suggested_fix_full}` is the `suggested_fix` field verbatim. No truncation — runners self-cap at ≤150 chars. For sentinel suggestions (`TODO: ...` / `Intentional —`) the body shows the rationale on the blockquote line and the sentinel on the "Düzeltme:" line; the sentinel also surfaces in the metadata line as `_Decision: overlay (sentinel: TODO)_` (or `sentinel: Intentional`).
+- For **drift findings** (`suggested_fix == null` / `line == null`): `### [drift-S3 drift, high] — status: overlay` (no `section_marker`), then the rationale blockquote, then `**Düzeltme:** (passed — no fix)` (or the TR equivalent `(geçti — düzeltme yok)`), then the metadata.
+- For **advisory TR findings** with `pronunciation_entry` populated and `suggested_fix == null`: the body shows the rationale blockquote, then `**Düzeltme:** {pronunciation_entry.term} → "{pronunciation_entry.phonetic}" (strategy: {strategy})`.
 
-The **revised** variant uses the same compact shape, with the heading marker swapped to `(revised)` and the body line showing the user-supplied replacement:
+The **revised** variant uses the same shape, with the heading marker swapped to `(revised)` and the "Düzeltme:" line carrying the user-supplied replacement:
 
 ```markdown
 ### {section_marker} [{finding_id} {lens}, {severity}] — status: overlay (revised)
 
-> {short_rationale} → **{short_revised_text}** _(was: "{short_original_fix}")_
+> {rationale_full}
+
+**Düzeltme:** {revised_text_full} _(was: "{original_fix_full}")_
 
 - _Decided:_ {timestamp} · _Note:_ {note (omit when absent)} · _Decision:_ overlay (revised)
 ```
 
 The section marker matches `section_ref` from findings.json. When `section_ref: null`, the marker is the bare line number. Schema lens findings that flag a heading itself (e.g. `section_gap` on line 280 = `## SECTION 7`) use the heading's own section as the marker.
 
-### Compact render rules
+### Render rules (compact writing invariant)
 
-- **Truncation is render-only.** `findings.json` still carries the full `rationale` + `suggested_fix` verbatim. Truncation applies ONLY to overlay + report + summary table.
-- **Truncation algorithm:** take the first sentence (split on `. ` or `! ` or `? ` boundary). If the first sentence exceeds the limit (120 chars rationale / 100 chars fix), ellipsis at limit-3 + `...`. Preserve trailing punctuation when the sentence fits.
-- **Structural fix shortening:** for `fix_strategy=structural` suggestions like `"Rewrite the X to remove Y. Suggested: 'Z'"`, extract the first imperative (`"Rewrite the X to remove Y."`) — NOT the suggested replacement text.
-- **Section-aware sort still applies.** Overlay sorts by severity desc → lens group → line asc, same as `findings.json.findings[]`.
-- **Per-finding entries excluded** for auto-filed TR findings (`foreign_word` + `abbreviation`, `decisions.jsonl` action: `auto_filed`). They appear only in the Pronunciation map section, not in "Findings with overlay status".
+- **No render-side truncation.** Runners self-cap at ≤200 chars rationale, ≤150 chars suggested_fix. The overlay uses full text verbatim.
+- **section_marker** uses `section_ref`:
+  - subsection: `Section 7.2 — L284`
+  - section only: `Section 7 — L284`
+  - null + line set: `— — L284`
+  - null + null (drift): `— — —`
+- **Structural fix shortening (compact writing) lives in the runner**, not here. The overlay shows the runner's text verbatim.
+- **Sort key** unchanged: severity desc → lens group → line asc → id.
+- **Auto-filed TR findings** (foreign_word + abbreviation) excluded from per-finding entries — surface only in the Pronunciation map.
+- **Drift findings** show no line/section in the header line because both are null.
 
 ### Rendering rules
 
