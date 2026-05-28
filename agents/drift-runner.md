@@ -54,9 +54,30 @@ Read every file under `inputs` exactly once. **Never read `output_path`** — it
 3. `expand_count` (whether from `inputs.expand_count_override`, `frontmatter.expand_count`, or the built-in default 3) is IGNORED. `expand_count: 0` does NOT disable drift in regression-only mode — anchors are still expanded into scenarios.
 4. The `rules` / `conflicts` / `gaps` / `dominances` inputs are NOT required (the caller may pass `null` or omit them). Their absence is NOT a warning.
 5. Apply `compact_mode` only insofar as it caps individual scenario verbosity — never trim the scenario count below the anchor count.
-6. Honour optional `anchor.context[]` (new, additive — see probes.md section 1): when present and non-empty, the regression scenario carries `prior_context` (a list of `{role, content}` entries). Step 2's simulation feeds `prior_context` to the model BEFORE the `input` is sent as the final user turn. When `context` is absent or `[]`, behaviour is unchanged (the input is sent as the first and only user turn).
+6. **Per-anchor branching by `kind`** (v0.5.1):
+   - **No `kind` field, or `kind == "single"`** → produce one scenario with `kind: "regression"`. Copy `anchor.input` → `scenario.input`; copy assertions; copy `anchor.context[]` → `scenario.prior_context` when present (single-turn with optional prior conversation). Existing v0.5.0 behaviour, unchanged.
+   - **`kind == "flow"`** → produce one scenario with `kind: "flow_regression"`. Copy `anchor.name` → `scenario.name` (or generate from first user_input content when missing). Copy `anchor.turns[]` (already expanded by the reader — `silence_input` sugar is already resolved into `user_input` form) → `scenario.turns[]`. Flow anchors do NOT carry `prior_context` — the conversation history IS the `turns[]` array.
+   - **Unknown `kind`** → emit a warning per anchor, skip the anchor (do not include in the scenario list).
 
 After producing the regression scenario list, jump directly to Step 2 (skip the rest of Step 1's logic for non-regression scenarios).
+
+**Flow scenario shape:**
+
+```json
+{
+  "id": "S<n>",
+  "kind": "flow_regression",
+  "name": "happy path booking",
+  "turns": [
+    {"kind": "user_input",        "content": "Merhaba"},
+    {"kind": "assistant_expect",  "expect_contains": ["Merve","Millenicom"], "rubric": "..."},
+    {"kind": "user_input",        "content": "[silence for 6 seconds]"},
+    {"kind": "assistant_expect",  "rubric": "..."},
+    {"kind": "end_call_expect",   "rubric": "polite close + end-call-tool"}
+  ],
+  "derived_from": "anchor<n>"
+}
+```
 
 **Normal path (when `regression_only` is false / absent):**
 
@@ -121,6 +142,21 @@ When `prior_context` is absent or empty, the scenario behaves as before — fres
 
 This handles the codex-flagged "state machine" gap: voice-agent prompts often only make sense after a greeting + identity check have happened. Anchors with `context` can capture those mid-flow states without inventing a multi-turn anchor schema.
 
+**Flow scenario simulation (v0.5.1 — `scenario.kind == "flow_regression"`):**
+
+A flow scenario is a scripted multi-turn conversation. The `turns[]` array specifies an alternating sequence of `user_input` and `assistant_expect` steps, optionally terminated by `end_call_expect`. The simulation walks the turns in order:
+
+1. Initialise a fresh conversation. The body is the simulated system prompt; no prior history.
+2. Iterate `turns[]` in order. For each step:
+   - **`user_input`** — append `{role: "user", content: <step.content>}` to the in-memory conversation. Then produce the next assistant turn AS the simulated persona would, given the conversation so far. Append that assistant turn to the conversation. The assistant's content is what the next `assistant_expect` step will be evaluated against.
+     - **Silence convention:** when `content == "[silence for N seconds]"` (the expanded form of the authored `silence_input` sugar), the user has said nothing — the persona should apply whatever silence policy the prompt defines (e.g. confirm caller is still there, re-ask the open question, escalate to handoff after K silences). Treat it as a meaningful conversational event, not as user speech.
+   - **`assistant_expect`** — do NOT call the model again. The LAST entry in the conversation is the assistant turn produced by the immediately preceding `user_input` step. Evaluate THAT turn against `expect_contains` / `expect_not_contains` / `rubric` from this step. Record a per-step verdict.
+   - **`end_call_expect`** — produce the next assistant turn as you would for a `user_input`, but the persona is expected to close the call here. Evaluate the closing turn against the step's assertions (rubric optional). The implicit "session is closed by the assistant" check applies — if the persona produces further dialogue beyond the closing line, that's a soft fail. No turns are processed after `end_call_expect`; this is the terminal step.
+3. Hold the full conversation transcript in memory. It goes into the run's `turns[]` field (see Output format below) for debugging the failure mode.
+4. Continue to the next scenario (back to the simulation loop or to Step 3 judging when all scenarios are done).
+
+Flow simulation runs **per-scenario sequentially** (multi-turn requires the model to remember the conversation), NOT in the cross-scenario batch shape used for single-turn scenarios. Each flow scenario has its own model-call chain. Single-turn `regression` scenarios are still batched as before. Mixing flow and single-turn in one drift output is supported — the runner picks the right simulation pattern per scenario kind.
+
 **Output format (mandatory, machine-readable):**
 
 Produce a single JSON object holding every Run, in `scenario_id` order:
@@ -136,15 +172,25 @@ Produce a single JSON object holding every Run, in `scenario_id` order:
     },
     {
       "scenario_id": "S2",
-      "output": "...",
+      "kind": "flow_regression",
+      "turns": [
+        {"role": "user",      "content": "Merhaba"},
+        {"role": "assistant", "content": "Merhaba, ben Merve..."},
+        {"role": "user",      "content": "[silence for 6 seconds]"},
+        {"role": "assistant", "content": "Hâlâ orada mısınız?"},
+        {"role": "assistant", "content": "...", "end_call": true}
+      ],
       "model": "<frontmatter.target_model>",
-      "provider": "drift-runner-batch"
+      "provider": "drift-runner-flow"
     }
   ]
 }
 ```
 
-Note: `provider` changes from `drift-runner-inline` (the old serial mode) to `drift-runner-batch` to mark the new path in artefacts. Use `drift-runner-batch` for every Run in this step. `tokens` and `latency_ms` are not measured — omit them.
+Notes:
+- **Single-turn scenario runs** carry `output` (the assistant turn) — unchanged from earlier versions. `provider: "drift-runner-batch"`.
+- **Flow scenario runs** carry `turns[]` (the full conversation transcript: alternating user/assistant entries) instead of `output`. The last entry is the closing turn when the scenario included `end_call_expect`. `provider: "drift-runner-flow"`. No `output` field on flow runs (the per-step verdict in Step 3 references `turns[]` by index).
+- `tokens` and `latency_ms` are not measured — omit them.
 
 **If you cannot produce a response for a scenario** (empty/malformed body, `scenario.input` nonsensical), record `output: ""` for that one entry and continue with the others. Do not abort.
 
@@ -202,6 +248,41 @@ verdict.pass  = mechanical_pass AND (rubric_pass if rubric else true)
 verdict.score = (mechanical_score + rubric_score) / 2  if rubric else mechanical_score   # rounded to 2 decimals
 verdict.reasons = mechanical_reasons + rubric_reasons
 verdict.violated_assertions = mechanical_violations   # rubric failures are not assertions
+```
+
+### Flow scenario judging (v0.5.1 — `scenario.kind == "flow_regression"`)
+
+Flow scenarios have a per-step structure rather than a single output → single verdict mapping. The judging walks each step in `scenario.turns[]` in order, evaluating only the steps that carry assertions (`assistant_expect` and `end_call_expect`):
+
+1. For each `assistant_expect` or `end_call_expect` step at index `i` in `scenario.turns[]`:
+   - Locate the corresponding assistant turn in `run.turns[]`. The run's `turns[]` mirrors the scenario's `turns[]` after expansion — `user_input` step at scenario index `i-1` produced the assistant turn at run index `i` (with `role: "assistant"`). Take that `run.turns[i].content` as the output under test.
+   - Apply mechanical evaluation against the step's `expect_contains` and `expect_not_contains` (same semantics as single-turn — substring matching).
+   - Apply rubric evaluation against the step's `rubric` (when non-empty).
+   - For `end_call_expect`, additionally check the implicit "session closed" rule: the run's assistant turn for this step must read as a closing line (polite goodbye + intent to end). The judge applies this as an extra rubric clause alongside any explicit `rubric` the author wrote.
+   - Produce a `step_verdict` with `step_index`, `kind`, `pass`, `score`, `reasons[]`, `violated_assertions[]`.
+2. After every step is judged, roll up to a scenario-level verdict:
+   - `verdict.pass = all(step_verdicts[].pass)` — one failed step fails the whole flow.
+   - `verdict.score = mean(step_verdicts[].score)` — rounded to 2 decimals.
+   - `verdict.reasons` — the FIRST failing step's reasons are surfaced verbatim (so the table render in `/prompt-test` Phase 3 has a useful one-liner); the full per-step detail lives in `step_verdicts[]`.
+   - `verdict.violated_assertions` — concatenation of all step-level violated_assertions, prefixed with `step-<i>:` for traceability.
+   - `verdict.step_verdicts` — the full array of per-step verdicts; consumers (Phase 3 failure follow-up, debug tooling) drill in from here.
+3. If `scenario.turns[]` contains no `assistant_expect` and no `end_call_expect` steps, the scenario has nothing to verify — treat as `{pass: false, score: 0.0, reasons: ["flow scenario has no assertion steps"], step_verdicts: []}`.
+
+**Flow verdict shape** (`step_verdicts` is new in v0.5.1; absent on single-turn verdicts):
+
+```json
+{
+  "scenario_id": "S2",
+  "pass": false,
+  "score": 0.67,
+  "reasons": ["step 4 (end_call_expect): assistant did not produce a closing line"],
+  "violated_assertions": ["step-4: rubric: did not close politely"],
+  "step_verdicts": [
+    {"step_index": 1, "kind": "assistant_expect", "pass": true,  "score": 1.0, "reasons": ["..."], "violated_assertions": []},
+    {"step_index": 3, "kind": "assistant_expect", "pass": true,  "score": 1.0, "reasons": ["..."], "violated_assertions": []},
+    {"step_index": 4, "kind": "end_call_expect",  "pass": false, "score": 0.0, "reasons": ["rubric: did not close politely"], "violated_assertions": ["rubric: ..."]}
+  ]
+}
 ```
 
 **Output format (mandatory):**
