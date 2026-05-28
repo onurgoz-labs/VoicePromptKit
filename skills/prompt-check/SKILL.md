@@ -592,7 +592,8 @@ Agent({
       selected_lenses: ["conflict"],
       compact_mode:    <bool from frontmatter.compact_mode>,
       max_char_limit:  <int from frontmatter.max_char_limit>,
-      section_index:   "<absolute path to $RUN_DIR/section_index.json>"
+      section_index:   "<absolute path to $RUN_DIR/section_index.json>",
+      report_language: <string from frontmatter.report_language, default "tr">
     },
     output_paths: {
       conflicts:  "<absolute path to $RUN_DIR/conflicts.json>"
@@ -605,7 +606,7 @@ Agent({
 Agent({
   subagent_type: "static-lens-runner",
   prompt: JSON.stringify({
-    inputs: { ..., selected_lenses: ["dominance"], ... },
+    inputs: { ..., selected_lenses: ["dominance"], ..., report_language: <string from frontmatter.report_language, default "tr"> },
     output_paths: { dominances: "<absolute path to $RUN_DIR/dominances.json>" }
   }),
   description: "dominance lens for " + BASENAME,
@@ -615,7 +616,7 @@ Agent({
 Agent({
   subagent_type: "static-lens-runner",
   prompt: JSON.stringify({
-    inputs: { ..., selected_lenses: ["gap"], ... },
+    inputs: { ..., selected_lenses: ["gap"], ..., report_language: <string from frontmatter.report_language, default "tr"> },
     output_paths: { gaps: "<absolute path to $RUN_DIR/gaps.json>" }
   }),
   description: "gap lens for " + BASENAME,
@@ -625,7 +626,7 @@ Agent({
 Agent({
   subagent_type: "static-lens-runner",
   prompt: JSON.stringify({
-    inputs: { ..., selected_lenses: ["schema"], ... },
+    inputs: { ..., selected_lenses: ["schema"], ..., report_language: <string from frontmatter.report_language, default "tr"> },
     output_paths: { schema: "<absolute path to $RUN_DIR/schema.json>" }
   }),
   description: "schema lens for " + BASENAME,
@@ -634,18 +635,23 @@ Agent({
 
 Agent({
   subagent_type: "tr-phonetic-runner",
-  prompt: JSON.stringify({ ... }),
+  prompt: JSON.stringify({
+    inputs: { ..., report_language: <string from frontmatter.report_language, default "tr"> },
+    ...
+  }),
   description: "tr phonetic lens for " + BASENAME,
   isolation: "worktree"
 })
 ```
+
+**Every runner receives `report_language` so it produces native-language `rationale` + `suggested_fix` directly. The render layer no longer translates content fields (only section headings and lens labels translate via `TEMPLATE_STRINGS`).**
 
 Each Agent call uses `isolation: "worktree"` — the runner gets its own clean
 git worktree. Output JSONs land at the per-lens path; the runner returns
 when its single output file is written. The skill awaits all five returns
 before Phase 5's drift gate.
 
-**Per-lens runner contract is unchanged.** The `static-lens-runner` still accepts the same `inputs` schema (`body`, `frontmatter`, `rules`, `lens_rules_ref`, `selected_lenses`, `compact_mode`, `max_char_limit`, `section_index`) and the same `output_paths` shape (any subset of `conflicts`, `dominances`, `gaps`, `schema`). The change is in HOW the skill calls it: FOUR singleton dispatches instead of one combined call with all four lenses in `selected_lenses`. The runner still handles a multi-lens `selected_lenses` array (backward compat) — singleton-per-call is the new RECOMMENDED dispatch shape, not a breaking change.
+**Per-lens runner contract.** The `static-lens-runner` accepts the `inputs` schema (`body`, `frontmatter`, `rules`, `lens_rules_ref`, `selected_lenses`, `compact_mode`, `max_char_limit`, `section_index`, `report_language`) and the same `output_paths` shape (any subset of `conflicts`, `dominances`, `gaps`, `schema`). The runner still handles a multi-lens `selected_lenses` array (backward compat) — singleton-per-call is the RECOMMENDED dispatch shape, not a breaking change. `report_language` is the new field (v0.4.10+) — it tells the runner which language to emit `rationale` and `suggested_fix` in directly, so Phase 7 never has to translate content fields.
 
 `compact_mode` and `max_char_limit` are additive — the runner uses them when `compact_mode == true`, ignores them otherwise (backward compat). `tr-phonetic-runner` is already line-level / cheap, so `compact_mode` has no effect on its analysis; the fields are passed for symmetry.
 
@@ -720,7 +726,8 @@ Agent({
       expand_count_override: 3,  // ← from user_intent.expand_count; takes precedence over frontmatter
       compact_mode:          <bool from frontmatter.compact_mode>,
       max_char_limit:        <int from frontmatter.max_char_limit>,
-      section_index:         "<absolute path to $RUN_DIR/section_index.json>"
+      section_index:         "<absolute path to $RUN_DIR/section_index.json>",
+      report_language:       <string from frontmatter.report_language, default "tr">
     },
     output_path: "<absolute path to $RUN_DIR/drift.json>"
   }),
@@ -773,7 +780,8 @@ Agent({
       user_intent_tr_phonetic: true,  // ← from user_intent.tr_phonetic_enabled; runtime authoritative
       compact_mode:          <bool from frontmatter.compact_mode>,
       max_char_limit:        <int from frontmatter.max_char_limit>,
-      section_index:         "<absolute path to $RUN_DIR/section_index.json>"
+      section_index:         "<absolute path to $RUN_DIR/section_index.json>",
+      report_language:       <string from frontmatter.report_language, default "tr">
     },
     output_path: "<absolute path to $RUN_DIR/tr_phonetic.json>"
   }),
@@ -877,7 +885,18 @@ TEMPLATE_STRINGS = {
     "lens_label_tr_phonetic": "türkçe fonetik",
     "severity_label_high": "yüksek",
     "severity_label_medium": "orta",
-    "severity_label_low": "düşük"
+    "severity_label_low": "düşük",
+    "table_id_column": "id",
+    "table_lens_column": "mercek",
+    "table_severity_column": "önem",
+    "table_section_line_column": "bölüm / satır",
+    "table_rationale_column": "açıklama",
+    "table_fix_column": "düzeltme",
+    "drift_passed_no_fix": "(geçti — düzeltme yok)",
+    "sentinel_todo_render": "_TODO: {text}_",
+    "sentinel_intentional_render": "_Intentional — atla_",
+    "no_line_marker": "— / —",
+    "no_section_marker": "—"
   },
   "en": {
     "report_title": "PromptChecker Report — {basename}",
@@ -918,7 +937,18 @@ TEMPLATE_STRINGS = {
     "lens_label_tr_phonetic": "tr phonetic",
     "severity_label_high": "high",
     "severity_label_medium": "medium",
-    "severity_label_low": "low"
+    "severity_label_low": "low",
+    "table_id_column": "id",
+    "table_lens_column": "lens",
+    "table_severity_column": "sev",
+    "table_section_line_column": "section / line",
+    "table_rationale_column": "rationale",
+    "table_fix_column": "fix",
+    "drift_passed_no_fix": "(passed — no fix)",
+    "sentinel_todo_render": "_TODO: {text}_",
+    "sentinel_intentional_render": "_Intentional — dismiss_",
+    "no_line_marker": "— / —",
+    "no_section_marker": "—"
   }
 }
 ```
