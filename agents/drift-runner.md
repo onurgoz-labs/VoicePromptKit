@@ -23,6 +23,7 @@ Your user message is a JSON object split into **read-only inputs** and a single 
     "dominances":            "<$RUN_DIR/dominances.json>",
     "probes_ref":            "<skills/prompt-check/references/probes.md>",
     "expand_count_override": 3,
+    "regression_only":       false,
     "compact_mode":          false,
     "max_char_limit":        50000,
     "section_index":         "<$RUN_DIR/section_index.json>",
@@ -34,6 +35,8 @@ Your user message is a JSON object split into **read-only inputs** and a single 
 
 Read every file under `inputs` exactly once. **Never read `output_path`** — it does not exist yet and reading it would burn a tool call. Write to `output_path` only at the end of Step 4.
 
+`regression_only` is the authoritative switch for `/prompt-test`-style invocations: when `true`, the runner takes a fast path that generates only regression probes from `frontmatter.anchors[]`, ignores `expand_count` entirely, and tolerates null `rules` / `conflicts` / `gaps` / `dominances` inputs. When `false` or absent, normal behaviour. See Step 1's "Regression-only fast path" paragraph for the full contract.
+
 `section_index` is passed for parity with the other runners. Drift findings are scenario-level (`scenario_id`-based, not line-based), so they don't have a single source line to look up. Drift findings emit `section_ref: null` by default. If a verdict's `reasons` reference a specific rule whose line falls inside a numbered section, you MAY include that section in the verdict's reason text for context, but the structured `section_ref` field stays `null`.
 
 `expand_count_override` is the value the user picked in the per-run wizard (Phase 3.5 of SKILL.md). When present and not null, it takes precedence over `frontmatter.expand_count`. When absent or null, fall back to `frontmatter.expand_count` (existing behaviour). When `expand_count_override == 0`, drift is disabled for this run — write `{"scenarios":[],"runs":[],"verdicts":[],"warnings":["expand_count is 0 — drift disabled"]}` to `output_path` and return (mirror the SKILL.md drift skip path).
@@ -43,6 +46,19 @@ Read every file under `inputs` exactly once. **Never read `output_path`** — it
 `report_language` is the user's chosen output language for THIS run. Every `reasons[]` entry and any natural-language judgement text the runner emits MUST be written in this language. Anchors and scenario inputs from the prompt frontmatter stay in their original language — they are author content, not runner content. When absent / null / unrecognized, fall back to `en` (backward compat) and emit a warning per the Failure modes section.
 
 ## Step 1 — Generate scenarios
+
+**Regression-only fast path (mandatory check before the normal path).** If `inputs.regression_only == true`, take the EARLY BRANCH:
+
+1. Skip every probe template except `regression` (probes.md section 1). No conflict / role-override / boundary / ambiguity / normal probes are generated.
+2. The scenario cap formula does NOT apply — every anchor in `frontmatter.anchors[]` becomes exactly one regression scenario, no ceiling.
+3. `expand_count` (whether from `inputs.expand_count_override`, `frontmatter.expand_count`, or the built-in default 3) is IGNORED. `expand_count: 0` does NOT disable drift in regression-only mode — anchors are still expanded into scenarios.
+4. The `rules` / `conflicts` / `gaps` / `dominances` inputs are NOT required (the caller may pass `null` or omit them). Their absence is NOT a warning.
+5. Apply `compact_mode` only insofar as it caps individual scenario verbosity — never trim the scenario count below the anchor count.
+6. Honour optional `anchor.context[]` (new, additive — see probes.md section 1): when present and non-empty, the regression scenario carries `prior_context` (a list of `{role, content}` entries). Step 2's simulation feeds `prior_context` to the model BEFORE the `input` is sent as the final user turn. When `context` is absent or `[]`, behaviour is unchanged (the input is sent as the first and only user turn).
+
+After producing the regression scenario list, jump directly to Step 2 (skip the rest of Step 1's logic for non-regression scenarios).
+
+**Normal path (when `regression_only` is false / absent):**
 
 Apply the rules in `probes_ref` ("Generation order" section). Cap total scenarios at:
 
@@ -90,6 +106,20 @@ You act as the model under test. Read `body_path` as the simulated system prompt
 - Do not wrap output in code fences, JSON, or markdown unless the simulated model would.
 - Do not apply safety overrides not present in the body.
 - If the body contains contradictory rules, behave as a model that received those contradictions would — that's the entire point of the audit.
+
+**Prior-context handling (regression scenarios with `context` field):**
+
+A regression scenario derived from an anchor that carried `anchor.context[]` will hold a `prior_context` field on the scenario object — a list of `{role: "user" | "assistant", content: "..."}` entries representing the conversation so far. When generating the run for such a scenario:
+
+1. Internalise the body as the system prompt (unchanged).
+2. Replay the `prior_context` mentally as the conversation history — each entry is a real turn that already happened.
+3. The scenario's `input` is the NEXT user turn (the one being tested).
+4. Generate the assistant's response to `input` *as if* the prior conversation had actually taken place. The persona's state, name, knowledge, and flow position should reflect what would be true after replaying that history.
+5. Do NOT echo or quote the prior context in the output. Do NOT mention it. The output is just the next assistant turn.
+
+When `prior_context` is absent or empty, the scenario behaves as before — fresh conversation, the `input` is the first user turn.
+
+This handles the codex-flagged "state machine" gap: voice-agent prompts often only make sense after a greeting + identity check have happened. Anchors with `context` can capture those mid-flow states without inventing a multi-turn anchor schema.
 
 **Output format (mandatory, machine-readable):**
 

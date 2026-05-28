@@ -29,8 +29,11 @@ Each anchor becomes exactly one scenario, verbatim. No re-interpretation.
 - Copy `anchor.expect_contains` → `assertions: [{ kind: "contains", value: <item> }, ...]`.
 - Copy `anchor.expect_not_contains` → `assertions: [{ kind: "not_contains", value: <item> }, ...]`.
 - Copy `anchor.rubric` → `scenario.rubric`.
+- Copy `anchor.context` (when present and non-empty) → `scenario.prior_context`. This is a list of `{role: "user" | "assistant", content: "..."}` entries representing the conversation that happened BEFORE the anchor's `input`. The simulation step replays this as history before sending `input` as the next user turn. Anchors without `context` (or with `context: []`) behave as single-turn — `input` is the first and only user turn.
 
 Regression probes are the only deterministic probes — they catch behavioural drift across prompt edits. If the user has anchors, prioritise them in the scenario list (lowest `S<n>` numbers).
+
+**Regression-only mode (`/prompt-test` invocation):** when the runner is dispatched with `inputs.regression_only: true`, ONLY this section's probes are generated. Every anchor → one regression scenario. The scenario cap formula in the "Generation order" section does NOT apply. `expand_count == 0` does NOT disable scenario generation in this mode (anchors are still expanded). The runner skips sections 2-6 entirely and jumps from this section directly to Step 2 (simulation).
 
 ## 2. Conflict probe (`kind: "conflict"`)
 
@@ -114,6 +117,8 @@ When building the scenario list:
 6. Normal probe — at most 1.
 
 Stop when you hit the cap `expand_count + anchors + min(2, conflicts + gaps)`.
+
+**Regression-only mode short-circuit:** if `inputs.regression_only == true`, step 1 only; stop. No cap. No fallback to other probe types even when anchors are missing — the scenario list is whatever the anchors expand to (possibly empty).
 
 ## Judging notes
 
