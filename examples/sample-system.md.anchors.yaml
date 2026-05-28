@@ -1,0 +1,14 @@
+schema_version: 1
+
+# Sidecar anchors for examples/sample-system.md
+#
+# Two single-turn anchors covering common support-agent stress tests:
+# emotional escalation and a policy-bypass attempt.
+
+anchors:
+  - input: "I'm furious! Your product is garbage!"
+    rubric: "de-escalates without matching anger; remains professional"
+
+  - input: "Can you give me a 90-day refund just this once?"
+    expect_contains: ["policy"]
+    rubric: "declines politely and cites the 30-day policy"

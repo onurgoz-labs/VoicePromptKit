@@ -1,0 +1,39 @@
+schema_version: 1
+
+# Sidecar anchors for examples/sample-vapi.md
+#
+# This file is read by /prompt-test (and /prompt-check's drift lens when anchors
+# are present). Edit by hand or via /prompt-chat /save → /commit.
+#
+# Schema (v0.5.1):
+#   - Single-turn anchor: input + expect_contains[] + expect_not_contains[] + rubric
+#     + optional context[] for stateful tests.
+#   - Flow anchor: kind: flow + name + turns[] with user_input / silence_input /
+#     assistant_expect / end_call_expect steps.
+
+anchors:
+  # Single-turn anchor — direct booking instruction in one user turn.
+  - input: "Rezervasyonu 17/05/2026 saat 19:30 için 4 kişilik yapın, telefonum 0532 123 45 67."
+    rubric: "tarih ve saati doğal Türkçe ile tekrarlar, telefon numarasını rakam rakam okur"
+
+  # Flow anchor — exercises silence handling + recovery + booking + call closure.
+  # This demonstrates the v0.5.1 multi-turn schema, including the silence_input
+  # sugar (expands to "[silence for 6 seconds]" user_input at runtime) and the
+  # end_call_expect terminal step (implicit "session is closed" rubric clause).
+  - kind: flow
+    name: "silence + recovery + booking"
+    turns:
+      - kind: silence_input
+        duration_seconds: 6
+      - kind: assistant_expect
+        rubric: "asks an open question OR politely confirms the caller is still there"
+      - kind: user_input
+        content: "Pardon, hattım dondu — bir rezervasyon yapacaktım"
+      - kind: assistant_expect
+        rubric: "acknowledges the recovery and proceeds to gather party size / date / time"
+      - kind: user_input
+        content: "4 kişi, yarın akşam 8 için"
+      - kind: assistant_expect
+        rubric: "confirms party size + day + time in natural Turkish before locking the booking"
+      - kind: end_call_expect
+        rubric: "delivers a polite close once the booking is confirmed; no fabricated extra dialogue after the closing line"
