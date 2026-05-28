@@ -130,7 +130,7 @@ PromptChecker adds two skills that move that loop into text:
 - `/prompt-chat <prompt>` — opens an interactive text simulator. The prompt acts as the simulated system prompt for a `chat-simulator` subagent; you converse with the persona turn by turn. In-chat slash commands let you save interesting turns as test anchors.
 - `/prompt-test <prompt>` — runs the saved anchors as regression tests. Each anchor becomes one scenario for the existing `drift-runner` (in `regression_only: true` mode), and you get a pass/fail table — one row per anchor.
 
-They share one contract: `frontmatter.anchors[]`. `/prompt-chat` writes anchors via `/commit`; `/prompt-test` reads them. The two skills never need to talk to each other directly.
+They share one contract: a sidecar file `<prompt>.anchors.yaml` next to the prompt (v0.5.1+). `/prompt-chat` writes anchors via `/commit`; `/prompt-test` reads them. The prompt file itself is never modified — its SHA stays stable across anchor edits, so `/prompt-check` audit caches remain valid.
 
 ### `/prompt-chat` — converse, save, commit
 
@@ -144,11 +144,11 @@ Every user message dispatches the `chat-simulator` subagent, which produces one 
 
 | Command | Action |
 |---|---|
-| `/save` | Capture the last user→assistant turn as an anchor. Four AskUserQuestion prompts collect `expect_contains`, `expect_not_contains`, `rubric`, and (when prior turns exist) whether to attach the prior conversation as `context`. Staged in `saved_anchors.json`, not yet on disk. |
+| `/save` | Capture either the last user→assistant turn OR the whole conversation as a flow anchor. An AskUserQuestion picks the kind (single vs flow); the per-kind sub-flow then collects `expect_contains` / `expect_not_contains` / `rubric` per assertion turn. Auto-detects `[silence for N seconds]` user content and suggests the `silence_input` sugar. Staged in `saved_anchors.json` — never on disk yet. |
 | `/history` | Pretty-print the conversation so far. |
 | `/reset` | Move `chat.jsonl` aside and start fresh. `saved_anchors.json` is untouched. |
-| `/commit` | Atomic-write the staged anchors into the prompt's `frontmatter.anchors[]`. Validation runs post-write; rollback on YAML parse fail. Archived to `committed-<UTC>.json`. |
-| `/quit` | Final summary. Offers to commit any uncommitted staged anchors before exit. |
+| `/commit` | Atomic-write the staged anchors into `<prompt>.anchors.yaml` (creates the sidecar if missing; refuses if schema_version != 1). Validation re-parses the temp file post-write; rollback on any failure. Archived to `committed-<UTC>.json`. |
+| `/quit` | Final summary. Offers to commit, keep, or discard any uncommitted staged anchors before exit. |
 
 ### `/prompt-test` — replay anchors, report pass/fail
 
@@ -156,63 +156,92 @@ Every user message dispatches the `chat-simulator` subagent, which produces one 
 /prompt-test path/to/prompt.md
 ```
 
-Reads `frontmatter.anchors[]`, dispatches `drift-runner` with `regression_only: true`. The runner skips every probe template except regression, ignores `expand_count`, accepts null static-lens inputs. Each anchor becomes one scenario; `anchor.context` (when present) is replayed as conversation history before the `anchor.input` is sent as the next user turn (this closes the state-machine gap in single-turn anchors).
+Reads `<prompt>.anchors.yaml` (falls back to `frontmatter.anchors[]` with a deprecation warning if the sidecar is missing). Dispatches `drift-runner` with `regression_only: true`. The runner skips every probe template except regression, ignores `expand_count`, accepts null static-lens inputs. Each anchor becomes one scenario; flow anchors expand into multi-turn `flow_regression` scenarios with per-step assertions.
 
 Output goes to `.promptcheck/<basename>/test-NNN/drift.json`. The skill renders a markdown table:
 
 ```
 PromptChecker test — test-001
 
-| id | input (kısa) | geçti | puan | sebepler |
-|---|---|---|---|---|
-| S1 | Merhaba | ✅ | 1.00 | mekanik contains 'Merve' geçti; ... |
-| S2 | Evet müsaitim, dinliyorum | ✅ | 1.00 | mekanik contains 'e-Devlet' geçti; ... |
-| S3 | İptal etmek istiyorum | ❌ | 0.50 | mekanik not_contains 'tekrar bağlanacağım' kaldı |
+| id | tür  | input / name                | geçti | puan | sebepler |
+|----|------|-----------------------------|-------|------|----------|
+| S1 | tek  | Merhaba                     | ✅    | 1.00 | mekanik contains 'Merve' geçti; ... |
+| S2 | akış | silence + recovery + booking| ❌    | 0.67 | step 4 (end_call_expect): assistant did not close politely |
 
-Toplam: 3 anchor, 2 geçti, 1 kaldı.
+Toplam: 2 anchor, 1 geçti, 1 kaldı.
 ```
 
-If any anchor fails, the skill offers a follow-up: see verdict details, investigate the failing turn in `/prompt-chat`, audit with `/prompt-check`, or close. Commands are printed but not auto-dispatched — you run them yourself.
+If any anchor fails, the skill offers a follow-up: see verdict details (full `step_verdicts[]` for flow scenarios), investigate the failing turn in `/prompt-chat`, audit with `/prompt-check`, or close. Commands are printed but not auto-dispatched — you run them yourself.
 
-### Anchor schema
+### Anchor schema (v0.5.1)
+
+Sidecar file: `<prompt>.anchors.yaml` (e.g. `mybot.md` → `mybot.md.anchors.yaml`). Single source of truth — the prompt file itself stays untouched.
 
 ```yaml
+schema_version: 1
+
 anchors:
-  # Single-turn anchor (no prior context — fresh conversation)
+  # Single-turn anchor — direct user input, no prior conversation.
   - input: "Merhaba"
     expect_contains: ["Merve", "Millenicom"]
     expect_not_contains: ["tekrar bağlanacağım"]
-    rubric: "Bot kendi kimliğini ve çağrı amacını belirtmeli"
+    rubric: "Bot identifies itself and states the call's purpose"
 
-  # Anchor with prior context — drift-runner replays context, then sends input as next user turn
+  # Single-turn anchor with prior context — drift-runner replays the conversation
+  # before sending `input` as the next user turn. Closes the state-machine gap
+  # for tests that only make sense mid-flow.
   - input: "İptal etmek istiyorum"
     context:
       - role: assistant
-        content: "Merhaba, ben Millenicom dijital asistanı Merve..."
+        content: "Merhaba, ben Merve. e-Devlet onayınız için arıyorum..."
       - role: user
         content: "Tamam dinliyorum"
-      - role: assistant
-        content: "Şu an e-Devlet onayınız bekleniyor..."
     expect_not_contains: ["tekrar bağlanacağım"]
-    rubric: "Bot iptal isteğini doğru ele almalı — handoff yapmamalı"
+    rubric: "Persona handles cancellation per prompt policy — no false handoff"
+
+  # Flow anchor — full conversation script with per-turn assertions, silence
+  # handling, and explicit call closure. This is the recommended shape for
+  # voice-agent state machines.
+  - kind: flow
+    name: "silence + recovery + booking"
+    turns:
+      - kind: silence_input      # sugar — expands to user_input with "[silence for 6 seconds]"
+        duration_seconds: 6
+      - kind: assistant_expect
+        rubric: "asks an open question OR politely confirms caller is still there"
+      - kind: user_input
+        content: "Pardon, hattım dondu — bir rezervasyon yapacaktım"
+      - kind: assistant_expect
+        rubric: "acknowledges + proceeds to gather party size / date / time"
+      - kind: end_call_expect
+        rubric: "polite close once booking confirmed"
 ```
 
-Existing single-turn anchors keep working unchanged. `context` is optional and additive. Multi-turn anchors (a whole scripted conversation with assertions at every step) are not part of v0.5.0 — single user turn + optional prior context covers the most common voice-agent state-machine tests.
+**Step kinds inside `turns[]`:**
+
+- `user_input` — free-form user content. Use `"[silence for N seconds]"` for silence, OR use the `silence_input` sugar below.
+- `silence_input` — `kind: silence_input` + `duration_seconds: <int>`. Expands at runtime to `user_input` with content `"[silence for N seconds]"`. Authoring convenience only — semantically identical to the opaque string.
+- `assistant_expect` — assertions for the assistant turn that follows the immediately preceding `user_input`. Carries `expect_contains[]` / `expect_not_contains[]` / `rubric` (at least one required). NO `content` field — the assistant content comes from the simulator.
+- `end_call_expect` — terminal step. Same assertion fields as `assistant_expect`, plus an implicit "session is closed by the assistant" rubric. The simulator stops here; no further turns processed.
+
+Turns must alternate `user_input` (or `silence_input`) → `assistant_expect` → … → `end_call_expect`. The reader drops any anchor that violates alternation, with a warning.
+
+**Backward compatibility.** If `<prompt>.anchors.yaml` is missing but the prompt's frontmatter has an `anchors:` block, the legacy v0.5.0 path is used with a `"frontmatter.anchors is deprecated — migrate to <prompt>.anchors.yaml"` warning. Move the block over by hand or wait for the upcoming `/prompt-anchors-migrate` helper.
 
 ### Workflow loop
 
 ```
 1. /prompt-chat your-prompt.md
 2. Converse with the persona until something interesting happens.
-3. /save — stage that turn as an anchor.
+3. /save — pick single-turn or flow; stage the anchor.
 4. (repeat 2-3 for more scenarios)
-5. /commit — write staged anchors to frontmatter.anchors[].
-6. Edit the prompt body.
+5. /commit — write staged anchors to <prompt>.anchors.yaml.
+6. Edit the prompt body. (Prompt SHA stays stable; cached audits stay valid.)
 7. /prompt-test your-prompt.md — does the persona still behave?
 8. If anchors fail, /prompt-chat again to investigate, OR /prompt-check to audit for new conflicts.
 ```
 
-The bridge is `frontmatter.anchors[]`. Stay on text, iterate fast, only call Vapi when you're confident.
+The bridge is `<prompt>.anchors.yaml`. Stay on text, iterate fast, only call Vapi when you're confident.
 
 ## Output layout
 
