@@ -830,6 +830,14 @@ Read every artefact that landed in `$RUN_DIR/` so far: `frontmatter.json`, `rule
   - Translate the `line` field via `body_line_offset`, exactly as for every other lens.
   - Set `summary.schema = { "total": N, "applicable": true, "by_kind": { "section_gap": ..., "subsection_gap": ..., "out_of_order": ..., ... }, "high": ..., "medium": ..., "low": ... }`.
 
+**Dominance metadata invariant (mandatory).** After loading `dominances.json` and before line translation, validate every dominance finding has `dominant_rule_id != dominated_rule_id`. A rule cannot dominate itself — when the runner emits one, it indicates the rubric collapsed two distinct rule references into one ID (a known runner failure mode). For each violation:
+
+1. Downgrade the finding's `severity` to `"low"` (preserve the finding so the author still sees it; do not drop silently).
+2. Append a warning to the top-level `findings.json.warnings[]` array: `"D<n>: dominant_rule_id == dominated_rule_id (R<x>) — severity downgraded to low; re-examine the runner output"`.
+3. Tag the finding object with `metadata_invariant_violation: true` so downstream tooling (Phase 9 render, Phase 10 apply) can surface a distinct visual cue.
+
+Apply this validation BEFORE line translation — operating on raw runner output keeps the failure-mode signal close to its source. The downgraded finding still flows through the rest of Phase 7 (line translation, section_ref attachment, render) like any other finding.
+
 **Line translation (mandatory):** Every lens wrote `line` numbers as body.txt indices. Before writing findings.json, translate each `line` to an original-file line:
 
 ```

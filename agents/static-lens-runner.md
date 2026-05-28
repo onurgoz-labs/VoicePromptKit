@@ -82,10 +82,14 @@ Apply the **Dominance lens** section of `lens_rules_ref` against the rule list.
 
 Use `body.txt` to confirm position/length/recency claims when needed — e.g. to check that a "later instruction" is genuinely later in the file. Read `body.txt` only once across the whole run; do not re-read it per dominance candidate.
 
+**Script-line context (mandatory for substring fixes).** When the dominated rule appears inside a state-machine step, script utterance, or scripted dialog line — i.e. the prompt prescribes a verbatim phrase the agent will say — the finding MUST carry a `current_excerpt` field with the exact body content of `line ± 2` (5 lines total, joined with `\n`). The runner uses this excerpt to author a `suggested_fix` that preserves dialog-state intent per the **Dialog state preservation** rubric in `lens_rules_ref`'s Dominance lens section. Indicators that the dominated rule is a script line: the line is inside a `Step N — ...`, `STATE N`, `Closing`, `Disclosure`, `Greeting` block, OR the rule text is a quoted utterance the agent says verbatim. When the dominated rule is structural (variable definition, global enforcement, schema constraint), `current_excerpt` is optional — emit it only when it would help downstream review.
+
+**Metadata invariant.** Every dominance finding MUST have `dominant_rule_id != dominated_rule_id`. A rule cannot dominate itself. If your analysis suggests they are the same, you have either (a) a conflict (use Step 1), (b) the same rule cited under two roles (re-examine — the dominant rule is some OTHER rule that overrides this one), or (c) an internal inconsistency in a single rule (skip — not a dominance). Self-correct before emitting.
+
 Write the result to `output_paths.dominances`. Every finding MUST carry a `section_ref` field per the "Section reference (mandatory for every finding)" section below:
 
 ```json
-{ "dominances": [{ "id": "D1", "dominant_rule_id": "R12", "dominated_rule_id": "R3", "mechanism": "position|length|specificity|recency|role-override", "severity": "low|medium|high", "reasoning": "<≤ 300 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "VALUE FRAMING AXES", "subsection_title": "MÜBADELE VALUE HIERARCHY" } }] }
+{ "dominances": [{ "id": "D1", "dominant_rule_id": "R12", "dominated_rule_id": "R3", "mechanism": "position|length|specificity|recency|role-override", "severity": "low|medium|high", "reasoning": "<≤ 300 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural", "current_excerpt": "<5-line body excerpt centred on the dominated rule's line, optional for structural fixes>", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "VALUE FRAMING AXES", "subsection_title": "MÜBADELE VALUE HIERARCHY" } }] }
 ```
 
 When the finding's `line` has no section context, emit explicit `section_ref: null` (not absent).

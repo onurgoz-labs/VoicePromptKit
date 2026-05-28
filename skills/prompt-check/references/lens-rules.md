@@ -93,6 +93,21 @@ Severity heuristic for dominance:
 
 For `suggested_fix`: **always populate `suggested_fix` with a concrete one-sentence action** — e.g. "Move R3 below R12 and merge their content", "Remove R6 (subsumed by R8)", or "Replace R12 with: \"After the announcement completes, immediately trigger end-call-tool unless an interruption is in progress; in that case, finish the remainder first.\"". If the dominance is intentional/benign, write `suggested_fix: 'Intentional — dismiss this finding'` so the author can see the runner reached that conclusion. Empty `suggested_fix` is no longer allowed.
 
+### Dialog state preservation (mandatory for substring fixes on script lines)
+
+When the dominated rule appears inside a state-machine step, script utterance, or scripted dialog line (anything where the prompt prescribes a verbatim phrase the agent will say), the replacement text MUST preserve the **dialog state intent** of the original utterance, not just remove the banned phrase.
+
+Reasoning: the prompt's surrounding section names the state (e.g. `Step 3 — Simulate busy queue`, `STATE 17 — handoff`, `Closing`, `AI disclosure`). Replacing a script line with a string that drops out of that state — e.g. swapping a queue-status utterance for an open-ended routing question — silently breaks the flow even though the banned phrase is gone.
+
+Checklist before emitting a substring `suggested_fix` for a script line:
+
+1. **Read the surrounding state.** The runner already has `current_excerpt` (± 2 body lines around the finding); read it. Identify which dialog state the line belongs to from its section/subsection name and from neighbouring step labels.
+2. **Preserve actor and presence.** The voice agent is the *only* active speaker; it does not "disconnect", "call you back", "reconnect later", or hand off to a human in the middle of its own utterance. Replacements must read as something the agent itself can say *next turn*. Phrases like "tekrar bağlanacağım", "I'll get back to you", "transferring you now" are forbidden unless the surrounding state is an *explicit handoff* state.
+3. **Preserve wait semantics.** A "busy queue" / "transfer wait" state implies the user should *wait* and the agent will *continue*. Replacements should reflect that — e.g. `"Lütfen kısa bir süre bekleyiniz; ardından kaldığımız yerden devam edeceğim."` rather than open-ended routing like `"Konuyla ilgili nasıl ilerlemek istersiniz?"` (which silently exits the queue state).
+4. **Do not overclaim resources.** Avoid implying real human agents, instant transfers, callbacks, or external systems that the prompt doesn't authorise (cf. R59 / R29 in voice prompts that restrict handoff conditions). When unsure, fall back to the safest in-state utterance (acknowledge wait, restate the user's name if known, do not promise a third party).
+
+When the dominated rule is **not** a script line (it's a global enforcement / variable definition / structural rule), the dialog-state checklist does not apply — use the standard rewrite guidance above. The check fires only when `fix_strategy: "substring"` and the target line is inside a `Step N`, `STATE N`, dialog block, or labelled utterance.
+
 ## Gap lens (strict scope)
 
 You flag only gaps that exist **within the prompt's own rules**, not absent concepts the prompt never addresses. Every gap must cite at least one `related_rule_id` that demonstrates the prompt itself raised the question.
