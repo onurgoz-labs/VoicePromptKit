@@ -98,6 +98,7 @@ except Exception as _e:
 
 resolved = {
     'target_model':     fm.get('target_model') or 'claude-opus-4-7',
+    'judge_model':      fm.get('judge_model') or 'claude-haiku-4-5-20251001',
     'report_language':  (fm.get('report_language') or 'tr').lower(),
     'expand_count':     int(fm.get('expand_count') or 3),
     'max_char_limit':   int(fm.get('max_char_limit') or 50000),
@@ -180,7 +181,9 @@ Agent({
       compact_mode:     <bool from frontmatter.compact_mode>,
       max_char_limit:   <int from frontmatter.max_char_limit>,
       section_index:    null,
-      report_language:  "<string from frontmatter.report_language>"
+      report_language:  "<string from frontmatter.report_language>",
+      target_model:     "<string from frontmatter.target_model, default claude-opus-4-7>",
+      judge_model:      "<string from frontmatter.judge_model, default claude-haiku-4-5-20251001>"
     },
     output_path: "<absolute path to $RUN_DIR/drift.json>"
   }),

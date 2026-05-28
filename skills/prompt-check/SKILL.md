@@ -210,6 +210,17 @@ resolved['target_model'] = (
     or 'claude-opus-4-7'
 )
 
+# v0.5.2: judge_model is the smaller / cheaper model used by drift-runner for
+# rubric evaluation (Step 3). target_model still drives simulation (Step 2).
+# Default Haiku — yes/no rubric judgement is well within Haiku's capability,
+# while Opus per-token cost on Step 3 was the largest single drift-runner expense.
+resolved['judge_model'] = (
+    fm.get('judge_model')
+    or env('PROMPTCHECKER_JUDGE_MODEL')
+    or project.get('judge_model')
+    or 'claude-haiku-4-5-20251001'
+)
+
 out = fm.get('output')
 if out is None:
     env_out = env('PROMPTCHECKER_OUTPUT')
@@ -318,8 +329,8 @@ else:
     _rlang_unknown = rlang if rlang is not None else None
 
 # Collect warnings for unknown frontmatter / config keys (surfaced in Phase 8).
-KNOWN_FM = {'type','target_model','output','expand_count','anchors','tr_phonetic','max_char_limit','report_language'}
-KNOWN_CFG = {'$schema','default_type','target_model','output','expand_count','tr_phonetic','max_char_limit','report_language'}
+KNOWN_FM = {'type','target_model','judge_model','output','expand_count','anchors','tr_phonetic','max_char_limit','report_language'}
+KNOWN_CFG = {'$schema','default_type','target_model','judge_model','output','expand_count','tr_phonetic','max_char_limit','report_language'}
 warnings = []
 if _rlang_unknown is not None:
     warnings.append(
@@ -971,7 +982,9 @@ Agent({
       compact_mode:          <bool from frontmatter.compact_mode>,
       max_char_limit:        <int from frontmatter.max_char_limit>,
       section_index:         "<absolute path to $RUN_DIR/section_index.json>",
-      report_language:       <string from frontmatter.report_language, default "tr">
+      report_language:       <string from frontmatter.report_language, default "tr">,
+      target_model:          <string from frontmatter.target_model, default "claude-opus-4-7">,
+      judge_model:           <string from frontmatter.judge_model, default "claude-haiku-4-5-20251001">
     },
     output_path: "<absolute path to $RUN_DIR/drift.json>"
   }),

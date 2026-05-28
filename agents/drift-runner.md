@@ -27,7 +27,9 @@ Your user message is a JSON object split into **read-only inputs** and a single 
     "compact_mode":          false,
     "max_char_limit":        50000,
     "section_index":         "<$RUN_DIR/section_index.json>",
-    "report_language":       "tr"
+    "report_language":       "tr",
+    "target_model":          "claude-opus-4-7",
+    "judge_model":           "claude-haiku-4-5-20251001"
   },
   "output_path": "<$RUN_DIR/drift.json>"
 }
@@ -36,6 +38,12 @@ Your user message is a JSON object split into **read-only inputs** and a single 
 Read every file under `inputs` exactly once. **Never read `output_path`** — it does not exist yet and reading it would burn a tool call. Write to `output_path` only at the end of Step 4.
 
 `regression_only` is the authoritative switch for `/prompt-test`-style invocations: when `true`, the runner takes a fast path that generates only regression probes from `frontmatter.anchors[]`, ignores `expand_count` entirely, and tolerates null `rules` / `conflicts` / `gaps` / `dominances` inputs. When `false` or absent, normal behaviour. See Step 1's "Regression-only fast path" paragraph for the full contract.
+
+**`target_model` vs `judge_model` (v0.5.2).** Two distinct knobs:
+- `target_model` (resolved from `frontmatter.target_model`) — the model under test, used in Step 2 (Simulate). Quality matters: this drives persona faithfulness, the body's rule following, the actual behaviour you're auditing. Defaults to `claude-opus-4-7`.
+- `judge_model` (new in v0.5.2) — the model evaluating rubric assertions in Step 3 (Judge). Rubric eval is a yes/no judgement task; smaller models are sufficient. Defaults to `claude-haiku-4-5-20251001` (~1/30 the cost of Opus per token, with equivalent rubric judgement accuracy for the well-bounded "did the output contain X / behave like Y" questions drift-runner asks).
+
+When the caller omits `judge_model`, default to `claude-haiku-4-5-20251001`. When the caller explicitly sets `judge_model` to the same value as `target_model` (or to any other model), use that value verbatim — the runner does not second-guess the caller.
 
 `section_index` is passed for parity with the other runners. Drift findings are scenario-level (`scenario_id`-based, not line-based), so they don't have a single source line to look up. Drift findings emit `section_ref: null` by default. If a verdict's `reasons` reference a specific rule whose line falls inside a numbered section, you MAY include that section in the verdict's reason text for context, but the structured `section_ref` field stays `null`.
 
@@ -127,6 +135,15 @@ You act as the model under test. Read `body_path` as the simulated system prompt
 - Do not wrap output in code fences, JSON, or markdown unless the simulated model would.
 - Do not apply safety overrides not present in the body.
 - If the body contains contradictory rules, behave as a model that received those contradictions would — that's the entire point of the audit.
+
+**Prompt caching (v0.5.2, mandatory when the underlying provider supports it).** The simulated system prompt — the full `body` content — repeats verbatim across every scenario in a batch AND across every turn within a flow scenario. When dispatching to a provider that exposes prompt caching (Anthropic API: `cache_control: {type: "ephemeral"}` on a content block; OpenAI: provider-side automatic caching kicks in on identical prefixes), structure each simulation call so that:
+
+1. The system prompt content block carries `cache_control: {type: "ephemeral"}`. First call populates the cache; subsequent calls in the same batch / flow get a cache hit on the body portion.
+2. Single-turn batch simulation gains the largest savings — N scenarios × (~body tokens) collapses to 1× body + (N-1)× cache hit.
+3. Flow simulation gains turn-level savings — the body stays cached across all K user_input turns of the flow; only the growing conversation history is fresh per turn.
+4. When the provider does not expose caching, fall through silently — behaviour identical, just no cost saving.
+
+The runner does not need to verify cache hits; the directive is a hint to the provider. Document the cache directive in the LLM dispatch payload (Anthropic SDK example): `system = [{"type": "text", "text": <body>, "cache_control": {"type": "ephemeral"}}]`. Conversation history (user/assistant turns) is NOT cached — only the system prompt.
 
 **Prior-context handling (regression scenarios with `context` field):**
 
@@ -241,6 +258,8 @@ Read the rubric and the run output. Apply your judgement:
 
 If the output is empty or unparseable, default to `{ rubric_pass: false, rubric_score: 0.0, reasons: ["rubric inconclusive (empty output)"] }`. Do not guess pass.
 
+**Use `inputs.judge_model` (v0.5.2) for the LLM call backing this rubric evaluation.** Default is `claude-haiku-4-5-20251001` — substantially cheaper than `target_model` (usually Opus). Rubric judgement is a yes/no comprehension task; the smaller judge model produces equivalent verdicts at a fraction of the cost. The `target_model` is reserved for Step 2 simulation where persona faithfulness matters. If `judge_model` is absent / null, fall back to Haiku per the default; never silently use `target_model` for judgement.
+
 ### Merge (per scenario, unchanged formula)
 
 ```
@@ -250,23 +269,43 @@ verdict.reasons = mechanical_reasons + rubric_reasons
 verdict.violated_assertions = mechanical_violations   # rubric failures are not assertions
 ```
 
-### Flow scenario judging (v0.5.1 — `scenario.kind == "flow_regression"`)
+### Flow scenario judging (v0.5.1, batched in v0.5.2 — `scenario.kind == "flow_regression"`)
 
-Flow scenarios have a per-step structure rather than a single output → single verdict mapping. The judging walks each step in `scenario.turns[]` in order, evaluating only the steps that carry assertions (`assistant_expect` and `end_call_expect`):
+Flow scenarios have a per-step structure rather than a single output → single verdict mapping. Each `assistant_expect` and `end_call_expect` step has its own assertions / rubric. v0.5.1 evaluated them with one LLM call per step (4-step flow → 4 judge calls); v0.5.2 batches all rubric calls for a single flow into ONE judge call.
 
-1. For each `assistant_expect` or `end_call_expect` step at index `i` in `scenario.turns[]`:
+**Step-by-step procedure:**
+
+1. **Mechanical pass (cheap, no LLM).** For each `assistant_expect` / `end_call_expect` step at index `i` in `scenario.turns[]`:
    - Locate the corresponding assistant turn in `run.turns[]`. The run's `turns[]` mirrors the scenario's `turns[]` after expansion — `user_input` step at scenario index `i-1` produced the assistant turn at run index `i` (with `role: "assistant"`). Take that `run.turns[i].content` as the output under test.
-   - Apply mechanical evaluation against the step's `expect_contains` and `expect_not_contains` (same semantics as single-turn — substring matching).
-   - Apply rubric evaluation against the step's `rubric` (when non-empty).
-   - For `end_call_expect`, additionally check the implicit "session closed" rule: the run's assistant turn for this step must read as a closing line (polite goodbye + intent to end). The judge applies this as an extra rubric clause alongside any explicit `rubric` the author wrote.
-   - Produce a `step_verdict` with `step_index`, `kind`, `pass`, `score`, `reasons[]`, `violated_assertions[]`.
-2. After every step is judged, roll up to a scenario-level verdict:
+   - Apply mechanical evaluation against the step's `expect_contains` and `expect_not_contains` (same semantics as single-turn — substring matching, no LLM).
+   - Record `mechanical_pass`, `mechanical_score`, `violated_assertions[]` for this step.
+
+2. **Batched rubric pass (ONE LLM call per flow scenario, v0.5.2).** Collect every step that carries a non-empty `rubric` (or is an `end_call_expect` step — even with empty explicit rubric, the implicit "session is closed" rubric applies). Build a single judge prompt that includes:
+   - The full conversation transcript (`run.turns[]`, alternating user/assistant entries).
+   - A numbered list of every step needing rubric evaluation, each with: `step_index`, `kind` (`assistant_expect` or `end_call_expect`), the assistant turn under test (taken from `run.turns[step_index].content`), and the rubric text. For `end_call_expect`, append the implicit clause "AND the assistant turn reads as a final closing line; no further dialogue is expected."
+   - Instructions: evaluate each step independently against its rubric; return a JSON array of `{step_index, rubric_pass, rubric_score, reason}` — one entry per step in the input list.
+   
+   Dispatch the call using `inputs.judge_model` (default Haiku). The judge response is one batched JSON document. Parse it; per-step rubric verdicts feed back into Step 3 of the per-step `step_verdict` build.
+   
+   **Why batching here works (and was scary for simulation):** rubric evaluation is independent across steps (each rubric judges its own assistant turn against its own criteria). There's no cross-step contamination risk — the judge isn't generating one persona output that drifts; it's emitting N independent yes/no judgements. The simulation step (Step 2) explicitly forbids batching across turns because conversation state matters; judging has no such constraint.
+
+3. **Merge mechanical + rubric, build step_verdicts[].** For each step:
+   - `step_verdict.pass = mechanical_pass AND (rubric_pass if rubric else true)`
+   - `step_verdict.score = (mechanical_score + rubric_score) / 2 if rubric else mechanical_score`
+   - `step_verdict.reasons = mechanical_reasons + ([rubric_reason] if rubric else [])`
+   - Carry the original `step_index`, `kind`, `violated_assertions[]`.
+
+4. **Roll up to scenario verdict.**
    - `verdict.pass = all(step_verdicts[].pass)` — one failed step fails the whole flow.
    - `verdict.score = mean(step_verdicts[].score)` — rounded to 2 decimals.
    - `verdict.reasons` — the FIRST failing step's reasons are surfaced verbatim (so the table render in `/prompt-test` Phase 3 has a useful one-liner); the full per-step detail lives in `step_verdicts[]`.
    - `verdict.violated_assertions` — concatenation of all step-level violated_assertions, prefixed with `step-<i>:` for traceability.
    - `verdict.step_verdicts` — the full array of per-step verdicts; consumers (Phase 3 failure follow-up, debug tooling) drill in from here.
-3. If `scenario.turns[]` contains no `assistant_expect` and no `end_call_expect` steps, the scenario has nothing to verify — treat as `{pass: false, score: 0.0, reasons: ["flow scenario has no assertion steps"], step_verdicts: []}`.
+
+5. **Edge cases:**
+   - `scenario.turns[]` contains no `assistant_expect` and no `end_call_expect` steps → `{pass: false, score: 0.0, reasons: ["flow scenario has no assertion steps"], step_verdicts: []}`.
+   - Batch judge returns malformed JSON or missing step entries → fall back to per-step rubric calls for the missing ones (graceful degradation). Emit a warning to `drift.json.warnings[]`.
+   - Batch judge returns extra step_indices not in the input → ignore them, emit a warning.
 
 **Flow verdict shape** (`step_verdicts` is new in v0.5.1; absent on single-turn verdicts):
 

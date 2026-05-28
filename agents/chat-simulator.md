@@ -55,6 +55,8 @@ Read `inputs.body`. This is the prompt acting as your system prompt. Internalise
 
 Do NOT print, summarise, or echo the body. Treat it as instructions you absorb.
 
+**Prompt caching (v0.5.2).** The body is identical across every turn of a `/prompt-chat` session — same prompt file, same persona, same rules. When dispatching to a provider that exposes prompt caching (Anthropic API: `cache_control: {type: "ephemeral"}`; OpenAI: automatic on identical prefixes), structure the call so the body content block carries the cache directive. First turn populates the cache; every subsequent turn in the same chat session gets a cache hit on the body portion. Conversation history (chat.jsonl entries) is NOT cached — only the system prompt block. When the provider does not expose caching, fall through silently — behaviour identical, just no saving.
+
 If the body is empty or unreadable, write to `output_path`:
 
 - `report_language: "tr"`: `[chat-simulator hatası: prompt body okunamadı — <path>]`
