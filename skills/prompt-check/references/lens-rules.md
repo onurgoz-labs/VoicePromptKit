@@ -1,249 +1,40 @@
-# Lens criteria — detailed reference
+# Lens criteria — split into shared + per-lens slices
 
-Read this on first use during a `prompt-check` run. It is the canonical specification for every analysis lens. Where the SKILL.md outline says "apply the criteria in lens-rules.md", look here.
+This file is the **index** for the lens criteria. Each static lens now reads only its own slice plus the shared invariants — instead of the full 425-line monolithic ruleset every previous version loaded.
 
-> **Output invariant — every finding must carry a concrete suggested_fix.** Conflict, Dominance, and Gap lenses MUST populate `suggested_fix` with either: (a) a one-sentence rewrite ready to apply, (b) a one-sentence structural action ("Move R3 below R12"), (c) the literal string `TODO: <open question>` when no clean resolution exists, or (d) the literal string `Intentional — dismiss this finding` when the runner judged the situation benign. Null / empty `suggested_fix` is invalid output.
+## Slices
 
-## fix_strategy — substring vs structural
-
-Every finding from the conflict, dominance, and gap lenses MUST also carry a `fix_strategy` field with one of two values:
-
-- **`substring`** — the `suggested_fix` is a literal text that REPLACES `current_excerpt`. Phase 10 will perform a substring-level replace. Use this when the fix is a clean rewrite of the same span (e.g. `current_excerpt: "always formal"` → `suggested_fix: "professional but warm"`).
-- **`structural`** — the `suggested_fix` is an instruction in natural language describing a structural change (e.g. "Add a clause after R3: '...'", "Move R7 below R12", "Rewrite the trigger sentence to remove the contradiction. Suggested: '...'", "Remove R6 (subsumed by R8)"). Phase 10 will use the Edit tool (or equivalent semantic edit) and surface a **risk warning** to the user before applying — manual review recommended.
-
-**How to choose:**
-- If the entire `current_excerpt` can be replaced verbatim with a self-contained text → `substring`.
-- If the fix requires inserting new content, moving rules, deleting rules, or rewording across multiple sentences → `structural`.
-- TODO / Intentional sentinel suggestions ("TODO: ...", "Intentional — dismiss this finding") → `structural` (Phase 10 routes them to overlay or skip; they're never applied directly).
-
-**Mapping to fix_kind:** `fix_strategy` is orthogonal to `fix_kind`. A finding can be `fix_kind: "replace" + fix_strategy: "substring"` (apply via substring-replace), `fix_kind: "replace" + fix_strategy: "structural"` (apply via Edit tool + risk warning), or `fix_kind: "advisory" + fix_strategy: "substring"` (overlay, but if user manually applies, substring-replace is the natural method).
-
-## Rule extraction
-
-You analyse the body text and extract every rule, instruction, constraint, or directive into a flat list of atomic rules.
-
-- One rule = one atomic obligation. Split compound sentences: "be polite and concise" → two rules.
-- Preserve absolute claims verbatim: "always", "never", "only", "must", "ignore".
-- `line` = lowest line number in `body.txt` where the rule begins.
-- `id` is `R1, R2, R3 …` in source order.
-- `category`:
-  - **behavior** — what the model should do (actions, workflow, decisions).
-  - **format** — how output is shaped (length, structure, JSON, markdown).
-  - **tone** — register, friendliness, formality.
-  - **policy** — refusal rules, safety, legal, scope.
-  - **persona** — who the model is, role, identity.
-- If the prompt contains examples, extract the rule the example illustrates, not the example itself.
-- If a section is unstructured prose, still split into atomic obligations.
-
-Schema:
-
-```json
-{
-  "rules": [
-    { "id": "R1", "category": "behavior|format|tone|policy|persona", "text": "<atomic, paraphrased to one sentence>", "line": 12, "source_excerpt": "<exact line or sub-clause that produced this rule, ≤ 200 chars>" }
-  ]
-}
-```
-
-## Conflict lens
-
-A conflict exists when obeying one rule **necessarily violates** another in at least one realistic input.
-
-- Cluster more than two rules into a single conflict when they form a transitive contradiction (A vs B vs C).
-- Do not invent rules; only reference `rule_ids` extracted above.
-- Severity:
-  - **high** — direct logical opposites ("always X" vs "never X"), or safety/policy contradictions.
-  - **medium** — rules conflict under common inputs but not all inputs.
-  - **low** — rules nudge in opposite directions but can be satisfied with care.
-
-If none, emit `{ "conflicts": [] }`. Empty is a legitimate outcome.
-
-Schema:
-
-```json
-{ "conflicts": [{ "id": "C1", "rule_ids": ["R3","R8"], "severity": "low|medium|high", "reasoning": "<≤ 400 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "VALUE FRAMING AXES", "subsection_title": "MÜBADELE VALUE HIERARCHY" } }] }
-```
-
-For the `suggested_fix` in the merged findings.json: propose a concrete rewrite that resolves the contradiction (e.g. "Replace R8 with: 'Stay warm and approachable while preserving professional language.'"). If no clean resolution exists, write `suggested_fix: 'TODO: pick one of (A) <option>, (B) <option>'` so the author has a starting point. Empty `suggested_fix` is no longer allowed.
-
-## Dominance lens
-
-A dominance is **not** a conflict: it is the relationship where one rule will silently override another in practice, even without a logical contradiction. The dominated rule still applies in theory, but the dominant rule wins under the model's recency / length / role-override biases.
-
-Mechanisms:
-
-- **position** — later instruction overrides earlier (LLMs are recency-biased).
-- **length** — a long, repeated rule overshadows a single-line counter-rule.
-- **specificity** — a specific exception beats a general rule (this one is often intentional and benign — flag only when the specific rule is too narrow).
-- **recency** — rules near the end of the prompt anchor model behaviour.
-- **role-override** — phrases like "ignore previous instructions", "your new role is", "actually you are", "from now on you are".
-
-Rules that **contradict** but where neither dominates are a *conflict*, not a dominance — emit them in the conflict lens instead.
-
-Schema:
-
-```json
-{ "dominances": [{ "id": "D1", "dominant_rule_id": "R12", "dominated_rule_id": "R3", "mechanism": "position|length|specificity|recency|role-override", "severity": "low|medium|high", "reasoning": "<≤ 300 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "VALUE FRAMING AXES", "subsection_title": "MÜBADELE VALUE HIERARCHY" } }] }
-```
-
-Severity heuristic for dominance:
-- **high** — `role-override` mechanism (the dominant rule is an explicit override pattern), or `recency` on a safety-critical rule.
-- **medium** — `position` / `length` where the dominated rule is consequential, or `specificity` where the specific rule is too narrow.
-- **low** — `specificity` where the dominant rule is a benign intentional exception.
-
-For `suggested_fix`: **always populate `suggested_fix` with a concrete one-sentence action** — e.g. "Move R3 below R12 and merge their content", "Remove R6 (subsumed by R8)", or "Replace R12 with: \"After the announcement completes, immediately trigger end-call-tool unless an interruption is in progress; in that case, finish the remainder first.\"". If the dominance is intentional/benign, write `suggested_fix: 'Intentional — dismiss this finding'` so the author can see the runner reached that conclusion. Empty `suggested_fix` is no longer allowed.
-
-### Dialog state preservation (mandatory for substring fixes on script lines)
-
-When the dominated rule appears inside a state-machine step, script utterance, or scripted dialog line (anything where the prompt prescribes a verbatim phrase the agent will say), the replacement text MUST preserve the **dialog state intent** of the original utterance, not just remove the banned phrase.
-
-Reasoning: the prompt's surrounding section names the state (e.g. `Step 3 — Simulate busy queue`, `STATE 17 — handoff`, `Closing`, `AI disclosure`). Replacing a script line with a string that drops out of that state — e.g. swapping a queue-status utterance for an open-ended routing question — silently breaks the flow even though the banned phrase is gone.
-
-Checklist before emitting a substring `suggested_fix` for a script line:
-
-1. **Read the surrounding state.** The runner already has `current_excerpt` (± 2 body lines around the finding); read it. Identify which dialog state the line belongs to from its section/subsection name and from neighbouring step labels.
-2. **Preserve actor and presence.** The voice agent is the *only* active speaker; it does not "disconnect", "call you back", "reconnect later", or hand off to a human in the middle of its own utterance. Replacements must read as something the agent itself can say *next turn*. Phrases like "tekrar bağlanacağım", "I'll get back to you", "transferring you now" are forbidden unless the surrounding state is an *explicit handoff* state.
-3. **Preserve wait semantics.** A "busy queue" / "transfer wait" state implies the user should *wait* and the agent will *continue*. Replacements should reflect that — e.g. `"Lütfen kısa bir süre bekleyiniz; ardından kaldığımız yerden devam edeceğim."` rather than open-ended routing like `"Konuyla ilgili nasıl ilerlemek istersiniz?"` (which silently exits the queue state).
-4. **Do not overclaim resources.** Avoid implying real human agents, instant transfers, callbacks, or external systems that the prompt doesn't authorise (cf. R59 / R29 in voice prompts that restrict handoff conditions). When unsure, fall back to the safest in-state utterance (acknowledge wait, restate the user's name if known, do not promise a third party).
-
-When the dominated rule is **not** a script line (it's a global enforcement / variable definition / structural rule), the dialog-state checklist does not apply — use the standard rewrite guidance above. The check fires only when `fix_strategy: "substring"` and the target line is inside a `Step N`, `STATE N`, dialog block, or labelled utterance.
-
-## Gap lens (strict scope)
-
-You flag only gaps that exist **within the prompt's own rules**, not absent concepts the prompt never addresses. Every gap must cite at least one `related_rule_id` that demonstrates the prompt itself raised the question.
-
-### Two kinds of gap
-
-**1. Undefined edge case (incomplete conditional).**
-A rule introduces a conditional ("if X, do A") but the rule set never covers the complementary case ("if not X" or "otherwise").
-
-- ✅ Flag: `R3: "If the customer is upset, prioritise satisfaction"` — no rule covers what to do when the customer is not upset and a policy conflict arises.
-- ❌ Don't flag: A prompt with a happy-path persona that never mentions angry users. No conditional → nothing to be incomplete.
-
-**2. Ambiguous term used inside a rule.**
-A rule uses a vague evaluative word — `appropriate`, `reasonable`, `professional`, `clear`, `concise`, `polite`, `friendly`, `formal`, `casual`, `comprehensive`, `brief`, `thorough` — without another rule or definition anchoring it.
-
-- ✅ Flag: `R5: "Be appropriately formal"` — "appropriate" is undefined; no other rule clarifies the formality scale.
-- ❌ Don't flag: A prompt that omits a tone instruction altogether. No ambiguous term → nothing to clarify.
-
-### Out of scope (do not flag)
-
-You do **not** speculate about absent concepts. The following are explicitly out of scope:
-
-- "The prompt doesn't say what to do if the request is impossible." — Only flag if a rule references impossibility.
-- "Persona is undefined." — Only flag if a rule references the persona/role/scope.
-- "For Vapi, the prompt should handle silence/hang-up/multi-speaker." — Don't flag based on prompt type.
-- "For agents, the prompt should define tool-use boundaries." — Don't flag based on prompt type.
-- "Missing failure mode." — Only flag if a rule references failure handling.
-
-The single rule of thumb: every gap must cite at least one `related_rule_id`. Gaps with no related rule are speculation; drop them.
-
-Severity:
-- **high** — the ambiguity or missing branch will affect most realistic inputs.
-- **medium** — it will affect some realistic inputs.
-- **low** — corner case; would only matter in edge inputs.
-
-Schema:
-
-```json
-{ "gaps": [{ "id": "G1", "kind": "undefined_edge_case|ambiguous_term", "description": "<one sentence: the conditional that is incomplete, or the term that is undefined>", "related_rule_ids": ["R5"], "severity": "low|medium|high", "suggested_fix": "<concrete one-sentence resolution or structural action>", "fix_strategy": "substring | structural", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "VALUE FRAMING AXES", "subsection_title": "MÜBADELE VALUE HIERARCHY" } }] }
-```
-
-For `suggested_fix`: **always populate `suggested_fix` with a concrete one-sentence resolution** — for `undefined_edge_case`, write the missing branch verbatim (e.g. `"Add: 'If the user keeps interrupting after 3 attempts, trigger end-call-tool with a brief apology.'"`). For `ambiguous_term`, anchor the vague word with a specific replacement (e.g. `"Replace 'appropriately formal' with 'address callers by surname and use the formal pronoun form throughout.'"`). Empty `suggested_fix` is no longer allowed — if the runner cannot draft a resolution, it must write `suggested_fix: 'TODO: <one-sentence open question for the author>'` and the human handles it in the konuşalım sub-flow.
-
-## Schema lens
-
-Detects structural issues in prompts that use numbered sections (e.g. system prompts, voice agent scripts, structured Vapi flows). The lens parses the body for ATX heading patterns and reports anomalies in section numbering, ordering, parent-child consistency, and heading style.
-
-**Applicability gate:** the lens auto-skips when the body has NO numbered structural headings. Specifically, the lens runs only when at least one of these is present:
-
-- A line matching `^## SECTION \d+\b` (top-level numbered section, e.g. `## SECTION 0 — GLOBAL ENFORCEMENT`)
-- A line matching `^### \d+\.\d+\b` (numbered subsection, e.g. `### 0.1 CHANNEL & LANGUAGE`)
-
-If neither pattern appears, emit `{"applicable": false, "findings": [], "reason": "no numbered section headings detected"}` and exit. Don't fabricate findings on flat prompts — the lens is intentionally silent on prose-only or unnumbered prompts.
-
-### Anomaly categories
-
-The `kind` field on each finding identifies the structural defect detected:
-
-| `kind` | Pattern | Severity heuristic |
+| Slice | File | Read by |
 |---|---|---|
-| `section_gap` | `## SECTION N` then `## SECTION N+2` (or larger jump). Section N+1 is missing entirely. | high (the missing section may indicate a deleted block; downstream cross-references break) |
-| `subsection_gap` | `### N.M` then `### N.M+2` (within the same parent section). Subsection N.(M+1) is missing. | medium |
-| `out_of_order` | `## SECTION N` after `## SECTION M` where N < M, OR `### N.M` after `### N.K` within the same parent where M < K. | high if section-level, medium if subsection-level |
-| `subsection_orphan` | `### A.B` appears under `## SECTION N` where A ≠ N. Subsection number does not match parent section. | high (the most confusing structural bug — readers / downstream tools follow the wrong context) |
-| `heading_style_inconsistent` | Some `## SECTION N` headings use ALL CAPS, others use Title Case. Or some `### N.M` lines use `### N.M TITLE` while others use `### N.M Title`. | low |
-| `missing_parent` | `### N.M` appears with no preceding `## SECTION N` (e.g. the body opens with `### 5.1` and no `## SECTION 5` ever appears). | high |
-| `step_gap` | `STEP N` (uppercase, standalone line or in heading) followed by `STEP N+2` within the same subsection. Common in flow-style instructions. | medium |
-| `non_applicable` | Reported only as `applicable: false` at the top of the output — not an individual finding. | n/a |
+| Shared invariants | [`lens-rules/_shared.md`](lens-rules/_shared.md) | every static-lens singleton dispatch |
+| Conflict lens | [`lens-rules/conflict.md`](lens-rules/conflict.md) | conflict singleton dispatch |
+| Dominance lens | [`lens-rules/dominance.md`](lens-rules/dominance.md) | dominance singleton dispatch |
+| Gap lens | [`lens-rules/gap.md`](lens-rules/gap.md) | gap singleton dispatch |
+| Schema lens | [`lens-rules/schema.md`](lens-rules/schema.md) | schema singleton dispatch |
 
-### Severity heuristics
+## What's in `_shared.md`
 
-- **high** — `section_gap` (a whole numbered section is missing), `subsection_orphan` (subsection under wrong parent), `missing_parent` (subsection has no parent), section-level `out_of_order`. These affect document navigation and cross-references.
-- **medium** — `subsection_gap`, subsection-level `out_of_order`, `step_gap`.
-- **low** — `heading_style_inconsistent`.
+Cross-lens content every lens depends on:
 
-### suggested_fix conventions
+- Output invariant (every finding needs `suggested_fix`)
+- `fix_strategy` — substring vs structural
+- Rule extraction schema (used in Phase 3 of the skill)
+- Severity heuristics across lenses
+- Compact mode policy table (per-lens trim rules)
+- Section reference (`section_ref` field, lookup conventions, rendering rules)
+- Render contract (markdown table format, language switching, sort order)
 
-For `section_gap` (Section N → N+2, missing N+1):
+## What's in each lens slice
 
-- `fix_strategy: "structural"`, `suggested_fix`: `"Insert a 'Section N+1 — <Placeholder Title>' heading between Section N and Section N+2, OR renumber Section N+2 → Section N+1 and shift all subsequent sections down by 1."`
+Only the lens-specific criteria:
 
-For `subsection_gap` (N.M → N.M+2, missing N.M+1):
+- Definition of what the lens detects
+- Severity heuristic for that lens
+- JSON schema for that lens's output
+- `suggested_fix` conventions for that lens
+- Lens-specific invariants (e.g. Dominance's "dialog state preservation" rubric and metadata invariant)
 
-- `fix_strategy: "structural"`, `suggested_fix`: `"Insert a 'Subsection N.(M+1) — <Placeholder Title>' heading, OR renumber N.(M+2) → N.(M+1) and shift subsequent subsections in this parent section."`
-
-For `out_of_order`:
-
-- `fix_strategy: "structural"`, `suggested_fix`: `"Reorder so that <heading-after> appears before <heading-before>."`
-
-For `subsection_orphan` (e.g. `### 5.1` under `## SECTION 4`):
-
-- `fix_strategy: "structural"`, `suggested_fix`: `"Renumber '### 5.1 <TITLE>' to '### 4.X <TITLE>' (where X is the next free subsection number under Section 4), OR move this subsection under the correct '## SECTION 5' parent."`
-
-For `heading_style_inconsistent`:
-
-- `fix_strategy: "substring"`, `suggested_fix`: a concrete rewrite of one heading to match the dominant style (e.g. `"## SECTION 3 — READER PROFILE MEMORY"` if other sections use ALL CAPS). This is the only schema finding that can produce a clean substring replacement.
-
-For `missing_parent`:
-
-- `fix_strategy: "structural"`, `suggested_fix`: `"Add a '## SECTION N — <Inferred Title>' heading before the first '### N.M' heading."`
-
-For `step_gap`:
-
-- `fix_strategy: "structural"`, `suggested_fix`: `"Add 'STEP N+1 — <Placeholder>' between STEP N and STEP N+2, OR renumber STEP N+2 to STEP N+1."`
-
-### Output schema (schema.json)
-
-```json
-{
-  "applicable": true,
-  "reason": null,
-  "findings": [
-    {
-      "id": "S1",
-      "kind": "section_gap | subsection_gap | out_of_order | subsection_orphan | heading_style_inconsistent | missing_parent | step_gap",
-      "severity": "low | medium | high",
-      "line": 280,
-      "current_excerpt": "## SECTION 7 — VALUE FRAMING AXES",
-      "related_lines": [220, 280],
-      "rationale": "Section 5 (line 220) is directly followed by Section 7 (line 280). Section 6 is missing.",
-      "suggested_fix": "Insert a 'Section 6 — <Placeholder Title>' heading between line 220 and line 280, OR renumber Section 7 → Section 6 and shift subsequent sections down by 1.",
-      "fix_strategy": "structural",
-      "rule_ids": [],
-      "section_ref": { "section": "7", "subsection": null, "section_title": "VALUE FRAMING AXES", "subsection_title": null }
-    }
-  ]
-}
-```
-
-Schema findings use `lens: "schema"` when merged into `findings.json`. `rule_ids: []` is intentional — the schema lens parses headings directly, not the rule list. It does **not** depend on `rules.json`.
-
-### fix_kind dispatch
-
-All schema findings emit `fix_kind: "replace"` (they are textual corrections to the prompt structure). Phase 10 routes them through the normal apply flow; substring-style heading edits use substring replace, structural reorderings use the Edit tool with a risk warning. Empty `suggested_fix` is invalid (same invariant as conflict/dominance/gap).
-
-## Drift lens (handled by `drift-runner` subagent)
+## Drift lens
 
 The drift lens does not analyse text — it constructs adversarial scenarios, simulates the prompt under each, and judges the outputs. It runs only when the body has anchors, conflicts, or role-override dominances; otherwise it adds no signal and is skipped.
 
@@ -257,190 +48,10 @@ The `drift-runner` subagent has its own definition (`agents/drift-runner.md`) an
 }
 ```
 
-The merged `findings.json` produced by the skill in Phase 6 promotes each **failing** verdict to a finding with `lens: "drift"`, severity inferred from `score` (≤ 0.5 = high, ≤ 0.75 = medium, else low). `suggested_fix` is empty for drift findings — the rationale describes the divergence, but the fix depends on which static finding caused the drift (conflict / dominance / gap).
+The merged `findings.json` produced by the skill in Phase 7 promotes each **failing** verdict to a finding with `lens: "drift"`, severity inferred from `score` (≤ 0.5 = high, ≤ 0.75 = medium, else low). `suggested_fix` is empty for drift findings — the rationale describes the divergence, but the fix depends on which static finding caused the drift (conflict / dominance / gap).
 
-## Severity heuristics across lenses
+## Backward compatibility
 
-When unsure, ask: "How many realistic inputs trigger this?"
+Callers that pass `lens_rules_ref: <path to lens-rules.md>` (single-file API) still get a valid file — this index — but the file no longer contains the criteria inline. Runners receiving the single-file path should look at this index, then read the slice they need. Newer dispatches pass `lens_rules: {shared, conflict, dominance, gap, schema}` directly and skip the indirection.
 
-- **high**: affects most realistic inputs, or causes safety/policy violation.
-- **medium**: affects some realistic inputs.
-- **low**: corner case, would only matter in edge inputs.
-
-## Compact mode
-
-Active when the prompt body length exceeds `frontmatter.max_char_limit` (default 50000 chars; set to 0 to disable). The skill computes the body length in Phase 2 and propagates `compact_mode: true | false` to every lens runner via the dispatch contract.
-
-The policies below trade audit DEPTH for SPEED. Every finding KIND remains possible — compact mode does not invent or remove categories — it trims which severities and pair-comparisons are evaluated.
-
-### Per-lens policy
-
-| Lens | Compact-mode change |
-|---|---|
-| **Conflict** | Severity floor: `medium`. Emit `high` and `medium` only; skip `low`. Pair budget: pick the 50 most-impactful rules (those containing "always", "never", "must", "only", "ignore") and compare only within that set. Cap at ~1250 pair comparisons regardless of N. |
-| **Dominance** | Mechanism restriction: emit only `role-override` and `recency`. Skip `position`, `length`, `specificity` (subtle effects requiring pair-comparison cost). Severity floor: `medium`. |
-| **Gap** | Severity floor: `medium`. Skip `low`-severity gaps (corner cases). Keep `undefined_edge_case` and `ambiguous_term` at medium/high. |
-| **Schema** | No change. Heading parsing is cheap regardless of body size. |
-| **Drift** | Halve `effective_expand_count = max(1, raw_expand_count // 2)`. Scenario count maps linearly to LLM simulation cost — this is the single biggest perf lever for drift on large prompts. |
-| **TR phonetic** | No change. Line-level pattern matching is already cheap. |
-
-### Rule extraction (Phase 3)
-
-In compact mode, keep each rule's `text` field to ≤ 100 characters and `source_excerpt` to ≤ 120 characters. This trims the rule-list payload that downstream lenses load. Atomic-rule semantics unchanged — the policy is about VERBOSITY, not correctness.
-
-### Output annotation
-
-Every static-lens output file (`conflicts.json`, `dominances.json`, `gaps.json`, `schema.json`) gains a top-level `compact_mode: true` field when policy fired, plus a `compact_policy` array listing which trim policies applied (e.g. `["severity_floor_medium", "pair_budget_50"]`). `drift.json` gains `compact_mode: true` + `compact_policy: ["expand_count_halved"]`. `tr_phonetic.json` gains `compact_mode: true` only (no policy fired — informational).
-
-### Override hierarchy for max_char_limit
-
-Same priority chain as other repo defaults (most specific wins):
-1. Per-prompt frontmatter (`max_char_limit: 100000` in the YAML header)
-2. Env var (`PROMPTCHECKER_MAX_CHAR_LIMIT=0` in Claude Code settings)
-3. Project config (`.promptchecker.json` `max_char_limit`)
-4. Built-in default: `50000`
-
-Set `max_char_limit: 0` at any layer to disable compact mode entirely — the audit runs at full depth regardless of body size.
-
-### Not a hard abort
-
-Compact mode does NOT abort the audit on oversize prompts. It runs THROUGH them with cheaper policies. To enforce a hard limit (refuse to audit prompts over N chars), you would add a separate frontmatter field (`hard_limit:`) — that is not part of v0.4.7 and not implemented.
-
-## Section reference (every finding)
-
-Every finding emitted by every lens (conflict, dominance, gap, schema, drift, tr_phonetic) MUST carry a `section_ref` field. This is a structured pointer to the `## SECTION N` (and `### N.M` if applicable) heading that contains the finding's `line`. Built deterministically in Phase 3 of the skill (see `section_index.json`); used by Phase 7 to render section-aware finding headers ("Section 7.2 — L284" instead of bare "L284").
-
-### Field shape
-
-```json
-"section_ref": {
-  "section": "7",
-  "subsection": "7.2",
-  "section_title": "VALUE FRAMING AXES",
-  "subsection_title": "MÜBADELE VALUE HIERARCHY"
-}
-```
-
-OR
-
-```json
-"section_ref": null
-```
-
-The `null` value signals "the finding's line is outside any numbered section" (e.g. a preamble line, a line between sections, or any line in a prompt with no numbered headings at all).
-
-### Per-lens conventions
-
-| Lens | section_ref source |
-|---|---|
-| Conflict / Dominance / Gap | Look up `finding.line` in `section_index.ranges`. Static lenses always operate on rule-anchored lines, so most findings have a real section_ref. |
-| Schema | Same lookup. For `section_gap` or `missing_parent` findings flagging a heading line, the ref points to the section the HEADING introduces (e.g. a finding on line 280 = `## SECTION 7` carries `section_ref.section: "7"`). |
-| Drift | Behavioural, scenario-level. `line: null` AND `section_ref: null` always. Drift findings describe model behaviour, not positional issues. |
-| TR phonetic | Same lookup. Both auto-filed (foreign_word/abbreviation) and apply-eligible (number_readability/punctuation) findings carry section_ref. |
-
-### Backward compatibility
-
-Findings from runs before v0.4.8 do not have the `section_ref` field. Renderers and downstream tools MUST handle:
-- Field present and not null → use it.
-- Field present and null → fall back to bare line marker.
-- Field absent → also fall back to bare line marker (treat as null).
-
-### Rendering rules (Phase 7 and overlay)
-
-When `section_ref.subsection` is not null:
-- TR: `Bölüm 7.2 — Satır 284`
-- EN: `Section 7.2 — L284`
-
-When `section_ref.section` is not null but `subsection` is null:
-- TR: `Bölüm 7 — Satır 284`
-- EN: `Section 7 — L284`
-
-When `section_ref` is null:
-- TR: `Satır 284`
-- EN: `L284`
-
-Section title is NOT included in the inline header (would make the line too long); it appears once in the section-level summary at the top of report.md / inline-suggestions.md.
-
-## Render contract — table format + compact writing
-
-Every finding emitted by every lens (conflict, dominance, gap, schema, drift, tr_phonetic) is rendered downstream as a row in a markdown TABLE. Phase 7 of the skill produces `report.md` with one table per severity bucket (or one combined table sorted by severity); the same table format appears in Phase 9's summary view shown to the user.
-
-### Table columns
-
-| Language | id | lens | severity | section/line | rationale | fix |
-|---|---|---|---|---|---|---|
-| TR | `id` | `mercek` | `önem` | `bölüm / satır` | `açıklama` | `düzeltme` |
-| EN | `id` | `lens` | `sev` | `section / line` | `rationale` | `fix` |
-
-### Column content rules
-
-- **id**: finding id verbatim (`C1`, `D3`, `G2`, `S1`, `T1`, `drift-S1`).
-- **lens / mercek**: translated lens name. Lookup table:
-
-  | English | Türkçe |
-  |---|---|
-  | conflict | çelişki |
-  | dominance | baskınlık |
-  | gap | boşluk |
-  | schema | şema |
-  | drift | davranışsal sapma |
-  | tr phonetic | türkçe fonetik |
-
-- **severity / önem**: translated severity. Lookup table:
-
-  | English | Türkçe |
-  |---|---|
-  | high | yüksek |
-  | medium | orta |
-  | low | düşük |
-
-  For drift findings, severity is inferred from the verdict score: `score ≤ 0.5` → high, `score ≤ 0.75` → medium, else low.
-
-- **section/line**: composite cell derived from `section_ref` + `line`:
-
-  | section_ref state | line state | TR render | EN render |
-  |---|---|---|---|
-  | subsection set | line set | `Bölüm 7.2 / Satır 284` | `Section 7.2 / L284` |
-  | section only | line set | `Bölüm 7 / Satır 284` | `Section 7 / L284` |
-  | null | line set | `— / Satır 284` | `— / L284` |
-  | null | null (drift only) | `— / —` | `— / —` |
-
-- **rationale / açıklama**: the runner-emitted `rationale` field verbatim — NO TRUNCATION. Runners self-cap at ≤200 chars per the compact writing invariant; render uses full text. Multi-sentence rationales are rare (compact writing prefers one sentence) but acceptable when needed.
-
-- **fix / düzeltme**: the runner-emitted `suggested_fix` field. Renders directly. Sentinel suggestions:
-  - `TODO: <text>` → renders as italic `_TODO: <text>_`
-  - `Intentional — dismiss this finding` → renders as italic `_Intentional — atla_` (TR) / `_Intentional — dismiss_` (EN)
-  - Drift findings with no fix: `(geçti — düzeltme yok)` (TR) / `(passed — no fix)` (EN)
-  - Empty/null fix for other lenses: `_(see rationale)_` / `_(bkz. açıklama)_`
-
-### Sort order (unchanged from v0.4.9)
-
-Severity descending (high → medium → low) → lens group → line ascending. Tied (same severity, same lens, same line): order by finding id.
-
-### Compact writing — runner-side invariant (also documented per-lens-runner)
-
-Every runner MUST write `rationale` ≤ 200 characters and `suggested_fix` ≤ 150 characters. One sentence preferred. No preamble ("This finding indicates..."). Direct identification + reason + actionable fix.
-
-The render layer assumes runners obey this invariant. If a runner emits oversized text, the render still uses it verbatim (no truncation) but the report becomes ugly — runners are responsible for the contract.
-
-### No truncation in render
-
-v0.4.9 had `≤120 chars rationale, ≤100 chars fix` truncation at the render layer with ellipsis. v0.4.10 REMOVES this. The new contract: runner self-caps; render uses full text. Truncation cut sentences mid-clause and made reports unreadable; pushing the constraint to the runner ensures the output is meaningful within the limit.
-
-### Canonical example — TR
-
-```markdown
-| id | mercek | önem | bölüm / satır | açıklama | düzeltme |
-|---|---|---|---|---|---|
-| C2 | çelişki | yüksek | Bölüm 5 / Satır 326 | R78 sms_retry_count max=1 ile R80 max=2 çelişiyor; aynı sayaç iki değer alamaz. | R80'i (satır 590) max=1 yap VEYA R78'i max=2 yap — tek değerde birleştir. |
-| G5 | boşluk | orta | Bölüm 0.1 / Satır 7 | R4 "step instructions require it" tanımsız; hangi step'lerin 35 kelimeye gittiği belirsiz. | R4'ü "Verbatim mandatory scripts muaftır, kısa tutulamaz" diye netleştir. |
-| drift-S1 | davranışsal sapma | düşük | — / — | regression senaryosu geçti (0.93). | (geçti — düzeltme yok) |
-```
-
-### Canonical example — EN
-
-```markdown
-| id | lens | sev | section / line | rationale | fix |
-|---|---|---|---|---|---|
-| C2 | conflict | high | Section 5 / L326 | R78 sets sms_retry_count max=1 but R80 says max=2; same counter cannot be both. | Change R80 (line 590) to max=1 OR R78 to max=2 — pick one canonical value. |
-```
+See `agents/static-lens-runner.md` for the input schema.

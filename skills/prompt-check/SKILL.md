@@ -613,9 +613,19 @@ else:
 ui_canonical = json.dumps(ui_for_cache, sort_keys=True, ensure_ascii=False)
 
 # 4. Reference docs + runner specs — any edit to these invalidates cached lens output.
+# The lens-rules slices are included individually so editing a single lens's rubric
+# (e.g. dominance.md) invalidates only the runs whose cache key incorporated that
+# slice's prior hash — but since the cache key is one-per-run-not-per-lens, in
+# practice any slice change invalidates the whole run's cache. Per-lens cache
+# granularity is a future refinement.
 ref_files = [
     'skills/prompt-check/SKILL.md',
     'skills/prompt-check/references/lens-rules.md',
+    'skills/prompt-check/references/lens-rules/_shared.md',
+    'skills/prompt-check/references/lens-rules/conflict.md',
+    'skills/prompt-check/references/lens-rules/dominance.md',
+    'skills/prompt-check/references/lens-rules/gap.md',
+    'skills/prompt-check/references/lens-rules/schema.md',
     'skills/prompt-check/references/probes.md',
     'skills/prompt-check/references/tr-phonetic.md',
     'agents/static-lens-runner.md',
@@ -747,7 +757,10 @@ Agent({
       body:            "<absolute path to $RUN_DIR/body.txt>",
       frontmatter:     "<absolute path to $RUN_DIR/frontmatter.json>",
       rules:           "<absolute path to $RUN_DIR/rules.json>",
-      lens_rules_ref:  "<absolute path to skills/prompt-check/references/lens-rules.md>",
+      lens_rules: {
+        shared:    "<absolute path to skills/prompt-check/references/lens-rules/_shared.md>",
+        conflict:  "<absolute path to skills/prompt-check/references/lens-rules/conflict.md>"
+      },
       selected_lenses: ["conflict"],
       compact_mode:    <bool from frontmatter.compact_mode>,
       max_char_limit:  <int from frontmatter.max_char_limit>,
@@ -765,7 +778,13 @@ Agent({
 Agent({
   subagent_type: "static-lens-runner",
   prompt: JSON.stringify({
-    inputs: { ..., selected_lenses: ["dominance"], ..., report_language: <string from frontmatter.report_language, default "tr"> },
+    inputs: {
+      ...,
+      lens_rules: { shared: "<.../_shared.md>", dominance: "<.../dominance.md>" },
+      selected_lenses: ["dominance"],
+      ...,
+      report_language: <string from frontmatter.report_language, default "tr">
+    },
     output_paths: { dominances: "<absolute path to $RUN_DIR/dominances.json>" }
   }),
   description: "dominance lens for " + BASENAME,
@@ -775,7 +794,13 @@ Agent({
 Agent({
   subagent_type: "static-lens-runner",
   prompt: JSON.stringify({
-    inputs: { ..., selected_lenses: ["gap"], ..., report_language: <string from frontmatter.report_language, default "tr"> },
+    inputs: {
+      ...,
+      lens_rules: { shared: "<.../_shared.md>", gap: "<.../gap.md>" },
+      selected_lenses: ["gap"],
+      ...,
+      report_language: <string from frontmatter.report_language, default "tr">
+    },
     output_paths: { gaps: "<absolute path to $RUN_DIR/gaps.json>" }
   }),
   description: "gap lens for " + BASENAME,
@@ -785,7 +810,13 @@ Agent({
 Agent({
   subagent_type: "static-lens-runner",
   prompt: JSON.stringify({
-    inputs: { ..., selected_lenses: ["schema"], ..., report_language: <string from frontmatter.report_language, default "tr"> },
+    inputs: {
+      ...,
+      lens_rules: { shared: "<.../_shared.md>", schema: "<.../schema.md>" },
+      selected_lenses: ["schema"],
+      ...,
+      report_language: <string from frontmatter.report_language, default "tr">
+    },
     output_paths: { schema: "<absolute path to $RUN_DIR/schema.json>" }
   }),
   description: "schema lens for " + BASENAME,
@@ -810,7 +841,7 @@ git worktree. Output JSONs land at the per-lens path; the runner returns
 when its single output file is written. The skill awaits all five returns
 before Phase 5's drift gate.
 
-**Per-lens runner contract.** The `static-lens-runner` accepts the same `inputs` schema (`body`, `frontmatter`, `rules`, `lens_rules_ref`, `selected_lenses`, `compact_mode`, `max_char_limit`, `section_index`, `report_language`) and `output_paths` (any subset of `conflicts`, `dominances`, `gaps`, `schema`). The change is in HOW the skill calls it: FOUR singleton dispatches instead of one combined call with all four lenses in `selected_lenses`. The runner still handles a multi-lens `selected_lenses` array (backward compat) — singleton-per-call is the new RECOMMENDED dispatch shape.
+**Per-lens runner contract.** The `static-lens-runner` accepts the same `inputs` schema (`body`, `frontmatter`, `rules`, `lens_rules` map, `selected_lenses`, `compact_mode`, `max_char_limit`, `section_index`, `report_language`) and `output_paths` (any subset of `conflicts`, `dominances`, `gaps`, `schema`). The change is in HOW the skill calls it: FOUR singleton dispatches instead of one combined call with all four lenses in `selected_lenses`. Each singleton dispatch passes only the relevant `lens_rules.shared` + `lens_rules.<lens>` slices — the runner does NOT load the full criteria document. The runner still handles a multi-lens `selected_lenses` array (backward compat) — singleton-per-call is the new RECOMMENDED dispatch shape. Legacy callers may still pass `lens_rules_ref` (single-file path) instead of `lens_rules` (map); the runner falls back to reading the full file in that case.
 
 **`report_language` propagation (mandatory).** Every Phase 4 / 5 / 6 Agent call MUST pass `report_language` from `frontmatter.report_language` in its `inputs` block. Runners write `rationale` + `suggested_fix` (and TR `pronunciation_entry.note`) directly in this language — there is NO post-render translation in Phase 7. Skipping this field on dispatch forces the runner into the EN fallback with a warning.
 

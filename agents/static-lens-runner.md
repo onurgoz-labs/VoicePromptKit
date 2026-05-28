@@ -18,7 +18,13 @@ Your user message is a JSON object split into **read-only inputs** and four **ou
     "body":            "<$RUN_DIR/body.txt>",
     "frontmatter":     "<$RUN_DIR/frontmatter.json>",
     "rules":           "<$RUN_DIR/rules.json>",
-    "lens_rules_ref":  "<skills/prompt-check/references/lens-rules.md>",
+    "lens_rules": {
+      "shared":     "<skills/prompt-check/references/lens-rules/_shared.md>",
+      "conflict":   "<skills/prompt-check/references/lens-rules/conflict.md>",
+      "dominance":  "<skills/prompt-check/references/lens-rules/dominance.md>",
+      "gap":        "<skills/prompt-check/references/lens-rules/gap.md>",
+      "schema":     "<skills/prompt-check/references/lens-rules/schema.md>"
+    },
     "selected_lenses": ["conflict", "dominance", "gap", "schema"],
     "compact_mode":    false,
     "max_char_limit":  50000,
@@ -34,6 +40,10 @@ Your user message is a JSON object split into **read-only inputs** and four **ou
 }
 ```
 
+**Reference loading contract.** When `inputs.lens_rules` is a MAP (new format), read ONLY the `shared` slice plus the slice for whichever lens(es) you are actually running. For a singleton dispatch (e.g. `selected_lenses: ["dominance"]`), that means reading `lens_rules.shared` and `lens_rules.dominance` — never the other three. For a multi-lens combined dispatch (backward-compat callers passing `selected_lenses: ["conflict","dominance","gap","schema"]`), read `shared` plus every slice corresponding to a selected lens.
+
+**Backward compatibility.** If `inputs` carries the legacy `lens_rules_ref` field (single-file path to `lens-rules.md`) INSTEAD OF the new map, fall back: read the single file in full. The file no longer contains the criteria inline (it became an index pointing to the slices) — follow the index links and read the relevant slices. This keeps older skill versions and external callers working without breakage.
+
 Read every file under `inputs` exactly once. **Never read any path under `output_paths`** — those files do not exist yet and reading them would burn a tool call. Write to each output path only at the end of the corresponding step.
 
 `section_index` is a read-only lookup table built in Phase 3 of the skill. For every finding you emit, attach a `section_ref` field by looking up the finding's `line` in `section_index.ranges`. If the line falls inside a range with `section: not null`, set `section_ref` to `{section, subsection, section_title, subsection_title}`. Otherwise set `section_ref: null` (the line is outside any numbered section — e.g. a preamble, an unstructured prompt, or a line between sections). The lookup is mandatory for all four static lenses including schema.
@@ -44,7 +54,9 @@ Read every file under `inputs` exactly once. **Never read any path under `output
 
 `report_language` is the user's chosen output language for THIS run. Every `rationale`, `suggested_fix`, `reasoning`, `description`, `rubric`, and `pronunciation_entry.note` field you emit MUST be written in this language. When absent/null/unrecognized, fall back to `en` (backward compat) and emit a warning per the Failure modes section.
 
-The `lens_rules_ref` file is the canonical specification for every lens criterion below. Do not internalise those rules from memory — read the document at runtime so the criteria stay in one source of truth.
+The lens criteria documents are the canonical specification for every lens criterion below. Do not internalise those rules from memory — read the document(s) at runtime so the criteria stay in one source of truth.
+
+> **Terminology note.** Throughout this document, the phrase `lens_rules_ref` (singular) refers to the canonical lens criteria reference — historically a single file (`lens-rules.md`), now split into a shared slice plus per-lens slices (see "Reference loading contract" above). Where a step below says "apply the X lens section of `lens_rules_ref`", in the new map input format that means "apply the criteria in `lens_rules.shared` + `lens_rules.<lens>`". Behaviour is identical — the slicing only changes which file(s) you open, not what they say.
 
 **Line-number contract:** every `line` field you emit (whether on a rule reference or anywhere else) is a `body.txt` index — 1-indexed, blank lines included. **Do not translate to original-file line numbers.** Phase 7 of the skill performs that translation when it renders `findings.json`.
 
