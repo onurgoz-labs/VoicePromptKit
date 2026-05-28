@@ -243,6 +243,20 @@ Turns must alternate `user_input` (or `silence_input`) → `assistant_expect` �
 
 The bridge is `<prompt>.anchors.yaml`. Stay on text, iterate fast, only call Vapi when you're confident.
 
+### Cost controls (v0.5.2)
+
+Three additive cost reductions kick in automatically — most users never need to think about them, but they're documented here for tuning:
+
+- **Prompt caching.** The simulated system prompt (the prompt body) is identical across every scenario in a batch and across every turn within a flow scenario. When the underlying provider supports it (Anthropic API: `cache_control: {type: "ephemeral"}`; OpenAI: automatic), drift-runner and chat-simulator attach the directive to the system block. First call populates the cache; later calls in the same batch / flow hit it. Saves ~50-60% on simulation tokens for long-body prompts.
+- **Judge model swap.** Rubric evaluation in drift-runner's Step 3 ("did the output behave like X?") is a yes/no judgement task that doesn't need a frontier model. v0.5.2 adds a `judge_model` frontmatter field (and matching env var / project-config keys) defaulting to `claude-haiku-4-5-20251001`. `target_model` still drives simulation — that's where persona faithfulness matters. Override per prompt: `judge_model: claude-opus-4-7` in frontmatter if you want Opus rubric eval for tricky cases.
+- **Batched flow rubric eval.** A flow anchor with K assertion steps previously cost K judge LLM calls (one per `assistant_expect` / `end_call_expect`). v0.5.2 collapses these into ONE batched judge call: the judge sees the full transcript + a numbered list of (step, rubric) pairs and returns all per-step verdicts in one JSON document. Simulation stays sequential (multi-turn state matters); judging batches safely because rubric eval is independent per step.
+
+Net effect on the canonical sample-vapi flow anchor (4 turns):
+- v0.5.1: 4 Opus simulation + 4 Opus judge = 8 Opus calls per anchor.
+- v0.5.2: 4 Opus simulation (body cached after turn 1) + 1 Haiku judge = ~4 Opus + 1 Haiku.
+
+Roughly ~80% reduction on the judging side, ~50% on simulation side from caching. Bigger savings on bigger bodies / longer flows.
+
 ## Output layout
 
 Every run gets its own directory. Older runs are preserved so you can diff audits across prompt edits.
