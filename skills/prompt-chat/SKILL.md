@@ -115,7 +115,7 @@ fm = json.load(open(os.path.join(run_dir, 'frontmatter.json'), encoding='utf-8')
 session = {
     "schema_version": 1,
     "run_id": os.path.basename(run_dir),
-    "started_at": datetime.datetime.utcnow().isoformat() + "Z",
+    "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     "prompt_path": prompt_path,
     "prompt_sha256_at_chat": fm['prompt_sha256'],
     "target_model": fm['target_model'],
@@ -287,7 +287,7 @@ run_dir, user_message = sys.argv[1], sys.argv[2]
 entry = {
     "role": "user",
     "content": user_message,
-    "ts": datetime.datetime.utcnow().isoformat() + "Z"
+    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat()
 }
 with open(os.path.join(run_dir, 'chat.jsonl'), 'a', encoding='utf-8') as f:
     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -307,7 +307,7 @@ text = open(output_path, encoding='utf-8').read().strip()
 entry = {
     "role": "assistant",
     "content": text,
-    "ts": datetime.datetime.utcnow().isoformat() + "Z"
+    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat()
 }
 with open(os.path.join(run_dir, 'chat.jsonl'), 'a', encoding='utf-8') as f:
     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -653,7 +653,7 @@ except Exception as e:
 os.rename(tmp, prompt_path)
 
 # Archive saved_anchors.json with a committed timestamp prefix.
-ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 committed_path = os.path.join(os.path.dirname(staged_path), f'committed-{ts}.json')
 shutil.move(staged_path, committed_path)
 
