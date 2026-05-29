@@ -1383,18 +1383,62 @@ class _ThinkingSpinner:
         i = 0
         while not self._stop.is_set():
             with _STDOUT_LOCK:
-                sys.stdout.write(
-                    "\r\033[2K" + _c(_COL_SPIN, f"{self.label}{frames[i % 3]}")
-                )
-                sys.stdout.flush()
+                self._paint_frame(f"{self.label}{frames[i % 3]}")
             i += 1
             self._stop.wait(0.35)
+
+    def _paint_frame(self, text: str) -> None:
+        """v0.5.17: render the spinner in the pinned footer row so it no
+        longer clobbers the input area (where cooked-mode echo from any
+        chars typed during bot thinking lands). Falls back to inline
+        ``\\r\\033[2K`` when the footer isn't pinned (terminal too small
+        or non-TTY)."""
+        if _PIN_ACTIVE:
+            cols, rows = _term_size()
+            visible = text[: max(1, cols - 1)]
+            sys.stdout.write("\033[s")                       # save cursor
+            sys.stdout.write(f"\033[{rows};1H\033[2K")        # jump + clear footer
+            sys.stdout.write(_c(_COL_SPIN, visible))         # write frame
+            sys.stdout.write("\033[u")                       # restore cursor
+        else:
+            sys.stdout.write("\r\033[2K" + _c(_COL_SPIN, text))
+        sys.stdout.flush()
 
     def stop(self) -> None:
         if self._thread is None:
             return
         self._stop.set()
         self._thread.join(timeout=1.0)
+        with _STDOUT_LOCK:
+            if _PIN_ACTIVE:
+                _cols, rows = _term_size()
+                sys.stdout.write("\033[s")
+                sys.stdout.write(f"\033[{rows};1H\033[2K")
+                sys.stdout.write("\033[u")
+            else:
+                sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
+
+
+def _drain_stale_input() -> None:
+    """v0.5.17: discard chars the user typed during bot thinking.
+
+    Between bot turns the terminal is in cooked mode (cbreak is only
+    engaged inside _read_raw_with_idle_timeout). Anything typed while
+    ctx.send() blocks goes into the kernel line discipline buffer and
+    echoes inline. Without draining, those chars would (a) re-surface as
+    ghost input on the row where the next bot reply is about to render,
+    and (b) the kernel buffer would feed them straight into the next
+    cbreak select() — making it look like the user typed them
+    *after* the reply.
+    """
+    if not _IDLE_TIMEOUT_OK or not sys.stdin.isatty():
+        return
+    try:
+        _termios_mod.tcflush(sys.stdin.fileno(), _termios_mod.TCIFLUSH)
+    except (OSError, _termios_mod.error):
+        pass
+    if _TTY:
         with _STDOUT_LOCK:
             sys.stdout.write("\r\033[2K")
             sys.stdout.flush()
@@ -1404,13 +1448,17 @@ def _send_with_spinner(ctx: "_SubprocessCtx", msg: str,
                        persona_name: str | None, report_language: str) -> str:
     """Wrap a ctx.send() call with the thinking spinner so the user sees
     progress feedback while the bare Claude subprocess is producing the
-    reply. Spinner stops in finally so an exception still cleans up."""
+    reply. Spinner stops in finally so an exception still cleans up.
+    v0.5.17: also drains stale cooked-mode input after spinner.stop so
+    the next bot reply doesn't collide with ghost chars the user typed
+    during the wait."""
     spinner = _ThinkingSpinner(persona_name, report_language)
     spinner.start()
     try:
         return ctx.send(msg, stream_to=None)
     finally:
         spinner.stop()
+        _drain_stale_input()
 
 
 def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
@@ -1429,7 +1477,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
     print()
     print(bar)
     if report_language == "tr":
-        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.16)"))
+        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.17)"))
         print(bar)
         print(f"  Prompt:    {_c(_COL_BOLD, basename)} ({line_count} satır, model: {chat_model})")
         print(f"  Arayan:    {_c(_COL_BOLD, caller_name)}")
@@ -1440,7 +1488,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
         print(_c(_COL_DIM, "  Komutlar: /save  /history  /reset  /silence <N>  /silence-auto  /commit  /help  /quit"))
         print(bar)
     else:
-        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.16)"))
+        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.17)"))
         print(bar)
         print(f"  Prompt:    {_c(_COL_BOLD, basename)} ({line_count} lines, model: {chat_model})")
         print(f"  Caller:    {_c(_COL_BOLD, caller_name)}")
