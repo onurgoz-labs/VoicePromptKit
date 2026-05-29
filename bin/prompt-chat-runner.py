@@ -67,12 +67,13 @@ def _c(code: str, text: str) -> str:
     return f"\033[{code}m{text}\033[0m"
 
 
-_COL_BOT       = "38;5;208"  # orange — persona reply prefix + footer
-_COL_USER      = "38;5;42"   # green  — user input prompt
+_COL_BOT       = "38;5;82"   # green  — persona reply (v0.5.13: was orange)
+_COL_USER      = "38;5;214"  # orange — user input + right-aligned echo (v0.5.13)
 _COL_SYS       = "38;5;245"  # gray   — system / meta messages
 _COL_DIM       = "2"         # dim    — secondary text (timestamps, hints)
 _COL_BOLD      = "1"         # bold   — emphasis
 _COL_ERR       = "38;5;196"  # red    — errors
+_COL_SPIN      = "38;5;82"   # green  — thinking spinner (matches bot)
 
 
 # v0.5.9 — random Turkish caller name pool for filling [MÜŞTERİ_ADI] /
@@ -251,6 +252,13 @@ def main() -> int:
 
     _print_welcome(run_dir, abs_prompt, chat_model, report_language, caller_name)
 
+    # v0.5.13: pin a status footer to the bottom terminal row via ANSI
+    # scroll region. Conversation scrolls within rows 1..rows-1; the
+    # footer ("― [tur N · /save | …]") lives on row N and is rewritten
+    # each turn. _release_pin in the finally block restores the default
+    # full-screen scroll region.
+    _init_pin()
+
     # v0.5.8: wrap body.txt with persona roleplay framing before passing to
     # claude. The original body.txt is left untouched; .body-wrapped.txt is
     # the framed version the subprocess actually reads as its system prompt.
@@ -272,9 +280,12 @@ def main() -> int:
             # bracketed marker would flash on screen if we passed
             # stream_to=sys.stdout. Buffer the opening, strip the marker,
             # THEN print the clean reply with the persona prefix.
-            opening_raw = ctx.send(
+            # v0.5.13: persona name unknown yet — spinner uses "Bot" label.
+            opening_raw = _send_with_spinner(
+                ctx,
                 f"[SYSTEM: call connected — caller is {caller_name}]",
-                stream_to=None,  # buffer-only; we re-render after stripping markers
+                None,
+                report_language,
             )
             opening_no_end, opening_ended = _strip_end_call_marker(opening_raw)
             opening_clean, persona_name = _strip_persona_name_marker(opening_no_end)
@@ -300,6 +311,7 @@ def main() -> int:
                     staged_path, abs_prompt, report_language, session)
     finally:
         ctx.close()
+        _release_pin()
 
 
 # v0.5.12: closing phrase heuristic backup for end-call detection.
@@ -548,7 +560,9 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
         _append_chat_entry(chat_jsonl_path, "user", user_input)
         print()  # blank line before the reply
         try:
-            reply_raw = ctx.send(user_input, stream_to=None)
+            reply_raw = _send_with_spinner(
+                ctx, user_input, session.get("persona_name"), report_language,
+            )
         except RuntimeError as e:
             print(_c(_COL_ERR, f"\n[chat error: {e}]\n"), file=sys.stderr)
             continue
@@ -671,7 +685,9 @@ def _handle_silence(arg: str, ctx: "_SubprocessCtx", chat_jsonl_path: str,
               else f"  (silence: {duration} seconds)"))
     print()
     try:
-        reply_raw = ctx.send(silence_msg, stream_to=None)
+        reply_raw = _send_with_spinner(
+            ctx, silence_msg, session.get("persona_name"), report_language,
+        )
     except RuntimeError as e:
         print(_c(_COL_ERR, f"\n[chat error: {e}]\n"), file=sys.stderr)
         return
@@ -822,9 +838,11 @@ def _handle_reset(run_dir: str, chat_jsonl_path: str, session_path: str,
     # Send the call-connected trigger for the new caller; bot greets first.
     print()
     try:
-        opening_raw = ctx.send(
+        opening_raw = _send_with_spinner(
+            ctx,
             f"[SYSTEM: call connected — caller is {session['caller_name']}]",
-            stream_to=None,
+            None,
+            report_language,
         )
         opening, _ = _strip_end_call_marker(opening_raw)
         opening, persona_name = _strip_persona_name_marker(opening)
@@ -945,29 +963,184 @@ def _exit_cleanly(run_dir: str, session_path: str, chat_jsonl_path: str,
 
 
 def _render_bot_reply(text: str, persona_name: str | None) -> None:
-    """Render the bot reply with a coloured persona-name prefix."""
-    if persona_name:
-        prefix = _c(_COL_BOT, _c(_COL_BOLD, f"❝ {persona_name}: "))
-    else:
-        prefix = _c(_COL_BOT, _c(_COL_BOLD, "❝ "))
-    print(prefix + _c(_COL_BOT, text))
+    """Render the bot reply LEFT-aligned in green with a persona-name prefix."""
+    with _STDOUT_LOCK:
+        if persona_name:
+            prefix = _c(_COL_BOT, _c(_COL_BOLD, f"❝ {persona_name}: "))
+        else:
+            prefix = _c(_COL_BOT, _c(_COL_BOLD, "❝ "))
+        print(prefix + _c(_COL_BOT, text))
+
+
+# v0.5.13: terminal width / height probe + pinned bottom footer.
+# Approach: set ANSI scroll region to rows 1..rows-1 so the conversation
+# scrolls in the upper region and the last row stays reserved for the
+# footer. Each turn, we redraw the footer text on that bottom row using
+# save/restore cursor sequences so the input prompt position is preserved.
+_PIN_ACTIVE = False
+
+
+def _term_size() -> tuple[int, int]:
+    cols, rows = shutil.get_terminal_size((80, 24))
+    return cols, rows
+
+
+def _init_pin() -> None:
+    """Reserve the last terminal row for the footer; subsequent output
+    scrolls within rows 1..rows-1 only."""
+    global _PIN_ACTIVE
+    if not _TTY or _PIN_ACTIVE:
+        return
+    _cols, rows = _term_size()
+    if rows < 4:
+        return  # too small to bother
+    with _STDOUT_LOCK:
+        # Set DECSTBM scrolling region: top=1, bottom=rows-1.
+        sys.stdout.write(f"\033[1;{rows - 1}r")
+        # Park cursor at row rows-1 (top of conversation area) so the
+        # welcome content we just printed isn't overwritten.
+        sys.stdout.write(f"\033[{rows - 1};1H")
+        sys.stdout.flush()
+    _PIN_ACTIVE = True
+
+
+def _release_pin() -> None:
+    """Restore the default scroll region (full screen) on exit."""
+    global _PIN_ACTIVE
+    if not _TTY or not _PIN_ACTIVE:
+        return
+    _cols, rows = _term_size()
+    with _STDOUT_LOCK:
+        # Clear the pinned footer row.
+        sys.stdout.write(f"\033[{rows};1H\033[2K")
+        # Reset scroll region to full screen.
+        sys.stdout.write(f"\033[1;{rows}r")
+        # Move cursor to bottom and emit a newline so the shell prompt
+        # appears below our last line of output.
+        sys.stdout.write(f"\033[{rows};1H\n")
+        sys.stdout.flush()
+    _PIN_ACTIVE = False
 
 
 def _render_footer(turn: int, report_language: str) -> None:
+    """v0.5.13: redraw the pinned footer at the bottom terminal row.
+
+    No longer prints inline; the footer lives on the reserved row set up
+    by _init_pin(). Falls back to inline rendering when stdout is not a
+    TTY (CI, piped output) so logs still show the turn marker.
+    """
     cmds = "/save | /history | /commit | /quit | /help"
-    if report_language == "tr":
-        line = f"― [tur {turn} · {cmds}]"
-    else:
-        line = f"― [turn {turn} · {cmds}]"
-    print()
-    print(_c(_COL_DIM, line))
-    print()
+    line = (f"― [tur {turn} · {cmds}]" if report_language == "tr"
+            else f"― [turn {turn} · {cmds}]")
+    if not _TTY or not _PIN_ACTIVE:
+        # Non-TTY: keep the old inline behaviour for log readability.
+        print()
+        print(_c(_COL_DIM, line))
+        print()
+        return
+    cols, rows = _term_size()
+    visible = line[: max(1, cols - 1)]
+    with _STDOUT_LOCK:
+        sys.stdout.write("\033[s")                 # save cursor
+        sys.stdout.write(f"\033[{rows};1H")        # jump to footer row
+        sys.stdout.write("\033[2K")                # clear it
+        sys.stdout.write(_c(_COL_DIM, visible))    # write footer
+        sys.stdout.write("\033[u")                 # restore cursor
+        sys.stdout.flush()
 
 
 def _input_prompt() -> str:
-    """Render the user input prompt in green and read a line."""
+    """Render the user input prompt in orange and read a line.
+
+    v0.5.13: after input() returns, redraw the just-typed line right-
+    aligned to visually distinguish "you said" from "bot replied". Bot
+    replies stay left-aligned; user echoes flush to the right edge.
+    """
     arrow = _c(_COL_USER, _c(_COL_BOLD, "❯ "))
-    return input(arrow)
+    text = input(arrow)
+    if text.strip() and _TTY:
+        _rerender_user_right(text)
+    return text
+
+
+def _rerender_user_right(text: str) -> None:
+    """After input() returns, clear the echo line and rewrite the typed
+    text flush to the right edge of the terminal in orange.
+
+    Best-effort: handles single-line input cleanly. If the user pasted
+    multi-line content or the input wrapped past the terminal width, the
+    visible echo may leave artifacts on the wrapped lines — acceptable
+    for the common case of short turns.
+    """
+    cols, _rows = _term_size()
+    # Truncate with ellipsis if too long; right-pad with spaces otherwise.
+    rendered_plain = text
+    if len(rendered_plain) >= cols - 1:
+        rendered_plain = rendered_plain[: cols - 2] + "…"
+    pad = " " * max(0, cols - 1 - len(rendered_plain))
+    with _STDOUT_LOCK:
+        # input() left cursor at start of next line after Enter; move up
+        # one row and clear the echoed prompt line.
+        sys.stdout.write("\033[1A\r\033[2K")
+        sys.stdout.write(_c(_COL_USER, pad + rendered_plain))
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+# v0.5.13: animated "..." spinner shown on its own line while the bare
+# Claude subprocess is producing a reply. Background daemon thread cycles
+# states every ~350ms; the line is cleared atomically when stop() runs.
+_STDOUT_LOCK = threading.Lock()
+
+
+class _ThinkingSpinner:
+    def __init__(self, persona_name: str | None, report_language: str):
+        suffix = "düşünüyor" if report_language == "tr" else "is thinking"
+        speaker = persona_name or ("Bot" if report_language == "tr" else "Bot")
+        self.label = f"{speaker} {suffix}"
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not _TTY:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        # Three frames give a clear "loop" feel: ".  ", ".. ", "..."
+        frames = [".  ", ".. ", "..."]
+        i = 0
+        while not self._stop.is_set():
+            with _STDOUT_LOCK:
+                sys.stdout.write(
+                    "\r\033[2K" + _c(_COL_SPIN, f"{self.label}{frames[i % 3]}")
+                )
+                sys.stdout.flush()
+            i += 1
+            self._stop.wait(0.35)
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        with _STDOUT_LOCK:
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
+
+
+def _send_with_spinner(ctx: "_SubprocessCtx", msg: str,
+                       persona_name: str | None, report_language: str) -> str:
+    """Wrap a ctx.send() call with the thinking spinner so the user sees
+    progress feedback while the bare Claude subprocess is producing the
+    reply. Spinner stops in finally so an exception still cleans up."""
+    spinner = _ThinkingSpinner(persona_name, report_language)
+    spinner.start()
+    try:
+        return ctx.send(msg, stream_to=None)
+    finally:
+        spinner.stop()
 
 
 def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
