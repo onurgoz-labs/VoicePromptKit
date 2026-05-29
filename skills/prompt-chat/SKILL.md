@@ -14,19 +14,31 @@ You give a prompt file `$1` and a conversation. The skill loads the prompt as th
 - `$1` — relative or absolute path to the prompt file under chat.
 - `agents/chat-simulator.md` — the subagent that produces each assistant turn (you read its definition once; dispatching it for every turn is the chat loop).
 
-## Phase 0 — Bootstrap
+## Phase 0+1 — Bootstrap & dispatch (v0.5.18: single bash invocation)
 
-Read `$1`, parse its frontmatter, write a run directory under `.promptcheck/<basename>/chat-NNN/`.
+**IMPORTANT: execute the bash block below as ONE Bash tool call. Do not split it into multiple invocations.** Pre-v0.5.18 split this into five separate blocks (paths/atomic alloc → frontmatter parse → state files → pre-flight → dispatch), which meant the user had to approve five permission prompts per `/prompt-chat` invocation. The consolidated form below is functionally identical but only triggers one prompt.
+
+The flow remains the same:
+
+1. **Phase 0** — read `$1`, parse frontmatter, allocate `.promptcheck/<basename>/chat-NNN/`, write `frontmatter.json` / `body.txt` / empty `chat.jsonl` / empty `saved_anchors.json` / initial `session.json`.
+2. **Phase 1** — detect platform + window-spawn capability + Python interpreter, resolve the runner script (dev-repo `bin/` first, plugin cache fallback), spawn the orchestrator in a fresh Terminal / tmux / Windows Terminal session, then exit this skill. The chat session always opens in a new window (v0.5.11 simplification — no in-session / setup-only alternatives).
+
+v0.5.7 — spawn the Python orchestrator DIRECTLY in the new Terminal/tmux window. Do NOT route through `claude '/prompt-chat-session ...'` because Claude Code's skill runtime wraps Python's REPL in a Bash tool call whose subshell has no interactive TTY — Python `input()` immediately hits EOF and the chat exits with 0 turns. Going directly to the Python script gives the runner the real terminal it needs.
 
 ```bash
+# v0.5.18 consolidated bootstrap + dispatch. Variables defined early stay in
+# scope through the rest of the block; abort early via `exit 1` on any fatal
+# precondition (missing Python, no window-spawn helper, missing runner).
+
+# ---- 0.1: paths + atomic chat-NNN allocation -------------------------------
 ABS_PROMPT=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 BASENAME=$(basename "$1" | sed 's/\.[^.]*$//')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
 PROMPT_DIR="$REPO_ROOT/.promptcheck/$BASENAME"
 mkdir -p "$PROMPT_DIR"
 
-# Atomic chat-NNN allocation. mkdir without -p fails if the directory exists,
-# so a concurrent run claiming the same number loses cleanly and we retry.
+# mkdir without -p fails if the dir exists, so a concurrent run claiming the
+# same number loses cleanly and we retry up to 100 times.
 ATTEMPT=1
 while [ "$ATTEMPT" -le 100 ]; do
   N=$(ls -1 "$PROMPT_DIR" 2>/dev/null | grep -c '^chat-')
@@ -41,18 +53,11 @@ if [ "$ATTEMPT" -gt 100 ]; then
   exit 1
 fi
 
-echo "RUN_DIR=$RUN_DIR"
-echo "BASENAME=$BASENAME"
-```
-
-Then parse frontmatter + body. Reuse the exact Python heredoc pattern from `skills/prompt-check/SKILL.md` Phase 2 (don't re-derive it — same parsing, same atomic write):
-
-```bash
+# ---- 0.2: frontmatter + body parse (identical to /prompt-check Phase 2) ---
 python3 - "$ABS_PROMPT" "$RUN_DIR" "$REPO_ROOT" <<'PY'
 import sys, re, json, os, hashlib, subprocess
 prompt_path, run_dir, repo_root = sys.argv[1], sys.argv[2], sys.argv[3]
 text = open(prompt_path, encoding='utf-8').read()
-
 prompt_sha256 = hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 m = re.match(r'^---\r?\n(.*?)\r?\n---\r?\n?(.*)$', text, re.DOTALL)
@@ -76,9 +81,8 @@ except Exception:
             k, v = line.split(':', 1)
             fm[k.strip()] = v.strip()
 
-# v0.5.1: count existing anchors via the sidecar reader so the session metadata
-# reflects sidecar + frontmatter combined (sidecar wins) — same source of truth
-# the rest of the pipeline uses.
+# v0.5.1: count sidecar+frontmatter anchors so session metadata reflects what
+# the rest of the pipeline uses as the single source of truth.
 existing_anchors_count = 0
 anchors_source = 'none'
 try:
@@ -93,8 +97,6 @@ try:
 except Exception:
     pass
 
-# Resolve defaults (target_model, report_language) the same way /prompt-check does.
-# chat-simulator IS the model under test — it always uses target_model (not worker).
 def _model_alias(full_or_alias, default):
     if not full_or_alias:
         return default
@@ -106,16 +108,11 @@ def _model_alias(full_or_alias, default):
     if 'opus' in s: return 'opus'
     return default
 
+# v0.5.4: chat_model defaults to Haiku — persona exploration during /prompt-chat
+# is rapid-iteration; cost & latency beat frontier-model quality per turn.
+# Override in frontmatter for tricky persona testing where fidelity matters.
 resolved = {
     'target_model':     fm.get('target_model') or 'claude-opus-4-7',
-    # v0.5.4: chat_model is separate from target_model. target_model represents
-    # the production model the prompt will run on (used by drift Step 2 for
-    # faithful regression simulation). chat_model is for INTERACTIVE chat
-    # (this skill's persona dispatches) — default Haiku, because persona
-    # exploration during /prompt-chat is rapid-iteration; we don't need
-    # frontier-model quality, we need fast + cheap feedback per turn.
-    # Tunable: override to Sonnet/Opus in frontmatter for tricky persona
-    # testing where chat-time fidelity matters.
     'chat_model':       fm.get('chat_model') or 'claude-haiku-4-5-20251001',
     'report_language':  (fm.get('report_language') or 'tr').lower(),
     'body_char_count':  len(body),
@@ -134,20 +131,15 @@ with open(os.path.join(run_dir, 'frontmatter.json'), 'w', encoding='utf-8') as f
 with open(os.path.join(run_dir, 'body.txt'), 'w', encoding='utf-8') as f:
     f.write(body)
 PY
-```
 
-Bootstrap empty state files (atomic, idempotent):
-
-```bash
-# chat.jsonl — append-only conversation log. Each line: {role, content, ts}.
+# ---- 0.3: empty state files ----------------------------------------------
 : > "$RUN_DIR/chat.jsonl"
-
-# saved_anchors.json — staging area for anchors captured via /save.
-# Empty array on bootstrap. Phase 7 (/commit) drains this into the prompt
-# sidecar file at <prompt>.anchors.yaml; Phase 8 (/quit) offers to commit if non-empty.
 printf '[]' > "$RUN_DIR/saved_anchors.json"
 
-# session.json — durable record of the chat session.
+# v0.5.18: bake isolation_mode="new_window" into session.json at creation
+# time. The pre-v0.5.18 skill wrote None here and then patched the field
+# again after dispatch — separate bash block, extra permission prompt.
+# Since dispatch is now unconditional, the value is known up front.
 python3 - "$RUN_DIR" "$ABS_PROMPT" <<'PY'
 import sys, json, os, datetime
 run_dir, prompt_path = sys.argv[1], sys.argv[2]
@@ -159,29 +151,22 @@ session = {
     "prompt_path": prompt_path,
     "prompt_sha256_at_chat": fm['prompt_sha256'],
     "target_model": fm['target_model'],
-    "chat_model": fm.get('chat_model'),                 # v0.5.4
+    "chat_model": fm.get('chat_model'),
     "report_language": fm['report_language'],
     "turns": 0,
     "saved_anchors": 0,
-    "isolation_mode": None,                             # filled by Phase 1
-    "chat_session_uuid": None,                          # v0.5.6: filled by bin/prompt-chat-runner.py on first user turn; cleared by /reset
+    "isolation_mode": "new_window",       # always: dispatch is unconditional
+    "chat_session_uuid": None,            # v0.5.6: filled by runner on first turn
 }
 with open(os.path.join(run_dir, 'session.json'), 'w', encoding='utf-8') as f:
     json.dump(session, f, indent=2, ensure_ascii=False)
 PY
-```
 
-## Phase 1 — Run mode selection (isolation)
-
-**v0.5.11 simplification:** the chat session **always opens in a new Terminal/tmux window**. No isolation-mode prompt — the previous "in-session" / "setup-only" alternatives caused confusion (in-session pollutes the main Claude Code context with persona turns; setup-only requires the user to type a command). User feedback was unambiguous: "chat ekranı her zaman yeni pencerede açılsın."
-
-### Pre-flight check (silent, fail-fast)
-
-```bash
-# v0.5.11+ — detect platform + window-spawn capability. Supported:
-#   macOS:   osascript (Terminal.app — bundled with macOS)
-#   Linux:   tmux OR gnome-terminal
-#   Windows: cmd's `start` (built-in) OR Windows Terminal (`wt.exe`) when present
+# ---- 1.1: pre-flight — platform / python / window-spawn capability --------
+# Supported window-spawn helpers per platform:
+#   macOS:   osascript (Terminal.app, bundled with macOS)
+#   Linux:   tmux | gnome-terminal | xterm | konsole
+#   Windows: cmd.exe `start` (built-in) or Windows Terminal (wt.exe)
 PLATFORM=$(uname 2>/dev/null || echo Windows)
 CLAUDE_CLI=$(command -v claude 2>/dev/null || true)
 NEW_WINDOW_OK=false
@@ -189,28 +174,20 @@ NEW_WINDOW_OK=false
 if [ -n "$CLAUDE_CLI" ]; then
   case "$PLATFORM" in
     Darwin)
-      command -v osascript >/dev/null && NEW_WINDOW_OK=true
-      ;;
+      command -v osascript >/dev/null && NEW_WINDOW_OK=true ;;
     Linux)
       if command -v tmux >/dev/null || command -v gnome-terminal >/dev/null \
          || command -v xterm >/dev/null || command -v konsole >/dev/null; then
         NEW_WINDOW_OK=true
-      fi
-      ;;
+      fi ;;
     MINGW*|MSYS*|CYGWIN*|Windows*)
-      # Windows with Git-Bash / MSYS2 / WSL-on-Win etc. The `start` builtin
-      # works through cmd.exe; `wt.exe` (Windows Terminal) is also detected.
       if command -v cmd.exe >/dev/null || command -v wt.exe >/dev/null \
          || command -v start >/dev/null; then
         NEW_WINDOW_OK=true
-      fi
-      ;;
+      fi ;;
   esac
 fi
 
-# v0.5.11+ — also detect the Python interpreter name. Unix uses `python3`,
-# Windows ships `python` (and sometimes `py` launcher). Pick the first one
-# that actually resolves.
 PYTHON_CLI=""
 for p in python3 python py; do
   if command -v "$p" >/dev/null 2>&1; then PYTHON_CLI="$p"; break; fi
@@ -227,20 +204,13 @@ if [ "$NEW_WINDOW_OK" != "true" ]; then
   echo "  - macOS:   (Terminal.app + osascript — bundled, should be auto)"
   echo "  - Linux:   tmux, gnome-terminal, xterm, or konsole"
   echo "  - Windows: cmd.exe (built-in) or Windows Terminal (wt.exe)"
-  echo "You can still launch manually:"
-  echo "  $PYTHON_CLI $RUNNER $RUN_DIR"
+  echo "You can still launch manually: $PYTHON_CLI <runner-path> $RUN_DIR"
   exit 1
 fi
-```
 
-### Dispatch — always new window
-
-v0.5.7 — spawn the Python orchestrator DIRECTLY in the new Terminal/tmux window. Do NOT route through `claude '/prompt-chat-session ...'` because Claude Code's skill runtime wraps Python's REPL in a Bash tool call whose subshell has no interactive TTY — Python `input()` immediately hits EOF and the chat exits with 0 turns. Going directly to the Python script gives the runner the real terminal it needs.
-
-```bash
-# Resolve the orchestrator script. The plugin installs under
-# ~/.claude/plugins/cache/onurgoz/PromptChecker/<version>/bin/, but in the
-# dev repo it's just bin/prompt-chat-runner.py at the repo root.
+# ---- 1.2: resolve the orchestrator script --------------------------------
+# Dev repo: bin/prompt-chat-runner.py. Installed plugin:
+# ~/.claude/plugins/cache/onurgoz/PromptChecker/<version>/bin/.
 RUNNER=""
 for guess in \
   "$REPO_ROOT/bin/prompt-chat-runner.py" \
@@ -254,6 +224,7 @@ if [ -z "$RUNNER" ]; then
   exit 1
 fi
 
+# ---- 1.3: dispatch to a new terminal -------------------------------------
 case "$PLATFORM" in
   Darwin)
     osascript -e "tell application \"Terminal\" to do script \"$PYTHON_CLI '$RUNNER' '$RUN_DIR'\"" >/dev/null
@@ -270,26 +241,29 @@ case "$PLATFORM" in
     fi
     ;;
   MINGW*|MSYS*|CYGWIN*|Windows*)
-    # Prefer Windows Terminal when present (modern UX), fall back to cmd's start.
+    # Prefer Windows Terminal (modern UX), fall back to cmd's `start`.
     if command -v wt.exe >/dev/null; then
       wt.exe new-tab --title "chat-$BASENAME" "$PYTHON_CLI" "$RUNNER" "$RUN_DIR" &
     else
-      # `start` opens a new console window. /B would suppress the window; we
-      # explicitly want a new one, so omit /B. The empty "" is the window title
-      # argument that `start` consumes when the first argument is quoted.
+      # `start` opens a new console. /B would suppress the window; we want
+      # one so we omit /B. The "" is the window-title arg `start` consumes
+      # when the first positional is quoted.
       cmd.exe /c start "" "$PYTHON_CLI" "$RUNNER" "$RUN_DIR" &
     fi
     ;;
 esac
+
+# Echo enough for the main session to greet the user with the relative path.
+RUN_DIR_REL=$(python3 -c "import os, sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))" "$RUN_DIR" "$REPO_ROOT")
+echo "OK chat session launched in new window"
+echo "RUN_DIR_REL=$RUN_DIR_REL"
 ```
 
-The `/prompt-chat-session` skill remains available as a manual resume path (`claude '/prompt-chat-session <run-dir>'`) but is no longer the primary entry — the new Terminal window runs Python directly, owning the TTY.
-
-Record `session.json.isolation_mode = "new_window"`. Print to the main session:
+After the bash block returns, print to the main session:
 
 ```
 Chat oturumu yeni pencerede başlatıldı.
-Run dir: <relative path to $RUN_DIR>
+Run dir: <value of RUN_DIR_REL from the bash output>
 Yeni pencere kapandıktan sonra `cat <run-dir>/chat.jsonl` ile konuşmayı inceleyebilirsin.
 ```
 
