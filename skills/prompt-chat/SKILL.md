@@ -238,7 +238,23 @@ fi
 # ---- 1.3: dispatch to a new terminal -------------------------------------
 case "$PLATFORM" in
   Darwin)
-    osascript -e "tell application \"Terminal\" to do script \"$PYTHON_CLI '$RUNNER' '$RUN_DIR'\"" >/dev/null
+    # v0.5.23: when Terminal.app is not running, plain `do script ...`
+    # opens TWO windows — first the default empty window from
+    # Terminal's launch, then a second one with the script. Detect
+    # that case and target the freshly-opened default window with
+    # `in front window` so only one window appears.
+    osascript >/dev/null <<OSA
+tell application "Terminal"
+    set wasRunning to running
+    activate
+    if not wasRunning then
+        delay 0.5
+        do script "$PYTHON_CLI '$RUNNER' '$RUN_DIR'" in front window
+    else
+        do script "$PYTHON_CLI '$RUNNER' '$RUN_DIR'"
+    end if
+end tell
+OSA
     ;;
   Linux)
     if command -v tmux >/dev/null; then
