@@ -1379,30 +1379,22 @@ class _ThinkingSpinner:
 
     def _run(self) -> None:
         # Three frames give a clear "loop" feel: ".  ", ".. ", "..."
+        # v0.5.18: reverted the v0.5.17 footer-painting experiment — the
+        # save/restore-cursor sequence (\033[s ... \033[u) interacted badly
+        # with the active DECSTBM scroll region in Terminal.app, leaving
+        # cursor state inconsistent and bot replies invisible. Back to the
+        # v0.5.16 inline paint; _drain_stale_input still cleans up cooked-
+        # mode echo and kernel-buffered chars after the spinner stops.
         frames = [".  ", ".. ", "..."]
         i = 0
         while not self._stop.is_set():
             with _STDOUT_LOCK:
-                self._paint_frame(f"{self.label}{frames[i % 3]}")
+                sys.stdout.write(
+                    "\r\033[2K" + _c(_COL_SPIN, f"{self.label}{frames[i % 3]}")
+                )
+                sys.stdout.flush()
             i += 1
             self._stop.wait(0.35)
-
-    def _paint_frame(self, text: str) -> None:
-        """v0.5.17: render the spinner in the pinned footer row so it no
-        longer clobbers the input area (where cooked-mode echo from any
-        chars typed during bot thinking lands). Falls back to inline
-        ``\\r\\033[2K`` when the footer isn't pinned (terminal too small
-        or non-TTY)."""
-        if _PIN_ACTIVE:
-            cols, rows = _term_size()
-            visible = text[: max(1, cols - 1)]
-            sys.stdout.write("\033[s")                       # save cursor
-            sys.stdout.write(f"\033[{rows};1H\033[2K")        # jump + clear footer
-            sys.stdout.write(_c(_COL_SPIN, visible))         # write frame
-            sys.stdout.write("\033[u")                       # restore cursor
-        else:
-            sys.stdout.write("\r\033[2K" + _c(_COL_SPIN, text))
-        sys.stdout.flush()
 
     def stop(self) -> None:
         if self._thread is None:
@@ -1410,13 +1402,7 @@ class _ThinkingSpinner:
         self._stop.set()
         self._thread.join(timeout=1.0)
         with _STDOUT_LOCK:
-            if _PIN_ACTIVE:
-                _cols, rows = _term_size()
-                sys.stdout.write("\033[s")
-                sys.stdout.write(f"\033[{rows};1H\033[2K")
-                sys.stdout.write("\033[u")
-            else:
-                sys.stdout.write("\r\033[2K")
+            sys.stdout.write("\r\033[2K")
             sys.stdout.flush()
 
 
@@ -1477,7 +1463,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
     print()
     print(bar)
     if report_language == "tr":
-        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.17)"))
+        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.18)"))
         print(bar)
         print(f"  Prompt:    {_c(_COL_BOLD, basename)} ({line_count} satır, model: {chat_model})")
         print(f"  Arayan:    {_c(_COL_BOLD, caller_name)}")
@@ -1488,7 +1474,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
         print(_c(_COL_DIM, "  Komutlar: /save  /history  /reset  /silence <N>  /silence-auto  /commit  /help  /quit"))
         print(bar)
     else:
-        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.17)"))
+        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.18)"))
         print(bar)
         print(f"  Prompt:    {_c(_COL_BOLD, basename)} ({line_count} lines, model: {chat_model})")
         print(f"  Caller:    {_c(_COL_BOLD, caller_name)}")
