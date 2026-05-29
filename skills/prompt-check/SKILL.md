@@ -221,6 +221,44 @@ resolved['judge_model'] = (
     or 'claude-haiku-4-5-20251001'
 )
 
+# v0.5.3: worker_model is the infrastructure model for non-target subagent
+# calls — static lens pair comparison (conflict/dominance/gap/schema),
+# tr-phonetic pattern matching, drift scenario generation (Step 1). These
+# are structured tasks where frontier-model quality is overkill. Defaults
+# to Haiku — combined with judge_model swap (v0.5.2), this drops a typical
+# audit from ~500k Opus tokens to ~200k Haiku + ~50k Opus.
+#
+# target_model semantics narrows in v0.5.3: it ONLY drives drift Step 2
+# simulation and chat-simulator persona. Everything else uses worker_model.
+resolved['worker_model'] = (
+    fm.get('worker_model')
+    or env('PROMPTCHECKER_WORKER_MODEL')
+    or project.get('worker_model')
+    or 'claude-haiku-4-5-20251001'
+)
+
+# v0.5.3: model alias normalisation. The Claude Code Agent tool's `model`
+# parameter accepts only the short aliases sonnet / opus / haiku — not the
+# full versioned IDs that authors typically write in frontmatter. Map the
+# resolved values so dispatch can pass either form through.
+def _model_alias(full_or_alias):
+    if not full_or_alias:
+        return None
+    s = str(full_or_alias).strip().lower()
+    if s in ('sonnet', 'opus', 'haiku'):
+        return s
+    if 'haiku' in s:
+        return 'haiku'
+    if 'sonnet' in s:
+        return 'sonnet'
+    if 'opus' in s:
+        return 'opus'
+    return None  # unknown model — caller falls through to default
+
+resolved['target_model_alias'] = _model_alias(resolved['target_model']) or 'opus'
+resolved['worker_model_alias'] = _model_alias(resolved['worker_model']) or 'haiku'
+resolved['judge_model_alias']  = _model_alias(resolved['judge_model'])  or 'haiku'
+
 out = fm.get('output')
 if out is None:
     env_out = env('PROMPTCHECKER_OUTPUT')
@@ -329,8 +367,8 @@ else:
     _rlang_unknown = rlang if rlang is not None else None
 
 # Collect warnings for unknown frontmatter / config keys (surfaced in Phase 8).
-KNOWN_FM = {'type','target_model','judge_model','output','expand_count','anchors','tr_phonetic','max_char_limit','report_language'}
-KNOWN_CFG = {'$schema','default_type','target_model','judge_model','output','expand_count','tr_phonetic','max_char_limit','report_language'}
+KNOWN_FM = {'type','target_model','worker_model','judge_model','output','expand_count','anchors','tr_phonetic','max_char_limit','report_language'}
+KNOWN_CFG = {'$schema','default_type','target_model','worker_model','judge_model','output','expand_count','tr_phonetic','max_char_limit','report_language'}
 warnings = []
 if _rlang_unknown is not None:
     warnings.append(
@@ -816,6 +854,7 @@ Agent({
     }
   }),
   description: "conflict lens for " + BASENAME,
+  model: "<frontmatter.worker_model_alias, default haiku>",
   isolation: "worktree"
 })
 
@@ -832,6 +871,7 @@ Agent({
     output_paths: { dominances: "<absolute path to $RUN_DIR/dominances.json>" }
   }),
   description: "dominance lens for " + BASENAME,
+  model: "<frontmatter.worker_model_alias, default haiku>",
   isolation: "worktree"
 })
 
@@ -848,6 +888,7 @@ Agent({
     output_paths: { gaps: "<absolute path to $RUN_DIR/gaps.json>" }
   }),
   description: "gap lens for " + BASENAME,
+  model: "<frontmatter.worker_model_alias, default haiku>",
   isolation: "worktree"
 })
 
@@ -864,6 +905,7 @@ Agent({
     output_paths: { schema: "<absolute path to $RUN_DIR/schema.json>" }
   }),
   description: "schema lens for " + BASENAME,
+  model: "<frontmatter.worker_model_alias, default haiku>",
   isolation: "worktree"
 })
 
@@ -874,6 +916,7 @@ Agent({
     ...
   }),
   description: "tr phonetic lens for " + BASENAME,
+  model: "<frontmatter.worker_model_alias, default haiku>",
   isolation: "worktree"
 })
 ```
@@ -989,6 +1032,7 @@ Agent({
     output_path: "<absolute path to $RUN_DIR/drift.json>"
   }),
   description: "drift analysis for " + BASENAME,
+  model: "<frontmatter.target_model_alias, default opus>",  // ← target_model, NOT worker — drift Step 2 is the model under test
   isolation: "worktree"
 })
 ```

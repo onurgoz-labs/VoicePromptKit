@@ -96,8 +96,23 @@ except Exception as _e:
     anchors_source = 'frontmatter' if anchors else 'none'
     anchor_warnings = [f"anchor reader exception: {_e}"]
 
+def _model_alias(full_or_alias, default):
+    """v0.5.3: map full Claude model IDs (e.g. claude-haiku-4-5-20251001) to
+    the short aliases (sonnet/opus/haiku) accepted by the Agent tool's model
+    parameter. Pass-through for unknown values via the supplied default."""
+    if not full_or_alias:
+        return default
+    s = str(full_or_alias).strip().lower()
+    if s in ('sonnet', 'opus', 'haiku'):
+        return s
+    if 'haiku' in s: return 'haiku'
+    if 'sonnet' in s: return 'sonnet'
+    if 'opus' in s: return 'opus'
+    return default
+
 resolved = {
     'target_model':     fm.get('target_model') or 'claude-opus-4-7',
+    'worker_model':     fm.get('worker_model') or 'claude-haiku-4-5-20251001',
     'judge_model':      fm.get('judge_model') or 'claude-haiku-4-5-20251001',
     'report_language':  (fm.get('report_language') or 'tr').lower(),
     'expand_count':     int(fm.get('expand_count') or 3),
@@ -109,6 +124,10 @@ resolved = {
     'anchors_source':   anchors_source,
     'anchor_warnings':  anchor_warnings,
 }
+resolved['target_model_alias'] = _model_alias(resolved['target_model'], 'opus')
+resolved['worker_model_alias'] = _model_alias(resolved['worker_model'], 'haiku')
+resolved['judge_model_alias']  = _model_alias(resolved['judge_model'],  'haiku')
+
 if resolved['report_language'] not in ('tr', 'en'):
     resolved['report_language'] = 'tr'
 resolved['compact_mode'] = (
@@ -188,6 +207,7 @@ Agent({
     output_path: "<absolute path to $RUN_DIR/drift.json>"
   }),
   description: "regression test for " + BASENAME,
+  model: "<frontmatter.target_model_alias, default opus>",  // drift Step 2 simulation runs as the model under test
   isolation: "worktree"
 })
 ```

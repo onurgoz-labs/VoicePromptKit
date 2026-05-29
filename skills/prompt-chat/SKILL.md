@@ -94,7 +94,18 @@ except Exception:
     pass
 
 # Resolve defaults (target_model, report_language) the same way /prompt-check does.
-# We keep this minimal — the chat skill only needs target_model + report_language.
+# chat-simulator IS the model under test — it always uses target_model (not worker).
+def _model_alias(full_or_alias, default):
+    if not full_or_alias:
+        return default
+    s = str(full_or_alias).strip().lower()
+    if s in ('sonnet', 'opus', 'haiku'):
+        return s
+    if 'haiku' in s: return 'haiku'
+    if 'sonnet' in s: return 'sonnet'
+    if 'opus' in s: return 'opus'
+    return default
+
 resolved = {
     'target_model':     fm.get('target_model') or 'claude-opus-4-7',
     'report_language':  (fm.get('report_language') or 'tr').lower(),
@@ -104,6 +115,7 @@ resolved = {
     'existing_anchors_count': existing_anchors_count,
     'anchors_source':   anchors_source,
 }
+resolved['target_model_alias'] = _model_alias(resolved['target_model'], 'opus')
 if resolved['report_language'] not in ('tr', 'en'):
     resolved['report_language'] = 'tr'
 
@@ -738,6 +750,7 @@ Agent({
     output_path: "<absolute path to $RUN_DIR/next_turn.txt>"
   }),
   description: "chat turn " + N + " for " + BASENAME,
+  model: "<frontmatter.target_model_alias, default opus>",  // chat-simulator IS the model under test — persona faithfulness matters
   isolation: "worktree"
 })
 ```

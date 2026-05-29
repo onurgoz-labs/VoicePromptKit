@@ -243,19 +243,26 @@ Turns must alternate `user_input` (or `silence_input`) → `assistant_expect` �
 
 The bridge is `<prompt>.anchors.yaml`. Stay on text, iterate fast, only call Vapi when you're confident.
 
-### Cost controls (v0.5.2)
+### Cost controls (v0.5.2 + v0.5.3)
 
-Three additive cost reductions kick in automatically — most users never need to think about them, but they're documented here for tuning:
+Four additive cost reductions kick in automatically — most users never need to think about them, but they're documented here for tuning:
 
 - **Prompt caching.** The simulated system prompt (the prompt body) is identical across every scenario in a batch and across every turn within a flow scenario. When the underlying provider supports it (Anthropic API: `cache_control: {type: "ephemeral"}`; OpenAI: automatic), drift-runner and chat-simulator attach the directive to the system block. First call populates the cache; later calls in the same batch / flow hit it. Saves ~50-60% on simulation tokens for long-body prompts.
 - **Judge model swap.** Rubric evaluation in drift-runner's Step 3 ("did the output behave like X?") is a yes/no judgement task that doesn't need a frontier model. v0.5.2 adds a `judge_model` frontmatter field (and matching env var / project-config keys) defaulting to `claude-haiku-4-5-20251001`. `target_model` still drives simulation — that's where persona faithfulness matters. Override per prompt: `judge_model: claude-opus-4-7` in frontmatter if you want Opus rubric eval for tricky cases.
 - **Batched flow rubric eval.** A flow anchor with K assertion steps previously cost K judge LLM calls (one per `assistant_expect` / `end_call_expect`). v0.5.2 collapses these into ONE batched judge call: the judge sees the full transcript + a numbered list of (step, rubric) pairs and returns all per-step verdicts in one JSON document. Simulation stays sequential (multi-turn state matters); judging batches safely because rubric eval is independent per step.
+- **`worker_model` for infrastructure subagents (v0.5.3).** Static-lens-runner (conflict, dominance, gap, schema pair comparison) and tr-phonetic-runner (line-level pattern matching) are structured tasks that don't need a frontier model. v0.5.3 adds `worker_model` frontmatter field (default `claude-haiku-4-5-20251001`) which the skill passes to subagent dispatches via the Agent tool's `model` parameter. `target_model` semantics narrows to "model under test" — drift Step 2 simulation and chat-simulator persona dispatches still use it (Opus by default, since those simulate the production model). The three knobs:
+  - `target_model` (default `claude-opus-4-7`) — production model your prompt will run on. drift Step 2 + chat-simulator.
+  - `worker_model` (default `claude-haiku-4-5-20251001`) — PromptChecker's own LLM workers. static-lens + tr-phonetic + drift Step 1.
+  - `judge_model` (default `claude-haiku-4-5-20251001`) — drift Step 3 rubric eval. Tunable separately for tricky judging.
+
+  Single audit on an 840-line prompt with 116 rules:
+  - v0.5.2: ~500k tokens (static-lens ×4 each ~74k Opus, tr-phonetic ~53k Opus, drift ~77k mixed).
+  - v0.5.3: ~200k tokens (static-lens ×4 ~10k Haiku each, tr-phonetic ~7k Haiku, drift ~77k mixed — drift unchanged since its Step 2 simulation IS the model under test).
 
 Net effect on the canonical sample-vapi flow anchor (4 turns):
 - v0.5.1: 4 Opus simulation + 4 Opus judge = 8 Opus calls per anchor.
 - v0.5.2: 4 Opus simulation (body cached after turn 1) + 1 Haiku judge = ~4 Opus + 1 Haiku.
-
-Roughly ~80% reduction on the judging side, ~50% on simulation side from caching. Bigger savings on bigger bodies / longer flows.
+- v0.5.3: same as v0.5.2 for flow anchors (drift Step 2 still target_model; Step 1 + 3 already Haiku). The savings come from non-drift lenses — see the audit example above.
 
 ## Output layout
 
