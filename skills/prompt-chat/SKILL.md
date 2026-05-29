@@ -229,20 +229,39 @@ Wording follows `frontmatter.report_language` from Phase 0. If `NEW_WINDOW_OK ==
 
 **Mode = "new window":**
 
+v0.5.7 — spawn the Python orchestrator DIRECTLY in the new Terminal/tmux window. Do NOT route through `claude '/prompt-chat-session ...'` because Claude Code's skill runtime wraps Python's REPL in a Bash tool call whose subshell has no interactive TTY — Python `input()` immediately hits EOF and the chat exits with 0 turns. Going directly to the Python script gives the runner the real terminal it needs.
+
 ```bash
-case "$PLATFORM" in
-  Darwin)
-    osascript -e "tell application \"Terminal\" to do script \"$CLAUDE_CLI '/prompt-chat-session $RUN_DIR'\"" >/dev/null
-    ;;
-  Linux)
-    if command -v tmux >/dev/null; then
-      tmux new-window -n "chat-$BASENAME" "$CLAUDE_CLI '/prompt-chat-session $RUN_DIR'"
-    else
-      gnome-terminal -- "$CLAUDE_CLI" "/prompt-chat-session $RUN_DIR"
-    fi
-    ;;
-esac
+# Resolve the orchestrator script. The plugin installs under
+# ~/.claude/plugins/cache/onurgoz/PromptChecker/<version>/bin/, but in the
+# dev repo it's just bin/prompt-chat-runner.py at the repo root.
+RUNNER=""
+for guess in \
+  "$REPO_ROOT/bin/prompt-chat-runner.py" \
+  "$HOME/.claude/plugins/cache/onurgoz/PromptChecker/"*/bin/prompt-chat-runner.py; do
+  if [ -f "$guess" ]; then RUNNER="$guess"; break; fi
+done
+
+if [ -z "$RUNNER" ]; then
+  echo "ERROR: bin/prompt-chat-runner.py not found — falling back to in-session mode."
+  MODE=in_session
+else
+  case "$PLATFORM" in
+    Darwin)
+      osascript -e "tell application \"Terminal\" to do script \"python3 '$RUNNER' '$RUN_DIR'\"" >/dev/null
+      ;;
+    Linux)
+      if command -v tmux >/dev/null; then
+        tmux new-window -n "chat-$BASENAME" "python3 '$RUNNER' '$RUN_DIR'"
+      else
+        gnome-terminal -- python3 "$RUNNER" "$RUN_DIR"
+      fi
+      ;;
+  esac
+fi
 ```
+
+The `/prompt-chat-session` skill remains available as a manual resume path (`claude '/prompt-chat-session <run-dir>'`) but is no longer the primary entry — the new Terminal window runs Python directly, owning the TTY.
 
 Record `session.json.isolation_mode = "new_window"`. Print to the main session:
 
