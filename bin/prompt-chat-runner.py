@@ -378,17 +378,14 @@ def main() -> int:
         _atomic_write_json(session_path, session)
     caller_name = session["caller_name"]
 
-    # v0.5.26: enter the alternate screen buffer BEFORE printing the
-    # welcome banner so the chat session lives in an isolated canvas.
-    # The user's previous shell state (Last login, the `python3 ...`
-    # invocation, prior scrollback) is preserved and reappears when
-    # _leave_alt_screen runs at the end. The banner row count is
-    # captured so DECSTBM's scroll region can be set to start
-    # IMMEDIATELY BELOW the banner — pinning it to the top.
-    _enter_alt_screen()
-    welcome_rows = _print_welcome(run_dir, abs_prompt, chat_model,
-                                  report_language, caller_name, session)
-    _init_pin(top_row=welcome_rows + 1)
+    # v0.5.27: alt-screen + DECSTBM removed (see _enter_alt_screen
+    # docstring). Welcome banner prints inline in the user's terminal;
+    # _print_welcome's return value (row count) is no longer used for
+    # scroll-region setup but kept for non-TTY logging.
+    _enter_alt_screen()  # no-op in v0.5.27
+    _print_welcome(run_dir, abs_prompt, chat_model, report_language,
+                   caller_name, session)
+    _init_pin()  # no-op in v0.5.27
 
     # v0.5.22: clean up any pre-v0.5.22 .body-wrapped.txt left in this
     # run dir before we materialise the fresh tempfile copy. Silent;
@@ -707,7 +704,12 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
             idle_arg = idle if idle > 0 and _IDLE_TIMEOUT_OK else None
 
         try:
-            user_input, timed_out = _input_prompt(idle_arg, report_language)
+            footer_line = _compute_footer_line(
+                session.get("turns", 0), report_language,
+                post_call=in_post_call,
+            )
+            user_input, timed_out = _input_prompt(idle_arg, report_language,
+                                                   footer_line)
         except EOFError:
             print()
             _exit_cleanly(run_dir, session_path, chat_jsonl_path, staged_path,
@@ -1381,131 +1383,72 @@ def _term_size() -> tuple[int, int]:
 
 
 def _enter_alt_screen() -> None:
-    """v0.5.26: switch to the terminal's alternate screen buffer so our
-    TUI (banner + conversation + sticky footer) lives in an isolated
-    canvas. The user's pre-chat terminal state — shell scrollback, the
-    `python3 ...` invocation, Last login — is preserved and reappears
-    on exit via _leave_alt_screen(). Idempotent."""
-    global _ALT_SCREEN_ACTIVE
-    if not _TTY or _ALT_SCREEN_ACTIVE:
-        return
-    with _STDOUT_LOCK:
-        sys.stdout.write("\033[?1049h")  # DECSET 1049 — enter alt screen
-        sys.stdout.write("\033[H")        # cursor home (1, 1)
-        sys.stdout.write("\033[2J")       # clear screen
-        sys.stdout.flush()
-    _ALT_SCREEN_ACTIVE = True
+    """v0.5.27: alt-screen experiment shelved.
+
+    v0.5.26 wrapped the chat in `\\033[?1049h` so the banner could sit
+    on row 1 of a clean canvas and DECSTBM could pin a footer to the
+    bottom row. In Terminal.app the combination produced unpredictable
+    rendering — banner halves got overwritten by the spinner's inline
+    `\\r\\033[2K` paint, the bot's opening reply collided with the
+    input arrow, and the user saw a visual mess.
+
+    Sticky footer is back to a "logical" approach in v0.5.27:
+    _input_prompt prints the footer line right above the arrow, and
+    _rerender_user_oneliner clears both lines on Enter. The result is
+    a footer that's visible while the user is typing — the only moment
+    it matters — and gone from the scrollback between turns. No alt
+    screen, no scroll region, no terminal-mode trickery.
+    """
+    return
 
 
 def _leave_alt_screen() -> None:
-    """v0.5.26: leave the alternate screen buffer; main screen state
-    flips back into view. Called by _exit_cleanly before the summary
-    card is printed (so the card lands in the main scrollback and the
-    user can still read it after the chat exits)."""
-    global _ALT_SCREEN_ACTIVE
-    if not _TTY or not _ALT_SCREEN_ACTIVE:
-        return
-    with _STDOUT_LOCK:
-        sys.stdout.write("\033[?1049l")  # DECRST 1049 — exit alt screen
-        sys.stdout.flush()
-    _ALT_SCREEN_ACTIVE = False
+    """v0.5.27: paired with _enter_alt_screen no-op — nothing to leave."""
+    return
 
 
 def _init_pin(top_row: int = 1) -> None:
-    """v0.5.26: reserve the last terminal row for the sticky footer and
-    set the scroll region to (top_row, rows - 1). top_row is normally
-    `welcome_banner_rows + 1` so the banner sits ABOVE the scroll
-    region and stays put while the conversation scrolls in the middle.
-
-    History recap (read before re-touching this code):
-      - v0.5.13: DECSTBM(1, rows-1) + manual cursor park to rows-1
-        → ~10-line blank gap under the banner.
-      - v0.5.19: removed the manual park → DECSTBM's cursor-home
-        side effect overwrote the banner.
-      - v0.5.22: re-introduced \\033[s / \\033[u save-restore around
-        DECSTBM → in Terminal.app, save/restore proved unreliable
-        and the bot's opening reply scrolled off-screen.
-      - v0.5.23: gave up and used inline footer per turn.
-      - v0.5.26 (this): wrapped in alt-screen + scroll region starts
-        AFTER the banner (top_row > 1). Banner is now outside the
-        scroll region and physically cannot be overwritten. Save/
-        restore is no longer needed for _init_pin itself — the
-        cursor naturally ends up at (top_row, 1) right after the
-        banner. _render_footer still uses save/restore (DECSC/DECRC
-        ESC 7 / ESC 8) to repaint the footer without losing the
-        in-progress input cursor.
-    """
-    global _PIN_ACTIVE, _PIN_TOP_ROW
-    if not _TTY or _PIN_ACTIVE:
-        return
-    _cols, rows = _term_size()
-    if rows < top_row + 2:
-        return  # too small to bother
-    with _STDOUT_LOCK:
-        sys.stdout.write(f"\033[{top_row};{rows - 1}r")
-        sys.stdout.flush()
-    _PIN_ACTIVE = True
-    _PIN_TOP_ROW = top_row
+    """v0.5.27: pinned-footer attempt deferred; see _enter_alt_screen
+    docstring for the rationale. Footer is now drawn by _input_prompt
+    and torn down by _rerender_user_oneliner."""
+    return
 
 
 def _release_pin() -> None:
-    """v0.5.26: reset DECSTBM to full screen (1..rows) so anything
-    printed after the pin is released — e.g. the final summary card
-    after _leave_alt_screen — uses the normal full-screen scroll
-    region. Idempotent."""
-    global _PIN_ACTIVE
-    if not _TTY or not _PIN_ACTIVE:
-        return
-    _cols, rows = _term_size()
-    with _STDOUT_LOCK:
-        sys.stdout.write(f"\033[1;{rows}r")
-        sys.stdout.flush()
-    _PIN_ACTIVE = False
+    """v0.5.27: paired no-op for _init_pin."""
+    return
+
+
+def _compute_footer_line(turn: int, report_language: str,
+                         post_call: bool = False) -> str:
+    """v0.5.27: helper that returns the footer text for the current
+    turn / post-call state without printing anything. _input_prompt
+    calls this and emits the line right above the arrow so the footer
+    visually attaches to the input area."""
+    cmds = "/save · /history · /commit · /quit · /help"
+    if post_call:
+        return (f"― [arama bitti · {cmds} · yeni mesaj → yeni arama]"
+                if report_language == "tr"
+                else f"― [call ended · {cmds} · new message → new call]")
+    return (f"― [tur {turn} · {cmds}]" if report_language == "tr"
+            else f"― [turn {turn} · {cmds}]")
 
 
 def _render_footer(turn: int, report_language: str,
                    post_call: bool = False) -> None:
-    """v0.5.13: redraw the pinned footer at the bottom terminal row.
-
-    No longer prints inline; the footer lives on the reserved row set up
-    by _init_pin(). Falls back to inline rendering when stdout is not a
-    TTY (CI, piped output) so logs still show the turn marker.
-
-    v0.5.19: when `post_call` is True (the persona has ended the call but
-    the REPL is still open) the footer switches to a post-call hint that
-    advertises slash commands plus the "new message → new call" shortcut.
-    """
-    cmds = "/save · /history · /commit · /quit · /help"
-    if post_call:
-        line = (f"― [arama bitti · {cmds} · yeni mesaj → yeni arama]"
-                if report_language == "tr"
-                else f"― [call ended · {cmds} · new message → new call]")
-    else:
-        line = (f"― [tur {turn} · {cmds}]" if report_language == "tr"
-                else f"― [turn {turn} · {cmds}]")
-    if not _TTY or not _PIN_ACTIVE:
-        # Non-TTY: keep the old inline behaviour for log readability.
-        print()
-        print(_c(_COL_DIM, line))
-        print()
-        return
-    cols, rows = _term_size()
-    visible = line[: max(1, cols - 1)]
-    with _STDOUT_LOCK:
-        # v0.5.26: use DECSC/DECRC (ESC 7 / ESC 8) instead of CSI s/u.
-        # Mac Terminal handles the VT100-native pair more reliably; the
-        # xterm-style \033[s / \033[u was unstable around DECSTBM in
-        # v0.5.22 and caused the bot's opening reply to scroll off.
-        sys.stdout.write("\0337")                  # DECSC: save cursor
-        sys.stdout.write(f"\033[{rows};1H")        # jump to footer row
-        sys.stdout.write("\033[2K")                # clear it
-        sys.stdout.write(_c(_COL_DIM, visible))    # write footer
-        sys.stdout.write("\0338")                  # DECRC: restore cursor
-        sys.stdout.flush()
+    """v0.5.27: deprecated — footer is drawn by _input_prompt now,
+    immediately above the user's arrow prompt, so it stays visually
+    attached to the input area and disappears from the scrollback once
+    the user submits a turn. This stub stays as a no-op for backwards
+    compatibility with the existing call sites (main(), _repl,
+    _exchange_turn, _start_fresh_call, _handle_silence) — none of
+    them need to be touched until the next cleanup pass."""
+    return
 
 
 def _input_prompt(idle_timeout: float | None = None,
-                  report_language: str = "tr") -> tuple[str | None, bool]:
+                  report_language: str = "tr",
+                  footer: str = "") -> tuple[str | None, bool]:
     """Render the user input prompt in orange and read a line.
 
     Returns (text, timed_out):
@@ -1518,19 +1461,30 @@ def _input_prompt(idle_timeout: float | None = None,
     one-liner format as the bot ('sen [hh:mm] « text') instead of
     pushing it to the right edge — matches the per-turn render style
     introduced in v0.5.19.
+    v0.5.27: optional `footer` string is printed on its own line right
+    above the arrow so it visually attaches to the input area. Both
+    the echo and footer lines are cleared on Enter / timeout so they
+    don't accumulate in the scrollback between turns.
     """
+    if footer and _TTY:
+        with _STDOUT_LOCK:
+            sys.stdout.write(_c(_COL_DIM, footer))
+            sys.stdout.write("\n")
+            sys.stdout.flush()
     arrow = _c(_COL_USER, _c(_COL_BOLD, "❯ "))
     text, timed_out = _read_with_idle_timeout(arrow, idle_timeout)
     if timed_out:
-        # Clear the empty echoed prompt line so the silence banner from
-        # the caller renders cleanly on a fresh row.
+        # Clear the empty echoed prompt line AND the footer above it so
+        # the silence banner that follows renders on a fresh row.
         if _TTY:
             with _STDOUT_LOCK:
                 sys.stdout.write("\r\033[2K")
+                if footer:
+                    sys.stdout.write("\033[1A\r\033[2K")
                 sys.stdout.flush()
         return None, True
     if text and text.strip() and _TTY:
-        _rerender_user_oneliner(text, report_language)
+        _rerender_user_oneliner(text, report_language, has_footer=bool(footer))
     return text, False
 
 
@@ -1696,7 +1650,8 @@ def _exchange_turn(ctx: "_SubprocessCtx", user_msg: str,
     return ended
 
 
-def _rerender_user_oneliner(text: str, report_language: str) -> None:
+def _rerender_user_oneliner(text: str, report_language: str,
+                            has_footer: bool = False) -> None:
     """v0.5.19: replace the cooked-mode echo with the one-liner user
     render — 'sen [hh:mm] « text' (or 'you [hh:mm] « text' in EN mode).
 
@@ -1706,11 +1661,16 @@ def _rerender_user_oneliner(text: str, report_language: str) -> None:
     effort for single-line input: pastes that wrapped during cooked echo
     may leave residue on the wrapped rows — acceptable for the common
     case of short replies.
+
+    v0.5.27: when `has_footer` is True, also climb one more row and
+    clear the footer line that _input_prompt printed above the arrow.
     """
     ts = datetime.datetime.now().strftime("%H:%M")
     speaker = "sen" if report_language == "tr" else "you"
     with _STDOUT_LOCK:
-        sys.stdout.write("\033[1A\r\033[2K")
+        sys.stdout.write("\033[1A\r\033[2K")          # clear echoed prompt line
+        if has_footer:
+            sys.stdout.write("\033[1A\r\033[2K")      # clear footer line above
         sys.stdout.flush()
     _render_message(speaker, ts, text, is_user=True)
 
@@ -1840,7 +1800,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                         f"disable with /silence-auto off)")
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.5.26"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.5.27"))
     print()
     if report_language == "tr":
         lines = [
