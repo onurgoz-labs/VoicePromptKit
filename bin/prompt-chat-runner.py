@@ -54,6 +54,25 @@ try:
 except ImportError:
     _READLINE_AVAILABLE = False
 
+# v0.5.14: Unix-only modules for idle-silence timeout. `select` lets us
+# wait for stdin with a timeout; `termios.tcflush` drains any partial
+# input the user typed but didn't Enter, so it doesn't leak into the next
+# prompt. On Windows we degrade to plain input() with no idle timeout.
+if sys.platform != "win32":
+    try:
+        import select as _select_mod
+        import termios as _termios_mod
+        _IDLE_TIMEOUT_OK = True
+    except ImportError:
+        _IDLE_TIMEOUT_OK = False
+else:
+    _IDLE_TIMEOUT_OK = False
+
+# v0.5.14: default seconds of inactivity before auto-firing a silence
+# event. Long enough that the tester can think; short enough to actually
+# exercise the script's silence policy.
+_DEFAULT_IDLE_SILENCE_SECS = 10
+
 # v0.5.11: ANSI escape sequences for color. Stdlib-only (no rich/colorama).
 # We only emit these when stdout is a real TTY — piping to a file would
 # pollute it with raw escape codes otherwise.
@@ -530,9 +549,19 @@ def _now_monotonic() -> float:
 def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str,
           chat_jsonl_path: str, staged_path: str, abs_prompt: str,
           report_language: str, session: dict) -> int:
+    # v0.5.14: idle-silence threshold. Persisted on session so /reset
+    # keeps the user's preference. 0 / negative disables. Unix-only —
+    # _read_with_idle_timeout transparently falls back to blocking
+    # input() on Windows or non-TTY streams.
+    if "idle_silence_secs" not in session:
+        session["idle_silence_secs"] = _DEFAULT_IDLE_SILENCE_SECS
+        _atomic_write_json(session_path, session)
+
     while True:
+        idle = session.get("idle_silence_secs", 0) or 0
+        idle_arg = idle if idle > 0 and _IDLE_TIMEOUT_OK else None
         try:
-            user_input = _input_prompt().strip()
+            user_input, timed_out = _input_prompt(idle_arg)
         except EOFError:
             print()
             _exit_cleanly(run_dir, session_path, chat_jsonl_path, staged_path,
@@ -544,6 +573,32 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
                           abs_prompt, report_language, "interrupt", session)
             return 0
 
+        if timed_out:
+            # v0.5.14: auto-silence. The user sat idle past the threshold;
+            # treat it as the caller staying quiet on the line and let the
+            # persona's silence policy decide what to do (gentle prompt,
+            # escalation, eventual hangup).
+            duration = int(idle_arg or _DEFAULT_IDLE_SILENCE_SECS)
+            banner = (f"  (otomatik sessizlik: {duration} sn — boş bekleme)"
+                      if report_language == "tr"
+                      else f"  (auto-silence: {duration}s — caller idle)")
+            print(_c(_COL_SYS, banner))
+            ended = _exchange_turn(
+                ctx, f"[silence for {duration} seconds]",
+                chat_jsonl_path, session_path, session, report_language,
+            )
+            if ended:
+                msg = ("Persona aramayı kapattı (sessizlik politikası)."
+                       if report_language == "tr"
+                       else "Persona ended the call (silence policy).")
+                print(_c(_COL_SYS, f"[{msg}]"))
+                print()
+                _exit_cleanly(run_dir, session_path, chat_jsonl_path, staged_path,
+                              abs_prompt, report_language, "end_call_marker", session)
+                return 0
+            continue
+
+        user_input = (user_input or "").strip()
         if not user_input:
             continue
 
@@ -555,35 +610,15 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
                 return 0
             continue
 
-        # Normal turn — append user, buffer reply (need to strip markers before
-        # rendering), then render with persona prefix.
-        _append_chat_entry(chat_jsonl_path, "user", user_input)
+        # Normal turn — delegate to the shared exchange helper.
         print()  # blank line before the reply
-        try:
-            reply_raw = _send_with_spinner(
-                ctx, user_input, session.get("persona_name"), report_language,
-            )
-        except RuntimeError as e:
-            print(_c(_COL_ERR, f"\n[chat error: {e}]\n"), file=sys.stderr)
-            continue
-
-        reply, ended = _strip_end_call_marker(reply_raw)
-        reply, _maybe_name = _strip_persona_name_marker(reply)
-        if _maybe_name and not session.get("persona_name"):
-            session["persona_name"] = _maybe_name
-        reply = reply.strip()
-        _append_chat_entry(chat_jsonl_path, "assistant", reply)
-        session["turns"] = session.get("turns", 0) + 1
-        _atomic_write_json(session_path, session)
-
-        _render_bot_reply(reply, session.get("persona_name"))
-        _render_footer(session["turns"], report_language)
-
+        ended = _exchange_turn(ctx, user_input, chat_jsonl_path, session_path,
+                               session, report_language)
         if ended:
-            # v0.5.9: persona signalled end-of-call via <<END_CALL>>. Treat
-            # as auto-quit — print a short banner so the user knows why we're
-            # closing, then run the normal exit path (with the staged-anchor
-            # commit prompt if any).
+            # v0.5.9 / v0.5.12: persona signalled end-of-call via
+            # <<END_CALL>> or a closing phrase. Print a short banner so
+            # the user knows why we're closing, then run the normal exit
+            # path (with the staged-anchor commit prompt if any).
             banner = ("Persona aramayı kapattı (end-call-tool eşdeğeri)."
                       if report_language == "tr"
                       else "Persona ended the call (end-call-tool equivalent).")
@@ -612,6 +647,8 @@ def _dispatch_slash(user_input: str, run_dir: str, session_path: str,
         _handle_reset(run_dir, chat_jsonl_path, session_path, session, report_language, ctx)
     elif cmd == "silence":
         _handle_silence(arg, ctx, chat_jsonl_path, session_path, session, report_language)
+    elif cmd in ("silence-auto", "silenceauto", "autosilence"):
+        _handle_silence_auto(arg, session_path, session, report_language)
     elif cmd == "commit":
         _handle_commit(abs_prompt, staged_path, session_path, session, report_language)
     elif cmd == "help":
@@ -633,26 +670,28 @@ def _handle_help(report_language: str) -> None:
     if report_language == "tr":
         print()
         print(_c(_COL_BOLD, "Komutlar:"))
-        print(f"  {_c(_COL_USER, '/save')}        — son turu anchor olarak kaydet (staging)")
-        print(f"  {_c(_COL_USER, '/history')}     — bu oturumdaki turları göster")
-        print(f"  {_c(_COL_USER, '/reset')}       — geçmişi sil, baştan başla (fresh persona + fresh caller)")
-        print(f"  {_c(_COL_USER, '/silence <N>')} — N saniye sessizlik simüle et (örn. /silence 6)")
-        print(f"  {_c(_COL_USER, '/commit')}      — staged anchor'ları sidecar dosyaya yaz")
-        print(f"  {_c(_COL_USER, '/help')}        — bu listeyi göster")
-        print(f"  {_c(_COL_USER, '/quit')}        — çıkış + final summary")
+        print(f"  {_c(_COL_USER, '/save')}                 — son turu anchor olarak kaydet (staging)")
+        print(f"  {_c(_COL_USER, '/history')}              — bu oturumdaki turları göster")
+        print(f"  {_c(_COL_USER, '/reset')}                — geçmişi sil, baştan başla (fresh persona + arayan)")
+        print(f"  {_c(_COL_USER, '/silence <N>')}          — N saniye sessizlik simüle et (manuel)")
+        print(f"  {_c(_COL_USER, '/silence-auto [on|off|N]')} — boş bekleyince otomatik sessizlik (varsayılan {_DEFAULT_IDLE_SILENCE_SECS} sn)")
+        print(f"  {_c(_COL_USER, '/commit')}               — staged anchor'ları sidecar dosyaya yaz")
+        print(f"  {_c(_COL_USER, '/help')}                 — bu listeyi göster")
+        print(f"  {_c(_COL_USER, '/quit')}                 — çıkış + final summary")
         print()
         print(_c(_COL_DIM, "İpucu: ok tuşları ile geçmiş mesajlar arasında dolaşabilirsin (readline)."))
         print()
     else:
         print()
         print(_c(_COL_BOLD, "Commands:"))
-        print(f"  {_c(_COL_USER, '/save')}        — capture last turn as a test anchor (staging)")
-        print(f"  {_c(_COL_USER, '/history')}     — show this session's turns")
-        print(f"  {_c(_COL_USER, '/reset')}       — discard history, fresh persona + caller")
-        print(f"  {_c(_COL_USER, '/silence <N>')} — simulate N seconds of caller silence")
-        print(f"  {_c(_COL_USER, '/commit')}      — write staged anchors to the sidecar file")
-        print(f"  {_c(_COL_USER, '/help')}        — show this list")
-        print(f"  {_c(_COL_USER, '/quit')}        — exit with a final summary")
+        print(f"  {_c(_COL_USER, '/save')}                 — capture last turn as a test anchor (staging)")
+        print(f"  {_c(_COL_USER, '/history')}              — show this session's turns")
+        print(f"  {_c(_COL_USER, '/reset')}                — discard history, fresh persona + caller")
+        print(f"  {_c(_COL_USER, '/silence <N>')}          — simulate N seconds of caller silence (manual)")
+        print(f"  {_c(_COL_USER, '/silence-auto [on|off|N]')} — fire silence after idle (default {_DEFAULT_IDLE_SILENCE_SECS}s)")
+        print(f"  {_c(_COL_USER, '/commit')}               — write staged anchors to the sidecar file")
+        print(f"  {_c(_COL_USER, '/help')}                 — show this list")
+        print(f"  {_c(_COL_USER, '/quit')}                 — exit with a final summary")
         print()
         print(_c(_COL_DIM, "Tip: use arrow keys to browse previous input (readline)."))
         print()
@@ -665,6 +704,7 @@ def _handle_silence(arg: str, ctx: "_SubprocessCtx", chat_jsonl_path: str,
     Sends the opaque-string convention `[silence for N seconds]` (the same
     pattern drift-runner uses when expanding silence_input sugar) to the
     bare subprocess. Framing rule 8 tells the persona how to react.
+    v0.5.14: turn-execution refactored into _exchange_turn.
     """
     try:
         duration = int(arg)
@@ -677,40 +717,93 @@ def _handle_silence(arg: str, ctx: "_SubprocessCtx", chat_jsonl_path: str,
         print(msg)
         return
 
-    silence_msg = f"[silence for {duration} seconds]"
-    _append_chat_entry(chat_jsonl_path, "user", silence_msg)
     print()  # blank line before reply
-    # Show what we sent so the user has context.
     print(_c(_COL_SYS, f"  (sessizlik: {duration} saniye)" if report_language == "tr"
               else f"  (silence: {duration} seconds)"))
-    print()
-    try:
-        reply_raw = _send_with_spinner(
-            ctx, silence_msg, session.get("persona_name"), report_language,
-        )
-    except RuntimeError as e:
-        print(_c(_COL_ERR, f"\n[chat error: {e}]\n"), file=sys.stderr)
-        return
-    reply, ended = _strip_end_call_marker(reply_raw)
-    reply, _maybe_name = _strip_persona_name_marker(reply)
-    if _maybe_name and not session.get("persona_name"):
-        session["persona_name"] = _maybe_name
-    reply = reply.strip()
-    _append_chat_entry(chat_jsonl_path, "assistant", reply)
-    session["turns"] = session.get("turns", 0) + 1
-    _atomic_write_json(session_path, session)
-    _render_bot_reply(reply, session.get("persona_name"))
-    _render_footer(session["turns"], report_language)
+    ended = _exchange_turn(
+        ctx, f"[silence for {duration} seconds]",
+        chat_jsonl_path, session_path, session, report_language,
+    )
     if ended:
-        # Silence policy escalated to hangup — persona dropped the call.
-        # Note: _handle_silence is called from _dispatch_slash which doesn't
-        # propagate an exit code; setting a flag on session signals the REPL
-        # to exit on the next iteration. Simpler: just raise SystemExit here.
         banner = ("Persona aramayı kapattı (sessizlik politikası — end-call eşdeğeri)."
                   if report_language == "tr"
                   else "Persona ended the call (silence policy → end-call equivalent).")
         print(f"\n[{banner}]\n")
         raise SystemExit(0)
+
+
+def _handle_silence_auto(arg: str, session_path: str, session: dict,
+                         report_language: str) -> None:
+    """v0.5.14: configure the idle-silence auto-timeout.
+
+      /silence-auto              → show current setting
+      /silence-auto off          → disable auto-silence (manual /silence only)
+      /silence-auto on           → enable with the default threshold (10s)
+      /silence-auto <N>          → enable with custom threshold N seconds
+                                   (N=0 disables; alias for off)
+    """
+    arg_l = (arg or "").strip().lower()
+    cur = int(session.get("idle_silence_secs", 0) or 0)
+
+    if not arg_l:
+        if not _IDLE_TIMEOUT_OK:
+            msg = ("Otomatik sessizlik bu platformda desteklenmiyor (Windows). "
+                   "Manuel /silence <N> kullan."
+                   if report_language == "tr"
+                   else "Auto-silence is not supported on this platform "
+                        "(Windows). Use manual /silence <N>.")
+        elif cur > 0:
+            msg = (f"Otomatik sessizlik AÇIK · eşik: {cur} sn. "
+                   f"Kapatmak için: /silence-auto off"
+                   if report_language == "tr"
+                   else f"Auto-silence ON · threshold: {cur}s. "
+                        f"Disable: /silence-auto off")
+        else:
+            msg = (f"Otomatik sessizlik KAPALI. Açmak için: /silence-auto on "
+                   f"(varsayılan {_DEFAULT_IDLE_SILENCE_SECS} sn)"
+                   if report_language == "tr"
+                   else f"Auto-silence OFF. Enable: /silence-auto on "
+                        f"(default {_DEFAULT_IDLE_SILENCE_SECS}s)")
+        print(msg)
+        return
+
+    if arg_l in ("off", "kapat", "kapali", "kapalı", "0"):
+        session["idle_silence_secs"] = 0
+        _atomic_write_json(session_path, session)
+        print("Otomatik sessizlik kapatıldı." if report_language == "tr"
+              else "Auto-silence disabled.")
+        return
+
+    if arg_l in ("on", "ac", "aç", "open"):
+        session["idle_silence_secs"] = _DEFAULT_IDLE_SILENCE_SECS
+        _atomic_write_json(session_path, session)
+        msg = (f"Otomatik sessizlik açıldı · eşik: {_DEFAULT_IDLE_SILENCE_SECS} sn."
+               if report_language == "tr"
+               else f"Auto-silence enabled · threshold: {_DEFAULT_IDLE_SILENCE_SECS}s.")
+        print(msg)
+        return
+
+    try:
+        n = int(arg_l)
+        if n < 0:
+            raise ValueError
+    except ValueError:
+        msg = ("kullanım: /silence-auto [on|off|<saniye>]"
+               if report_language == "tr"
+               else "usage: /silence-auto [on|off|<seconds>]")
+        print(msg)
+        return
+
+    session["idle_silence_secs"] = n
+    _atomic_write_json(session_path, session)
+    if n == 0:
+        print("Otomatik sessizlik kapatıldı." if report_language == "tr"
+              else "Auto-silence disabled.")
+    else:
+        msg = (f"Otomatik sessizlik eşiği: {n} sn."
+               if report_language == "tr"
+               else f"Auto-silence threshold: {n}s.")
+        print(msg)
 
 
 def _handle_save(chat_jsonl_path: str, staged_path: str, report_language: str,
@@ -1049,18 +1142,111 @@ def _render_footer(turn: int, report_language: str) -> None:
         sys.stdout.flush()
 
 
-def _input_prompt() -> str:
+def _input_prompt(idle_timeout: float | None = None) -> tuple[str | None, bool]:
     """Render the user input prompt in orange and read a line.
+
+    Returns (text, timed_out):
+      - (text, False) when the user submits a line (text may be empty).
+      - (None,  True) when no Enter arrived within `idle_timeout`
+        seconds (idle-silence trigger — Unix only).
 
     v0.5.13: after input() returns, redraw the just-typed line right-
     aligned to visually distinguish "you said" from "bot replied". Bot
     replies stay left-aligned; user echoes flush to the right edge.
+    v0.5.14: optional idle timeout that fires the auto-silence path.
     """
     arrow = _c(_COL_USER, _c(_COL_BOLD, "❯ "))
-    text = input(arrow)
-    if text.strip() and _TTY:
+    text, timed_out = _read_with_idle_timeout(arrow, idle_timeout)
+    if timed_out:
+        # Clear the empty echoed prompt line so the silence banner from
+        # the caller renders cleanly on a fresh row.
+        if _TTY:
+            with _STDOUT_LOCK:
+                sys.stdout.write("\r\033[2K")
+                sys.stdout.flush()
+        return None, True
+    if text and text.strip() and _TTY:
         _rerender_user_right(text)
-    return text
+    return text, False
+
+
+def _read_with_idle_timeout(arrow_prompt: str,
+                            idle_timeout: float | None) -> tuple[str | None, bool]:
+    """Cross-platform line reader with optional idle timeout.
+
+    When idle_timeout is None / 0 / negative — or when running on
+    Windows / a non-TTY stream — falls back to blocking input(). On Unix
+    TTYs, writes the prompt manually, waits on stdin with
+    select.select(), and returns (None, True) when no input was
+    submitted within the timeout. Any chars the user typed without
+    pressing Enter are drained via termios.tcflush so they don't leak
+    into the next prompt.
+    """
+    if (not idle_timeout) or idle_timeout <= 0 or (not _IDLE_TIMEOUT_OK) or (
+            not sys.stdin.isatty()):
+        return input(arrow_prompt), False
+    with _STDOUT_LOCK:
+        sys.stdout.write(arrow_prompt)
+        sys.stdout.flush()
+    try:
+        ready, _, _ = _select_mod.select([sys.stdin], [], [], idle_timeout)
+    except (OSError, ValueError):
+        # select can fail on some non-standard streams; degrade.
+        return input(), False
+    if ready:
+        # Data on stdin (cooked-mode line in the kernel buffer). input()
+        # with an empty prompt reads it without re-printing the arrow.
+        return input(), False
+    _drain_partial_input()
+    return None, True
+
+
+def _drain_partial_input() -> None:
+    """Discard any chars the user typed before the idle timeout fired.
+
+    Without this, half-typed input ("hel" without Enter) would surface
+    in the NEXT input() call after the bot's silence reply, prepending
+    leaked chars to whatever the user types next.
+    """
+    if not _IDLE_TIMEOUT_OK or not sys.stdin.isatty():
+        return
+    try:
+        _termios_mod.tcflush(sys.stdin.fileno(), _termios_mod.TCIFLUSH)
+    except (OSError, _termios_mod.error):
+        pass
+
+
+def _exchange_turn(ctx: "_SubprocessCtx", user_msg: str,
+                   chat_jsonl_path: str, session_path: str,
+                   session: dict, report_language: str) -> bool:
+    """Send one user message, render the bot reply, return True if call ended.
+
+    Centralises the append-user → ctx.send → strip-markers → append-
+    assistant → render flow that's shared by the normal REPL turn, the
+    /silence command, and the v0.5.14 auto-silence path. The caller is
+    responsible for any pre-render output (banners, blank lines) and
+    end-of-call handling (banner + exit) — this helper only returns the
+    "did the persona end the call" flag.
+    """
+    _append_chat_entry(chat_jsonl_path, "user", user_msg)
+    try:
+        reply_raw = _send_with_spinner(
+            ctx, user_msg, session.get("persona_name"), report_language,
+        )
+    except RuntimeError as e:
+        print(_c(_COL_ERR, f"\n[chat error: {e}]\n"), file=sys.stderr)
+        return False
+    reply, ended = _strip_end_call_marker(reply_raw)
+    reply, maybe_name = _strip_persona_name_marker(reply)
+    if maybe_name and not session.get("persona_name"):
+        session["persona_name"] = maybe_name
+    reply = reply.strip()
+    _append_chat_entry(chat_jsonl_path, "assistant", reply)
+    session["turns"] = session.get("turns", 0) + 1
+    _atomic_write_json(session_path, session)
+    _render_bot_reply(reply, session.get("persona_name"))
+    _render_footer(session["turns"], report_language)
+    return ended
 
 
 def _rerender_user_right(text: str) -> None:
@@ -1148,29 +1334,39 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
     basename = os.path.basename(abs_prompt).rsplit(".", 1)[0]
     line_count = sum(1 for _ in open(os.path.join(run_dir, "body.txt"), encoding="utf-8"))
     bar = _c(_COL_DIM, "─" * 60)
+    if _IDLE_TIMEOUT_OK:
+        idle_hint_tr = (f"  Otomatik sessizlik: {_DEFAULT_IDLE_SILENCE_SECS} sn (boş bekle → silence). "
+                        f"/silence-auto ile değiştir.")
+        idle_hint_en = (f"  Auto-silence: {_DEFAULT_IDLE_SILENCE_SECS}s of idle fires a silence event. "
+                        f"Toggle via /silence-auto.")
+    else:
+        idle_hint_tr = "  Otomatik sessizlik: bu platformda kapalı (manuel /silence <N> kullan)."
+        idle_hint_en = "  Auto-silence: disabled on this platform (use manual /silence <N>)."
     print()
     print(bar)
     if report_language == "tr":
-        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.11)"))
+        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.14)"))
         print(bar)
         print(f"  Prompt:    {_c(_COL_BOLD, basename)} ({line_count} satır, model: {chat_model})")
         print(f"  Arayan:    {_c(_COL_BOLD, caller_name)}")
         print(f"  İzolasyon: yeni pencere · bare Claude session")
         print(bar)
         print(_c(_COL_DIM, "  Bot birazdan kendisi selamlayacak — sen aramayı cevapladın."))
-        print(_c(_COL_DIM, "  Komutlar: /save  /history  /reset  /silence <N>  /commit  /help  /quit"))
+        print(_c(_COL_DIM, idle_hint_tr))
+        print(_c(_COL_DIM, "  Komutlar: /save  /history  /reset  /silence <N>  /silence-auto  /commit  /help  /quit"))
         if _READLINE_AVAILABLE:
             print(_c(_COL_DIM, "  İpucu: ok tuşları geçmiş mesajları gezer."))
         print(bar)
     else:
-        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.11)"))
+        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.14)"))
         print(bar)
         print(f"  Prompt:    {_c(_COL_BOLD, basename)} ({line_count} lines, model: {chat_model})")
         print(f"  Caller:    {_c(_COL_BOLD, caller_name)}")
         print(f"  Isolation: new window · bare Claude session")
         print(bar)
         print(_c(_COL_DIM, "  The bot will greet you first — you're the caller answering."))
-        print(_c(_COL_DIM, "  Commands: /save  /history  /reset  /silence <N>  /commit  /help  /quit"))
+        print(_c(_COL_DIM, idle_hint_en))
+        print(_c(_COL_DIM, "  Commands: /save  /history  /reset  /silence <N>  /silence-auto  /commit  /help  /quit"))
         if _READLINE_AVAILABLE:
             print(_c(_COL_DIM, "  Tip: arrow keys browse previous input."))
         print(bar)
