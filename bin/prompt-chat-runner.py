@@ -45,23 +45,28 @@ import threading
 import uuid
 from queue import Empty, Queue
 
-# v0.5.11: readline is stdlib on macOS/Linux but not bundled on Windows. Import
-# defensively — when unavailable, input() still works, just without arrow-key
-# history or line editing.
+# v0.5.11: readline is stdlib on macOS/Linux but not bundled on Windows.
+# Import for its side effect — enables arrow-key history + line editing on
+# the cooked-mode input() fallback (used when idle-silence is OFF, on
+# Windows, or on a non-TTY stream). The v0.5.16 raw-mode reader does not
+# use readline; readline-style history is intentionally absent there.
 try:
-    import readline  # noqa: F401 — side-effect import: enables history + line edit on input()
-    _READLINE_AVAILABLE = True
+    import readline  # noqa: F401
 except ImportError:
-    _READLINE_AVAILABLE = False
+    pass
 
-# v0.5.14: Unix-only modules for idle-silence timeout. `select` lets us
-# wait for stdin with a timeout; `termios.tcflush` drains any partial
-# input the user typed but didn't Enter, so it doesn't leak into the next
-# prompt. On Windows we degrade to plain input() with no idle timeout.
+# v0.5.16: raw-mode reader needs `tty` alongside `select` + `termios`.
+# Cooked-mode `select()` only signals stdin readable on Enter, so a user
+# actively typing a long reply got killed by the idle-silence timer mid-
+# word (their buffer was then tcflushed and discarded — see v0.5.14 bug).
+# Raw (cbreak) mode delivers each keystroke immediately, letting us reset
+# the deadline on every byte. On Windows / non-Unix we degrade to plain
+# input() with no idle timeout.
 if sys.platform != "win32":
     try:
         import select as _select_mod
         import termios as _termios_mod
+        import tty as _tty_mod
         _IDLE_TIMEOUT_OK = True
     except ImportError:
         _IDLE_TIMEOUT_OK = False
@@ -679,8 +684,6 @@ def _handle_help(report_language: str) -> None:
         print(f"  {_c(_COL_USER, '/help')}                 — bu listeyi göster")
         print(f"  {_c(_COL_USER, '/quit')}                 — çıkış + final summary")
         print()
-        print(_c(_COL_DIM, "İpucu: ok tuşları ile geçmiş mesajlar arasında dolaşabilirsin (readline)."))
-        print()
     else:
         print()
         print(_c(_COL_BOLD, "Commands:"))
@@ -692,8 +695,6 @@ def _handle_help(report_language: str) -> None:
         print(f"  {_c(_COL_USER, '/commit')}               — write staged anchors to the sidecar file")
         print(f"  {_c(_COL_USER, '/help')}                 — show this list")
         print(f"  {_c(_COL_USER, '/quit')}                 — exit with a final summary")
-        print()
-        print(_c(_COL_DIM, "Tip: use arrow keys to browse previous input (readline)."))
         print()
 
 
@@ -1174,46 +1175,129 @@ def _read_with_idle_timeout(arrow_prompt: str,
                             idle_timeout: float | None) -> tuple[str | None, bool]:
     """Cross-platform line reader with optional idle timeout.
 
-    When idle_timeout is None / 0 / negative — or when running on
-    Windows / a non-TTY stream — falls back to blocking input(). On Unix
-    TTYs, writes the prompt manually, waits on stdin with
-    select.select(), and returns (None, True) when no input was
-    submitted within the timeout. Any chars the user typed without
-    pressing Enter are drained via termios.tcflush so they don't leak
-    into the next prompt.
+    When idle_timeout is None / 0 / negative — or when running on Windows
+    / a non-TTY stream — falls back to blocking input() in cooked mode
+    (preserving full readline support). On Unix TTYs with a positive
+    timeout, switches to cbreak mode via _read_raw_with_idle_timeout so
+    the silence deadline resets on every keystroke (v0.5.16 — fixes the
+    v0.5.14 race where typing a long reply that hadn't reached Enter in
+    time was tcflushed as silence).
     """
     if (not idle_timeout) or idle_timeout <= 0 or (not _IDLE_TIMEOUT_OK) or (
             not sys.stdin.isatty()):
         return input(arrow_prompt), False
+    try:
+        return _read_raw_with_idle_timeout(arrow_prompt, float(idle_timeout))
+    except (OSError, ValueError):
+        # Raw-mode setup failed on this stream (unusual fd, no termios
+        # support, etc.). Degrade to cooked input() so the user can still
+        # type — they just lose the silence timer for this turn.
+        return input(), False
+
+
+def _read_raw_with_idle_timeout(arrow_prompt: str,
+                                idle_timeout: float) -> tuple[str | None, bool]:
+    """Read a line in cbreak mode, resetting the silence deadline on each
+    keystroke.
+
+    Minimal line editor — readline history and cursor navigation are
+    intentionally gone (the welcome banner no longer advertises arrow-key
+    history). Handles:
+      • UTF-8 multi-byte sequences via an incremental decoder so a code
+        point split across two os.read() chunks is never echoed half-way,
+      • Backspace (0x7f / 0x08) — pops one code point and emits ``\\b \\b``,
+      • Enter (CR or LF) — commits and returns the buffer,
+      • Ctrl-D on empty buffer → EOFError (cbreak keeps ISIG on, so
+        Ctrl-C still arrives as SIGINT → KeyboardInterrupt above us),
+      • CSI / SS3 escape sequences (arrow keys, function keys) — swallowed
+        silently across chunk boundaries via a small state machine,
+      • Other control bytes < 0x20 (Tab, etc.) — dropped to keep the line
+        rendering clean.
+
+    The deadline resets on every chunk received; only a select() that
+    elapses to zero with no further bytes triggers the silence return.
+    Typed chars echo in the terminal's default color — _rerender_user_right
+    repaints them in orange after Enter, matching the v0.5.13 cooked-mode
+    look.
+    """
+    import codecs
+    fd = sys.stdin.fileno()
+    old_attrs = _termios_mod.tcgetattr(fd)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    buf: list[str] = []
+    in_escape = False
+    escape_first: int | None = None
+
     with _STDOUT_LOCK:
         sys.stdout.write(arrow_prompt)
         sys.stdout.flush()
+
     try:
-        ready, _, _ = _select_mod.select([sys.stdin], [], [], idle_timeout)
-    except (OSError, ValueError):
-        # select can fail on some non-standard streams; degrade.
-        return input(), False
-    if ready:
-        # Data on stdin (cooked-mode line in the kernel buffer). input()
-        # with an empty prompt reads it without re-printing the arrow.
-        return input(), False
-    _drain_partial_input()
-    return None, True
+        _tty_mod.setcbreak(fd)
+        deadline = _now_monotonic() + idle_timeout
+        while True:
+            remaining = deadline - _now_monotonic()
+            if remaining <= 0:
+                return None, True
+            ready, _, _ = _select_mod.select([fd], [], [], remaining)
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, 256)
+            except OSError:
+                continue
+            if not chunk:
+                raise EOFError
+            deadline = _now_monotonic() + idle_timeout
 
-
-def _drain_partial_input() -> None:
-    """Discard any chars the user typed before the idle timeout fired.
-
-    Without this, half-typed input ("hel" without Enter) would surface
-    in the NEXT input() call after the bot's silence reply, prepending
-    leaked chars to whatever the user types next.
-    """
-    if not _IDLE_TIMEOUT_OK or not sys.stdin.isatty():
-        return
-    try:
-        _termios_mod.tcflush(sys.stdin.fileno(), _termios_mod.TCIFLUSH)
-    except (OSError, _termios_mod.error):
-        pass
+            for b in chunk:
+                if in_escape:
+                    if escape_first is None:
+                        escape_first = b
+                        # ESC <char> alt-key shortcut terminates immediately
+                        # unless it introduces a CSI ('[') or SS3 ('O').
+                        if b not in (0x5b, 0x4f):
+                            in_escape = False
+                            escape_first = None
+                    elif 0x40 <= b <= 0x7e:
+                        # Final byte of CSI / SS3 sequence.
+                        in_escape = False
+                        escape_first = None
+                    continue
+                if b == 0x03:  # Ctrl-C — defensive: ISIG normally fires SIGINT
+                    raise KeyboardInterrupt
+                if b == 0x04:  # Ctrl-D
+                    if not buf:
+                        raise EOFError
+                    continue
+                if b in (0x0a, 0x0d):
+                    with _STDOUT_LOCK:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                    return "".join(buf), False
+                if b in (0x7f, 0x08):
+                    if buf:
+                        buf.pop()
+                        with _STDOUT_LOCK:
+                            sys.stdout.write("\b \b")
+                            sys.stdout.flush()
+                    continue
+                if b == 0x1b:
+                    in_escape = True
+                    escape_first = None
+                    continue
+                if b < 0x20:
+                    continue
+                # Feed bytes one at a time so a multi-byte code point split
+                # across os.read() boundaries never echoes a half character.
+                ch = decoder.decode(bytes([b]))
+                if ch:
+                    buf.append(ch)
+                    with _STDOUT_LOCK:
+                        sys.stdout.write(ch)
+                        sys.stdout.flush()
+    finally:
+        _termios_mod.tcsetattr(fd, _termios_mod.TCSADRAIN, old_attrs)
 
 
 def _exchange_turn(ctx: "_SubprocessCtx", user_msg: str,
@@ -1345,7 +1429,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
     print()
     print(bar)
     if report_language == "tr":
-        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.14)"))
+        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.16)"))
         print(bar)
         print(f"  Prompt:    {_c(_COL_BOLD, basename)} ({line_count} satır, model: {chat_model})")
         print(f"  Arayan:    {_c(_COL_BOLD, caller_name)}")
@@ -1354,11 +1438,9 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
         print(_c(_COL_DIM, "  Bot birazdan kendisi selamlayacak — sen aramayı cevapladın."))
         print(_c(_COL_DIM, idle_hint_tr))
         print(_c(_COL_DIM, "  Komutlar: /save  /history  /reset  /silence <N>  /silence-auto  /commit  /help  /quit"))
-        if _READLINE_AVAILABLE:
-            print(_c(_COL_DIM, "  İpucu: ok tuşları geçmiş mesajları gezer."))
         print(bar)
     else:
-        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.14)"))
+        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.16)"))
         print(bar)
         print(f"  Prompt:    {_c(_COL_BOLD, basename)} ({line_count} lines, model: {chat_model})")
         print(f"  Caller:    {_c(_COL_BOLD, caller_name)}")
@@ -1367,8 +1449,6 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
         print(_c(_COL_DIM, "  The bot will greet you first — you're the caller answering."))
         print(_c(_COL_DIM, idle_hint_en))
         print(_c(_COL_DIM, "  Commands: /save  /history  /reset  /silence <N>  /silence-auto  /commit  /help  /quit"))
-        if _READLINE_AVAILABLE:
-            print(_c(_COL_DIM, "  Tip: arrow keys browse previous input."))
         print(bar)
 
 
