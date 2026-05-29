@@ -211,14 +211,25 @@ fi
 # ---- 1.2: resolve the orchestrator script --------------------------------
 # Dev repo: bin/prompt-chat-runner.py. Installed plugin:
 # ~/.claude/plugins/cache/onurgoz/PromptChecker/<version>/bin/.
+#
+# v0.5.19: cache fallback now version-sorts. Pre-v0.5.19 the `for guess in
+# <glob>` loop relied on bash's alphabetic glob expansion, which made
+# "0.5.11" sort BEFORE "0.5.18" (and "0.5.19") — so the oldest cached
+# version always won. `ls ... | sort -V | tail -1` picks the highest
+# semver instead. Dev override env var PROMPTCHECKER_RUNNER short-
+# circuits both lookups so a contributor can point at an in-tree file
+# regardless of cwd.
 RUNNER=""
-for guess in \
-  "$REPO_ROOT/bin/prompt-chat-runner.py" \
-  "$HOME/.claude/plugins/cache/onurgoz/PromptChecker/"*/bin/prompt-chat-runner.py; do
-  if [ -f "$guess" ]; then RUNNER="$guess"; break; fi
-done
+if [ -n "$PROMPTCHECKER_RUNNER" ] && [ -f "$PROMPTCHECKER_RUNNER" ]; then
+  RUNNER="$PROMPTCHECKER_RUNNER"
+elif [ -f "$REPO_ROOT/bin/prompt-chat-runner.py" ]; then
+  RUNNER="$REPO_ROOT/bin/prompt-chat-runner.py"
+else
+  RUNNER=$(ls -d "$HOME/.claude/plugins/cache/onurgoz/PromptChecker/"*/bin/prompt-chat-runner.py 2>/dev/null \
+    | sort -V | tail -1)
+fi
 
-if [ -z "$RUNNER" ]; then
+if [ -z "$RUNNER" ] || [ ! -f "$RUNNER" ]; then
   echo "ERROR: bin/prompt-chat-runner.py not found in repo or plugin cache."
   echo "Reinstall PromptChecker (the runner script is part of the plugin distribution)."
   exit 1

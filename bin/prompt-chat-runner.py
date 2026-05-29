@@ -41,6 +41,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 import uuid
 from queue import Empty, Queue
@@ -655,7 +656,7 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
             idle_arg = idle if idle > 0 and _IDLE_TIMEOUT_OK else None
 
         try:
-            user_input, timed_out = _input_prompt(idle_arg)
+            user_input, timed_out = _input_prompt(idle_arg, report_language)
         except EOFError:
             print()
             _exit_cleanly(run_dir, session_path, chat_jsonl_path, staged_path,
@@ -1015,20 +1016,36 @@ def _handle_save(chat_jsonl_path: str, staged_path: str, report_language: str,
 
 def _handle_history(chat_jsonl_path: str, report_language: str,
                     persona_name: str | None) -> None:
+    """v0.5.19: history dump uses the same one-liner style as live
+    rendering — '  N.  speaker [hh:mm] arrow text' with the speaker
+    label padded to align the longer of {persona_name, "sen"/"you"}.
+    Content is truncated at 90 chars (no wrap) so each turn stays on a
+    single row for scrollable review."""
     entries = _read_chat_jsonl(chat_jsonl_path)
     if not entries:
         print(_c(_COL_DIM, "(boş)" if report_language == "tr" else "(empty)"))
         return
+    user_label = "sen" if report_language == "tr" else "you"
+    bot_label = persona_name if persona_name else "Bot"
+    label_w = max(len(user_label), len(bot_label))
     print()
     for i, e in enumerate(entries, 1):
-        role = e.get('role', '?')
-        text = _truncate(e.get('content', ''), 100)
+        role = e.get("role", "?")
+        text = _truncate(e.get("content", ""), 90)
+        ts_raw = e.get("ts", "")
+        try:
+            hhmm = datetime.datetime.fromisoformat(ts_raw).strftime("%H:%M")
+        except (ValueError, TypeError):
+            hhmm = "--:--"
         if role == "assistant":
-            label = persona_name if persona_name else "bot"
-            line = _c(_COL_BOT, f"{i:3d}. {label}: {text}")
+            speaker = _c(_COL_BOLD, _c(_COL_BOT, bot_label.ljust(label_w)))
+            arrow = _c(_COL_DIM, "»")
         else:
-            line = _c(_COL_USER, f"{i:3d}. you: {text}")
-        print(line)
+            speaker = _c(_COL_BOLD, _c(_COL_USER, user_label.ljust(label_w)))
+            arrow = _c(_COL_DIM, "«")
+        num = _c(_COL_DIM, f"{i:3d}.")
+        ts_col = _c(_COL_DIM, f"[{hhmm}]")
+        print(f"{num} {speaker} {ts_col} {arrow} {text}")
     print()
 
 
@@ -1227,14 +1244,63 @@ def _exit_cleanly(run_dir: str, session_path: str, chat_jsonl_path: str,
 # ----------------------------------------------------------------- helpers
 
 
-def _render_bot_reply(text: str, persona_name: str | None) -> None:
-    """Render the bot reply LEFT-aligned in green with a persona-name prefix."""
+def _render_message(speaker: str, ts: str, text: str, is_user: bool) -> None:
+    """v0.5.19: minimal one-liner per-turn render — '{speaker} [{ts}]
+    {arrow} {text}'. Speaker is bold-colored (green for bot, orange for
+    user), timestamp + arrow are dim, body uses the terminal's default
+    colour so the eye lands on content rather than chrome.
+
+    Long bodies are word-wrapped to the terminal width with continuation
+    lines indented by the prefix width — keeps the message visually
+    grouped under its speaker label even when it spans multiple rows.
+    Blank lines inside the body are preserved as paragraph breaks.
+    """
+    if is_user:
+        col_speaker = _COL_USER
+        arrow = "«"
+    else:
+        col_speaker = _COL_BOT
+        arrow = "»"
+
+    prefix_plain = f"{speaker} [{ts}] {arrow} "
+    prefix_colored = (
+        _c(_COL_BOLD, _c(col_speaker, speaker)) + " "
+        + _c(_COL_DIM, f"[{ts}]") + " "
+        + _c(_COL_DIM, arrow) + " "
+    )
+    prefix_w = _visible_len(prefix_plain)
+    indent = " " * prefix_w
+
+    cols = _term_size()[0]
+    available = max(20, cols - prefix_w - 1)
+    paragraphs = (text or "").split("\n")
+
     with _STDOUT_LOCK:
-        if persona_name:
-            prefix = _c(_COL_BOT, _c(_COL_BOLD, f"❝ {persona_name}: "))
-        else:
-            prefix = _c(_COL_BOT, _c(_COL_BOLD, "❝ "))
-        print(prefix + _c(_COL_BOT, text))
+        emitted_any = False
+        first_line = True
+        for para in paragraphs:
+            if not para.strip():
+                if emitted_any:
+                    print()
+                continue
+            wrapped = textwrap.wrap(para, width=available) or [para]
+            for line in wrapped:
+                if first_line:
+                    print(prefix_colored + line)
+                    first_line = False
+                else:
+                    print(indent + line)
+                emitted_any = True
+
+
+def _render_bot_reply(text: str, persona_name: str | None) -> None:
+    """v0.5.19: delegate to the shared one-liner renderer. Persona name
+    defaults to 'Bot' when the opening reply hasn't supplied
+    [PERSONA_NAME] yet (rare — only happens if the model omits the
+    metadata line on its first turn)."""
+    speaker = persona_name if persona_name else "Bot"
+    ts = datetime.datetime.now().strftime("%H:%M")
+    _render_message(speaker, ts, text, is_user=False)
 
 
 # v0.5.13: terminal width / height probe + pinned bottom footer.
@@ -1324,7 +1390,8 @@ def _render_footer(turn: int, report_language: str,
         sys.stdout.flush()
 
 
-def _input_prompt(idle_timeout: float | None = None) -> tuple[str | None, bool]:
+def _input_prompt(idle_timeout: float | None = None,
+                  report_language: str = "tr") -> tuple[str | None, bool]:
     """Render the user input prompt in orange and read a line.
 
     Returns (text, timed_out):
@@ -1332,10 +1399,11 @@ def _input_prompt(idle_timeout: float | None = None) -> tuple[str | None, bool]:
       - (None,  True) when no Enter arrived within `idle_timeout`
         seconds (idle-silence trigger — Unix only).
 
-    v0.5.13: after input() returns, redraw the just-typed line right-
-    aligned to visually distinguish "you said" from "bot replied". Bot
-    replies stay left-aligned; user echoes flush to the right edge.
     v0.5.14: optional idle timeout that fires the auto-silence path.
+    v0.5.19: after input() returns we redraw the echo using the same
+    one-liner format as the bot ('sen [hh:mm] « text') instead of
+    pushing it to the right edge — matches the per-turn render style
+    introduced in v0.5.19.
     """
     arrow = _c(_COL_USER, _c(_COL_BOLD, "❯ "))
     text, timed_out = _read_with_idle_timeout(arrow, idle_timeout)
@@ -1348,7 +1416,7 @@ def _input_prompt(idle_timeout: float | None = None) -> tuple[str | None, bool]:
                 sys.stdout.flush()
         return None, True
     if text and text.strip() and _TTY:
-        _rerender_user_right(text)
+        _rerender_user_oneliner(text, report_language)
     return text, False
 
 
@@ -1514,28 +1582,23 @@ def _exchange_turn(ctx: "_SubprocessCtx", user_msg: str,
     return ended
 
 
-def _rerender_user_right(text: str) -> None:
-    """After input() returns, clear the echo line and rewrite the typed
-    text flush to the right edge of the terminal in orange.
+def _rerender_user_oneliner(text: str, report_language: str) -> None:
+    """v0.5.19: replace the cooked-mode echo with the one-liner user
+    render — 'sen [hh:mm] « text' (or 'you [hh:mm] « text' in EN mode).
 
-    Best-effort: handles single-line input cleanly. If the user pasted
-    multi-line content or the input wrapped past the terminal width, the
-    visible echo may leave artifacts on the wrapped lines — acceptable
-    for the common case of short turns.
+    input() leaves the cursor at the start of the next line after Enter.
+    We move up one row, clear the echoed prompt line, and let
+    _render_message redraw the message in its canonical form. Best-
+    effort for single-line input: pastes that wrapped during cooked echo
+    may leave residue on the wrapped rows — acceptable for the common
+    case of short replies.
     """
-    cols, _rows = _term_size()
-    # Truncate with ellipsis if too long; right-pad with spaces otherwise.
-    rendered_plain = text
-    if len(rendered_plain) >= cols - 1:
-        rendered_plain = rendered_plain[: cols - 2] + "…"
-    pad = " " * max(0, cols - 1 - len(rendered_plain))
+    ts = datetime.datetime.now().strftime("%H:%M")
+    speaker = "sen" if report_language == "tr" else "you"
     with _STDOUT_LOCK:
-        # input() left cursor at start of next line after Enter; move up
-        # one row and clear the echoed prompt line.
         sys.stdout.write("\033[1A\r\033[2K")
-        sys.stdout.write(_c(_COL_USER, pad + rendered_plain))
-        sys.stdout.write("\n")
         sys.stdout.flush()
+    _render_message(speaker, ts, text, is_user=True)
 
 
 # v0.5.13: animated "..." spinner shown on its own line while the bare
