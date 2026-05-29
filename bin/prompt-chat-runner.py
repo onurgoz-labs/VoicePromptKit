@@ -32,6 +32,7 @@ Why a stripped-down context:
 Usage: python3 prompt-chat-runner.py <run-dir>
 """
 import argparse
+import atexit
 import datetime
 import io
 import json
@@ -41,6 +42,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import uuid
@@ -75,13 +77,12 @@ else:
     _IDLE_TIMEOUT_OK = False
 
 # v0.5.14: seconds of inactivity before auto-firing a silence event.
-# v0.5.19 (post-feedback): default is 0 (disabled). The previous 10s
-# threshold ambushed users who were still composing a reply, and the
-# silence event sometimes wedged the cooked/cbreak terminal mode
-# transition. Auto-silence is now opt-in via `/silence-auto on` —
-# turning it on uses _SILENCE_ON_DEFAULT_SECS (30s, a comfortable
-# think-time floor). Manual `/silence <N>` still works regardless.
-_DEFAULT_IDLE_SILENCE_SECS = 0
+# v0.5.22: default back to enabled at 30s — long enough that a thinking
+# user isn't ambushed (the 10s default in v0.5.14-v0.5.18 was too
+# tight), short enough to actually exercise the script's silence
+# policy in a normal session. `/silence-auto off` disables it; manual
+# `/silence <N>` works regardless of the auto setting.
+_DEFAULT_IDLE_SILENCE_SECS = 30
 _SILENCE_ON_DEFAULT_SECS = 30
 
 # v0.5.11: ANSI escape sequences for color. Stdlib-only (no rich/colorama).
@@ -214,7 +215,9 @@ ABSOLUTE RULES (these OVERRIDE anything in the script that contradicts them):
 
 7. **No emojis unless the script's tone explicitly calls for them.** Voice agents that get rendered into TTS cannot pronounce emojis — keep them out unless the script style guide says otherwise.
 
-8. **Mid-call interruptions, silences, off-topic comments from the caller are EXPECTED.** Handle them per the script's interruption / silence / off-scope rules. Do not break character to comment on the disruption. When you receive a user message that matches `[silence for N seconds]` (case-insensitive), treat it as the caller saying NOTHING for N seconds — apply your script's silence policy (gentle confirmation prompt, escalation after K silences, etc.), do not respond as if "silence for 6 seconds" were spoken text.
+8. **Mid-call interruptions, silences, off-topic comments from the caller are EXPECTED.** Handle them per the script's interruption / silence / off-scope rules. Do not break character to comment on the disruption. When you receive a user message that matches `[silence for N seconds]` (case-insensitive), treat it as the caller saying NOTHING for N seconds.
+
+   **STRICTLY enforce your script's silence thresholds.** If your script says "1st silence ≥15s" and N=9, the threshold is NOT met — DO NOT emit a silence-recovery line, just continue waiting (a brief continuation phrase is acceptable only if your script explicitly allows it). Apply the silence-recovery line(s) ONLY when N meets or exceeds the threshold your script prescribes. Use the EXACT wording your script gives for each silence beat; do not improvise the wording or invent new lines. Never respond as if "silence for 6 seconds" were spoken text.
 
 9. **Internal call-state triggers.** Messages wrapped in `[SYSTEM: ...]` are NOT from the caller — they are internal call infrastructure events from the test harness. Process them silently and respond per the cue:
    - `[SYSTEM: call connected — caller is <Name Surname>]` — the phone just rang and the caller picked up. Deliver your script's opening greeting NOW, in character. Use the caller's name where your script asks for `[MÜŞTERİ_ADI]` / `[MÜŞTERİ_SOYADI]` / `<caller_name>` or similar placeholders. Do NOT ask the user for their name — you ALREADY have it. Do NOT echo the bracketed system text in your reply.
@@ -263,20 +266,40 @@ YOUR PERSONA SCRIPT — internalise this as your voice, your rules, your scope. 
 """
 
 
-def _write_wrapped_body(run_dir: str, body_path: str) -> str:
-    """Write a persona-framed copy of body.txt that claude will receive as the
-    system prompt. The original body.txt is never modified. Wrapped file
-    lives in the run dir as .body-wrapped.txt; regenerated on every script
-    start so framing edits in this file propagate automatically.
+def _safe_unlink(path: str) -> None:
+    """Best-effort delete used by the atexit hook below; we never want
+    cleanup to crash the interpreter shutdown if the file is already
+    gone or its directory has been swept by /tmp's maid."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _write_wrapped_body(body_path: str) -> str:
+    """Write a persona-framed copy of body.txt that claude will receive
+    as the --system-prompt-file payload. The original body.txt is never
+    modified.
+
+    v0.5.22: wrapped body lives in a per-process tempfile under /tmp
+    (e.g. `/tmp/promptchat-XXXX.body-wrapped.txt`) instead of cluttering
+    every chat run dir with a duplicate of body+framing. The framing
+    block is shared across all chats; persisting a copy alongside body.
+    txt added storage with no real benefit (framing edits propagate
+    from the script anyway). atexit cleans the tempfile up on normal
+    Python shutdown; OS /tmp policy handles ungraceful exits.
     """
     body = open(body_path, encoding="utf-8").read()
     wrapped = _ROLEPLAY_FRAMING + body
-    wrapped_path = os.path.join(run_dir, ".body-wrapped.txt")
-    tmp = wrapped_path + ".tmp." + str(os.getpid())
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(wrapped)
-    os.rename(tmp, wrapped_path)
-    return wrapped_path
+    fd, path = tempfile.mkstemp(suffix=".body-wrapped.txt", prefix="promptchat-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(wrapped)
+    except Exception:
+        _safe_unlink(path)
+        raise
+    atexit.register(_safe_unlink, path)
+    return path
 
 
 # --------------------------------------------------------------------- main
@@ -354,10 +377,16 @@ def main() -> int:
     # full-screen scroll region.
     _init_pin()
 
+    # v0.5.22: clean up any pre-v0.5.22 .body-wrapped.txt left in this
+    # run dir before we materialise the fresh tempfile copy. Silent;
+    # missing file is the common case after the first upgrade.
+    _safe_unlink(os.path.join(run_dir, ".body-wrapped.txt"))
+
     # v0.5.8: wrap body.txt with persona roleplay framing before passing to
-    # claude. The original body.txt is left untouched; .body-wrapped.txt is
-    # the framed version the subprocess actually reads as its system prompt.
-    wrapped_body_path = _write_wrapped_body(run_dir, body_path)
+    # claude. The original body.txt is left untouched.
+    # v0.5.22: wrapped body now lives in /tmp (tempfile) instead of inside
+    # the run dir — see _write_wrapped_body.
+    wrapped_body_path = _write_wrapped_body(body_path)
 
     # Spawn the long-lived claude subprocess ONCE.
     ctx = _SubprocessCtx(wrapped_body_path, chat_session_uuid, chat_model)
@@ -1322,31 +1351,48 @@ def _term_size() -> tuple[int, int]:
 
 
 def _init_pin() -> None:
-    """v0.5.21: pinned footer disabled.
+    """v0.5.22: reserve the last terminal row for a sticky footer
+    (status-line) via DECSTBM. Subsequent prints scroll within rows
+    1..rows-1 only; _render_footer paints row N at will.
 
-    v0.5.13 introduced DECSTBM (`\\033[1;{rows-1}r`) to reserve the last
-    terminal row for the footer. The trade-offs accumulated:
-      • DECSTBM moves the cursor to the scroll-region origin as a side
-        effect (xterm / Mac Terminal spec) — overwriting the welcome
-        banner or producing a ~10-line blank gap depending on which
-        compensating cursor jump we applied.
-      • The pinned footer's save/restore-cursor sequence collided with
-        the spinner's inline paint (v0.5.17 bug — bot replies rendered
-        blank), forcing further patches.
-      • Behaviour varied across emulators (Terminal.app, iTerm, tmux,
-        gnome-terminal), making the feature fragile.
-
-    v0.5.21 drops the pin entirely. _render_footer's existing non-TTY
-    fallback (inline `\\n footer \\n` per turn) is now the only path. A
-    little more scroll noise per turn, but the UI is deterministic and
-    no terminal mode tricks remain.
+    The trick that previous attempts (v0.5.13, v0.5.19) got wrong:
+    setting DECSTBM with `\\033[1;{rows-1}r` moves the cursor to the
+    scroll-region origin as a side effect (xterm / Terminal.app spec).
+    To keep the cursor exactly where the welcome banner left it, we
+    bracket the DECSTBM write with `\\033[s` (save) and `\\033[u`
+    (restore). This time the cursor stays on the row right below the
+    welcome banner, so the bot's opening reply flows naturally — no
+    over-write of the banner, no ~10-line blank gap, no manual cursor
+    park to row rows-1.
     """
-    return
+    global _PIN_ACTIVE
+    if not _TTY or _PIN_ACTIVE:
+        return
+    _cols, rows = _term_size()
+    if rows < 4:
+        return  # too small to bother
+    with _STDOUT_LOCK:
+        sys.stdout.write("\033[s")               # save current cursor
+        sys.stdout.write(f"\033[1;{rows - 1}r")  # set DECSTBM scroll region
+        sys.stdout.write("\033[u")               # restore cursor (cancels DECSTBM home)
+        sys.stdout.flush()
+    _PIN_ACTIVE = True
 
 
 def _release_pin() -> None:
-    """v0.5.21: paired with _init_pin no-op — nothing to release."""
-    return
+    """v0.5.22: restore the full-screen scroll region on exit and emit
+    a final newline so the shell prompt appears below our last line of
+    output instead of overlapping the pinned footer row."""
+    global _PIN_ACTIVE
+    if not _TTY or not _PIN_ACTIVE:
+        return
+    _cols, rows = _term_size()
+    with _STDOUT_LOCK:
+        sys.stdout.write(f"\033[{rows};1H\033[2K")  # clear footer row
+        sys.stdout.write(f"\033[1;{rows}r")         # reset scroll region full
+        sys.stdout.write(f"\033[{rows};1H\n")       # cursor to bottom + newline
+        sys.stdout.flush()
+    _PIN_ACTIVE = False
 
 
 def _render_footer(turn: int, report_language: str,
@@ -1709,7 +1755,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                         f"(toggle: /silence-auto)")
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.5.21"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.5.22"))
     print()
     if report_language == "tr":
         lines = [

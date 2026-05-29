@@ -13,7 +13,7 @@
         "url": "https://github.com/onurgoz/PromptChecker.git"
       },
       "description": "Audit prompts (/prompt-check) across six lenses, converse with a prompt's persona (/prompt-chat) to author test anchors, and replay them as regression tests (/prompt-test). Anchors live in sidecar <prompt>.anchors.yaml files; flow anchors support multi-turn scripted conversations with silence handling and call closure. Cost-tuned via target_model / worker_model / judge_model split.",
-      "version": "0.5.21",
+      "version": "0.5.22",
       "license": "MIT",
       "author": {
         "name": "Onur GOZ",
