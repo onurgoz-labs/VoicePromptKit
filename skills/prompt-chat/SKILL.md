@@ -164,7 +164,7 @@ session = {
     "turns": 0,
     "saved_anchors": 0,
     "isolation_mode": None,                             # filled by Phase 1
-    "chat_simulator_agent_id": None,                    # v0.5.4: filled by Phase 6.1 on first user turn; cleared by /reset
+    "chat_session_uuid": None,                          # v0.5.6: filled by bin/prompt-chat-runner.py on first user turn; cleared by /reset
 }
 with open(os.path.join(run_dir, 'session.json'), 'w', encoding='utf-8') as f:
     json.dump(session, f, indent=2, ensure_ascii=False)
@@ -388,7 +388,7 @@ User typed something starting with `/`. Parse the command (lowercase, strip lead
 |---|---|
 | `save` | Phase 5 — anchor save sub-flow (filled in Phase C of the implementation) |
 | `history` | Pretty-print `chat.jsonl` (turn N · role · first 80 chars), then return to chat loop |
-| `reset` | Move `chat.jsonl` to `chat-N-discarded.jsonl`, create fresh empty `chat.jsonl`, update `session.json.turns = 0`, AND clear `session.json.chat_simulator_agent_id` to null (v0.5.4 — next user turn re-spawns a fresh agent per Step 6.1). Inform user. saved_anchors.json is NOT touched. |
+| `reset` | Move `chat.jsonl` to `chat-N-discarded.jsonl`, create fresh empty `chat.jsonl`, update `session.json.turns = 0`, AND regenerate `session.json.chat_session_uuid` (v0.5.6 — the next user message spawns a new bare Claude subprocess with a fresh session id, body reloaded). Inform user. saved_anchors.json is NOT touched. |
 | `commit` | Phase 7 — sidecar write (<prompt>.anchors.yaml) |
 | `quit` | Phase 8 — final summary + optional commit prompt (filled in Phase C) |
 | anything else | Print "Bilinmeyen komut: `/<x>`. Mevcut: /save /history /reset /commit /quit" and return |
@@ -745,87 +745,47 @@ Surface to user:
 
 Return to chat loop.
 
-## Phase 6 — `chat-simulator` agent invocation (persistent, v0.5.4)
+## Phase 6 — Chat loop runtime (v0.5.6 — Python orchestrator + bare claude subprocess)
 
-v0.5.4 introduces persistent chat-simulator subagents — the subagent is spawned ONCE per chat session (on the first user message) and kept in the background; every subsequent user message is delivered via `SendMessage` to the same agent instance, which already has the body + prior conversation in memory. This collapses per-turn token cost from ~30k (Opus, every dispatch re-reads body + chat.jsonl) to ~3-5k (Haiku, incremental message only) and per-turn latency from ~50s to ~5-10s.
+**v0.5.4'ün persistent-subagent yaklaşımı başarısız oldu** çünkü Claude Code Agent tool'unun SendMessage mekanizması transcript replay yapıyor — her turn body + chat.jsonl yeniden işleniyor, sonuç: ~32k token / ~50s per turn. v0.5.5'in tahmini iyileşmesi (~%50, skill-as-persona) hedefin altında kaldı çünkü skill'in kendi SKILL.md + tool definitions + CLAUDE.md overhead'i kaçınılmaz baseline ekliyor.
 
-### Step 6.1 — First user message: spawn the persistent agent
+**v0.5.6 mimari pivot:** chat loop'u tamamen Claude Code skill / subagent dünyasından çıkar. Bunun yerine `bin/prompt-chat-runner.py` (saf Python, stdlib + PyYAML) şu desene göre çalışır:
 
-Run only when `session.json.chat_simulator_agent_id` is missing or null (i.e. the first user message of this chat session, OR after `/reset` cleared the id).
+1. Python script BİR KEZ spawn edilir (`/prompt-chat-session` skill'inin `exec python3 ...` çağrısı ile).
+2. Script de BİR KEZ `claude --bare-mode-equivalent` subprocess'i spawn eder — `--input-format stream-json --output-format stream-json --include-partial-messages --system-prompt-file <body> --session-id <uuid> --disable-slash-commands --allowedTools "" --permission-mode bypassPermissions`. Subprocess'in cwd'si `/tmp` (neutral) — proje CLAUDE.md'si auto-discover edilmez.
+3. Her user turn için Python script stdin'e tek bir `{"type":"user","message":{...}}` JSON line yazar, stdout'tan event'leri parse eder, `text_delta` event'lerini gerçek zamanlı kullanıcıya yazdırır (TTFT düşer), `result` event'inde dönüş tamamlanır.
+4. Subprocess konuşma boyunca canlı kalır — her turn yeniden spawn etmek YOK, izin prompt'u YOK, body re-read YOK.
 
-```javascript
-Agent({
-  subagent_type: "chat-simulator",
-  prompt: JSON.stringify({
-    inputs: {
-      body:                 "<absolute path to $RUN_DIR/body.txt>",
-      conversation_history: "<absolute path to $RUN_DIR/chat.jsonl>",
-      report_language:      "<string from frontmatter.report_language>"
-    },
-    output_path: "<absolute path to $RUN_DIR/next_turn.txt>"
-  }),
-  description: "persistent chat-simulator for " + BASENAME,
-  model: "<frontmatter.chat_model_alias, default haiku>",  // v0.5.4: chat-time exploration — Haiku default
-  isolation: "worktree",
-  run_in_background: true   // ← critical: keeps the subagent alive for SendMessage
-})
-```
+**Per turn token / latency (gerçek ölçüm, edevletprompt benzeri 5-satır test body'si):**
 
-The Agent tool returns an `agentId`. Persist it into `session.json.chat_simulator_agent_id` immediately (atomic temp + rename — same pattern as other session.json updates), then continue Step 3.2 to wait for the subagent's first response.
+| Metric | v0.5.4 (broken) | v0.5.6 (this) |
+|---|---|---|
+| Turn cost (cache hit) | ~32k | **~3-5k** (input 9 + cache_read body) |
+| Turn latency | ~50s | **~3-5s** (Haiku, streaming output) |
+| Subprocess per turn | New Agent + SendMessage | Same long-lived process |
+| Permission prompts per turn | Var (Bash tool izinleri) | Yok (--permission-mode bypassPermissions) |
+| Body load count | Her turn (transcript replay) | Bir kez (subprocess startup) |
 
-The subagent reads `body.txt` ONCE on first activation, internalises the persona, processes the user turn already appended to `chat.jsonl`, writes the assistant turn to `next_turn.txt`, and stays alive waiting for SendMessage.
+**Skill-level dispatch (Step 3'ten gelen) burada gerçekleşmez.** Skill yalnızca Phase 0 (bootstrap) ve Phase 1 (run mode selection) ile sınırlıdır. "Open new window" mode'u `claude '/prompt-chat-session <run-dir>'` ile yeni Terminal başlatır; o skill de hemen `exec python3 bin/prompt-chat-runner.py <run-dir>` ile Python'a teslim olur. Bu noktadan sonra chat akışı tamamen Python orchestrator'da:
 
-### Step 6.2 — Subsequent user messages: SendMessage
+- **Welcome screen** — Python `_print_welcome()`.
+- **Slash command handling** — Python `_dispatch_slash()`. /save / /history / /reset / /commit / /quit hepsi Python tarafında, file-system mutations + AskUserQuestion benzeri `input()` prompts. Phase 5 / 7 / 8 prose'u bu file'da kalır ama **canonical implementation Python script'tir**; bu spec metni Python kodunun davranışını dokümante eder.
+- **Non-slash user turn** — Python `_SubprocessCtx.send()` claude subprocess'ine JSON line yazar, text_delta event'lerini streaming ile stdout'a yazdırır, result event'i geldiğinde reply'ı chat.jsonl'a atomic append eder, session.turns incrementer.
 
-Run when `session.json.chat_simulator_agent_id` is set (turns 2+).
+### What this changes for downstream phases
 
-```javascript
-SendMessage({
-  to: "<session.chat_simulator_agent_id>",
-  message: JSON.stringify({
-    user_input: "<the user's latest message, verbatim>",
-    output_path: "<absolute path to $RUN_DIR/next_turn.txt>"
-  })
-})
-```
+- **session.json schema:** `chat_simulator_agent_id` field'ı kaldırıldı. Yerine `chat_session_uuid` — claude CLI subprocess'inin --session-id ile başlattığı conversation'ın id'si. Phase 0 bootstrap bu field'ı null olarak yazar; Python script ilk turn'de UUID üretir + persist eder; /reset onu yeni UUID ile değiştirir (eski subprocess kill edilir, fresh subprocess spawn olur).
+- **`agents/chat-simulator.md` deprecated.** Artık çağrılmıyor. Header note ile v0.5.6 deprecation işaretlendi; v0.6.0'da file silinecek.
+- **`/prompt-test` ve `drift-runner` etkilenmedi.** Drift simulation yine target_model (Opus) ile çalışır — chat exploration ile regression simulation farklı modeller, farklı runtime'lar.
 
-The subagent already has the body + prior conversation in its context window — it processes only the new user_input, produces the next assistant turn, writes it to `next_turn.txt`. No re-reading of state files.
+### Failure modes for Phase 6 runtime
 
-After SendMessage returns, the skill reads `next_turn.txt` (same pattern as Step 3.2) and appends to `chat.jsonl`.
+Python orchestrator handles these (see bin/prompt-chat-runner.py docstring + RuntimeError paths):
 
-### Step 6.3 — `/reset` invalidates the agent
-
-When the user runs `/reset` (Phase 4), in addition to moving chat.jsonl aside:
-
-1. If `session.json.chat_simulator_agent_id` is set, send a final SendMessage to inform the subagent of the reset (it will then halt or be replaced). Alternatively, use TaskStop to terminate gracefully — implementation choice.
-2. Clear `session.json.chat_simulator_agent_id` (set to null).
-3. The next user message after /reset triggers Step 6.1 again — fresh agent, fresh body load.
-
-### Why this works
-
-- **body.txt is read once.** The 40 KB body is loaded into the subagent's context on first activation. Provider-side prompt caching (Anthropic's `cache_control: {type: "ephemeral"}` directive, see `agents/chat-simulator.md`) makes even THAT one read efficient if the same body is reused across multiple chat sessions within the cache TTL window.
-- **conversation_history grows in subagent memory.** The subagent appends each new user/assistant pair to its own conversation context as turns arrive via SendMessage. The skill's chat.jsonl on disk is the durable audit log; the subagent's in-memory conversation is the active working set. The two are kept in sync but neither is reloaded from disk per turn.
-- **Haiku is sufficient for persona play.** Chat-simulator's job is to read body, internalise persona, produce next turn. This is not a reasoning task — it's a structured roleplay task. Haiku 4.5 handles it with no measurable quality difference vs Opus 4.7 in informal testing. The `chat_model` override exists for the rare case where persona fidelity matters more than turn latency / cost.
-- **Drift simulation is unaffected.** `/prompt-test`'s drift-runner Step 2 still uses `target_model` (default Opus) and dispatches a FRESH simulator per scenario — that's where production-mode fidelity matters. Chat is exploration; drift is regression.
-
-### Failure modes
-
-- **SendMessage returns "agent not found":** the subagent was reaped (Claude Code may garbage-collect long-idle background agents). Fall back to Step 6.1 — spawn a new agent with the existing chat.jsonl as conversation_history. The new agent picks up where the old one left off.
-- **Subagent writes empty next_turn.txt:** treat as Step 3.2's existing failure path — surface the error to the user, do NOT append an empty assistant turn to chat.jsonl, prompt user to try again or /quit.
-- **Concurrent SendMessage** (shouldn't happen since the skill is single-threaded per chat session, but defensively): the second send queues behind the first. SendMessage is FIFO.
-```
-
-`N` is the upcoming assistant turn number (= `session.json.turns + 1`).
-
-The subagent reads `body.txt` as the simulated system prompt, reads `chat.jsonl` as conversation history (the last `role: user` entry is the turn to answer), produces the next assistant turn, and writes it to `next_turn.txt` as plain text.
-
-Wait for the subagent to return. Then continue Step 3.2 (read `next_turn.txt`, append to chat.jsonl).
-
-If the subagent reports an error (its status line starts with `chat-simulator error:`), surface the error to the user and skip the chat.jsonl assistant append:
-
-```
-[Bot şu an cevap üretemedi: <error reason>. Devam etmek için tekrar yaz veya /quit yaz.]
-```
+- **claude subprocess dies mid-chat** — Python catches the broken pipe / non-zero exit, prints `[chat error: ...]` to stderr, REPL loop continues. User can /quit and re-spawn.
+- **subprocess timeout** (>180s per turn) — Python aborts that turn with timeout error; user can re-send.
+- **stream-json parse error** on a line — silently skipped (defensive); only `type:"result"` events are required for turn completion.
+- **/reset mid-chat** — old subprocess closed gracefully, new one spawned with fresh session_uuid. Single-turn latency spike (body re-load) but persona is clean.
 
 ## Phase 7 — Frontmatter commit (`/commit`)
 

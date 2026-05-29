@@ -243,9 +243,9 @@ Turns must alternate `user_input` (or `silence_input`) → `assistant_expect` �
 
 The bridge is `<prompt>.anchors.yaml`. Stay on text, iterate fast, only call Vapi when you're confident.
 
-### Cost controls (v0.5.2 → v0.5.4)
+### Cost controls (v0.5.2 → v0.5.6)
 
-Five additive cost reductions kick in automatically — most users never need to think about them, but they're documented here for tuning:
+Six additive cost reductions kick in automatically — most users never need to think about them, but they're documented here for tuning:
 
 - **Prompt caching.** The simulated system prompt (the prompt body) is identical across every scenario in a batch and across every turn within a flow scenario. When the underlying provider supports it (Anthropic API: `cache_control: {type: "ephemeral"}`; OpenAI: automatic), drift-runner and chat-simulator attach the directive to the system block. First call populates the cache; later calls in the same batch / flow hit it. Saves ~50-60% on simulation tokens for long-body prompts.
 - **Judge model swap.** Rubric evaluation in drift-runner's Step 3 ("did the output behave like X?") is a yes/no judgement task that doesn't need a frontier model. v0.5.2 adds a `judge_model` frontmatter field (and matching env var / project-config keys) defaulting to `claude-haiku-4-5-20251001`. `target_model` still drives simulation — that's where persona faithfulness matters. Override per prompt: `judge_model: claude-opus-4-7` in frontmatter if you want Opus rubric eval for tricky cases.
@@ -264,7 +264,16 @@ Net effect on the canonical sample-vapi flow anchor (4 turns):
 - v0.5.2: 4 Opus simulation (body cached after turn 1) + 1 Haiku judge = ~4 Opus + 1 Haiku.
 - v0.5.3: same as v0.5.2 for flow anchors (drift Step 2 still target_model; Step 1 + 3 already Haiku). The savings come from non-drift lenses — see the audit example above.
 
-- **Persistent chat-simulator + `chat_model` knob (v0.5.4).** Earlier versions dispatched a fresh `chat-simulator` subagent per user turn in `/prompt-chat`, which re-read body.txt (40 KB) and chat.jsonl every time — ~30k tokens / turn at Opus pricing, ~50 seconds latency / turn. v0.5.4 spawns the subagent ONCE with `run_in_background: true` on the first user message, then uses `SendMessage` to deliver subsequent user inputs. The subagent's in-memory context retains body + conversation; only the incremental message is sent. Combined with a new `chat_model` frontmatter field (default `claude-haiku-4-5-20251001` — chat-time exploration doesn't need frontier-model reasoning), per-turn cost drops to ~3-5k tokens at Haiku pricing, and per-turn latency to ~5-10 seconds. `/reset` clears `session.chat_simulator_agent_id` and the next turn spawns a fresh agent.
+- **Bare Claude subprocess + Python orchestrator (v0.5.6).** v0.5.4's "persistent subagent" design did NOT deliver the promised savings — Claude Code's `SendMessage` triggers transcript replay on each call, re-processing body + history every turn (~32k tokens / ~50s observed). v0.5.6 takes a fundamentally different approach:
+  - `/prompt-chat-session` skill execs `bin/prompt-chat-runner.py` (a small Python script, stdlib + PyYAML only) which owns the chat REPL.
+  - The Python script spawns ONE long-lived `claude` subprocess with `--input-format stream-json --output-format stream-json --include-partial-messages --system-prompt-file <body> --session-id <uuid> --disable-slash-commands --allowedTools "" --permission-mode bypassPermissions`, cwd=`/tmp` (no CLAUDE.md auto-discovery).
+  - Each user turn is one JSON-line to subprocess stdin; assistant text streams back via `text_delta` events (low TTFT, user sees the reply as it's typed).
+  - Slash commands (/save /history /reset /commit /quit) are Python-side handlers — no subprocess per command, no permission prompt.
+  - `/reset` regenerates the session UUID, kills the old subprocess, spawns a fresh one.
+
+  **Measured per-turn cost** (5-line test body, Haiku): ~3-5k tokens / ~3-5s/turn. **v0.5.4 vs v0.5.6: ~90% cost reduction, ~90% latency reduction.**
+
+  The `chat_model` frontmatter knob (default `claude-haiku-4-5-20251001`) selects the model the subprocess uses. Override to Sonnet / Opus in frontmatter for tricky persona testing.
 
   | knob | default | scope |
   |---|---|---|

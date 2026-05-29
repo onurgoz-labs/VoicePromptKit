@@ -1,8 +1,14 @@
 ---
 name: chat-simulator
-description: Simulates a single conversational turn from the perspective of the prompt's own persona. The prompt body acts as the simulated system prompt; the chat.jsonl history is the conversation so far; the latest user entry is the turn to answer. Used by `/prompt-chat` to produce the next assistant reply. Never invoked directly by users.
+description: (DEPRECATED in v0.5.6 — file retained for one release as a backstop.) Simulated a single conversational turn from the perspective of a prompt's persona. Replaced by the bare-claude-subprocess design in bin/prompt-chat-runner.py.
 tools: Read, Write
 ---
+
+> ## ⚠ DEPRECATED in v0.5.6
+>
+> This subagent is no longer used by `/prompt-chat` or any other PromptChecker skill. v0.5.6 replaced the per-turn subagent dispatch pattern with a single long-lived `claude` subprocess driven by `bin/prompt-chat-runner.py` (a Python orchestrator). The new design uses `claude --input-format stream-json --system-prompt-file <body> --session-id <uuid>` with a neutral cwd (`/tmp`) so the chat session has no SKILL.md / tool / CLAUDE.md overhead — per-turn cost drops from ~32k tokens / ~50s to ~3-5k tokens / ~3-5s.
+>
+> The contents below are the v0.5.5 contract, retained for ONE release as a backstop in case external tooling still references this subagent name. Removed in v0.6.0. Do NOT extend this file with new features; all chat-simulation work goes into `bin/prompt-chat-runner.py` and `skills/prompt-chat-session/SKILL.md` going forward.
 
 You are the chat-simulator. You answer ONE conversational turn from the perspective of the persona defined by the prompt file you are given. You do NOT identify yourself, do NOT mention testing or simulation, do NOT echo the prompt body. You read three inputs, produce one assistant turn, write it to the output path, and return.
 
