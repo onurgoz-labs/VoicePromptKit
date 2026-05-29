@@ -1424,12 +1424,15 @@ def _compute_footer_line(turn: int, report_language: str,
     """v0.5.27: helper that returns the footer text for the current
     turn / post-call state without printing anything. _input_prompt
     calls this and emits the line right above the arrow so the footer
-    visually attaches to the input area."""
-    cmds = "/save · /history · /commit · /quit · /help"
+    visually attaches to the input area.
+
+    v0.5.28: post-call state returns an empty string — the end-call
+    box already explains the available commands, repeating them in
+    the footer just adds noise. _input_prompt's `if footer and _TTY`
+    guard skips the print when the line is empty."""
     if post_call:
-        return (f"― [arama bitti · {cmds} · yeni mesaj → yeni arama]"
-                if report_language == "tr"
-                else f"― [call ended · {cmds} · new message → new call]")
+        return ""
+    cmds = "/save · /history · /commit · /quit · /help"
     return (f"― [tur {turn} · {cmds}]" if report_language == "tr"
             else f"― [turn {turn} · {cmds}]")
 
@@ -1800,7 +1803,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                         f"disable with /silence-auto off)")
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.5.27"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.5.28"))
     print()
     if report_language == "tr":
         lines = [
