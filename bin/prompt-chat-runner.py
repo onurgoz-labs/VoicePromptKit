@@ -1360,10 +1360,17 @@ def _render_bot_reply(text: str, persona_name: str | None) -> None:
     """v0.5.19: delegate to the shared one-liner renderer. Persona name
     defaults to 'Bot' when the opening reply hasn't supplied
     [PERSONA_NAME] yet (rare — only happens if the model omits the
-    metadata line on its first turn)."""
+    metadata line on its first turn).
+
+    v0.5.29: emit a trailing blank line so the footer / input arrow
+    that comes next has visual breathing room. Without this the bot
+    reply sat flush against the user echo of the previous turn,
+    making the conversation look cramped."""
     speaker = persona_name if persona_name else "Bot"
     ts = datetime.datetime.now().strftime("%H:%M")
     _render_message(speaker, ts, text, is_user=False)
+    if _TTY:
+        print()
 
 
 # v0.5.13: terminal width / height probe + pinned bottom footer.
@@ -1803,7 +1810,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                         f"disable with /silence-auto off)")
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.5.28"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.5.29"))
     print()
     if report_language == "tr":
         lines = [
