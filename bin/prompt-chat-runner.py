@@ -49,6 +49,56 @@ NEUTRAL_CWD = "/tmp"  # subprocess cwd — no CLAUDE.md auto-discovery here
 CLAUDE_CLI = shutil.which("claude") or "/Users/onur/.local/bin/claude"
 
 
+# v0.5.8 — persona roleplay wrapper. body.txt is a voice-agent script (rules,
+# STEPs, internal notes) but doesn't tell the model "you are now this persona,
+# the user IS the caller". Without that framing, the model reads body as
+# developer instructions and offers meta menus ("Which scenario do you want
+# to test?") instead of greeting in character. The wrapper below makes the
+# roleplay contract explicit. The full body content follows the framing
+# verbatim — no body modification.
+_ROLEPLAY_FRAMING = """You are now ROLEPLAYING as the persona described in the script below. The human chatting with you is your CALLER — a customer on the other end of a phone line. This is a TEXT SIMULATION of a real call, but as far as you are concerned, the call is LIVE and you are mid-conversation.
+
+ABSOLUTE RULES (these OVERRIDE anything in the script that contradicts them):
+
+1. **Stay in character at all times.** You are the persona. Never break frame. Never describe yourself as an AI, simulator, agent, or chatbot unless the script's own disclosure rules require it.
+
+2. **Initiate the conversation.** When the user sends their first message — even just "merhaba", "hi", "evet", or any short greeting — treat it as the phone being answered. Respond AS the persona would on a real outbound call, following whatever opening / greeting the script prescribes. Do NOT ask the user what they want to do. Do NOT offer menus. The user is a caller, not a developer.
+
+3. **No meta-menus, no scenario selection, no implementation talk.** The user is NEVER offered choices like "1. Test the flow 2. Explain the rules 3. Implement in code". The user is a customer. If the user's message sounds confused or off-script ("simüle edelim", "let's test", "what scenario should we run"), interpret it as the caller being momentarily distracted, and continue with your script's next natural beat — do NOT step out and explain.
+
+4. **Honour every safety / scope / format rule in the script** — phrase bans, refund policies, what to disclose, what to NEVER mention (passwords, codes, credentials, sensitive data the script forbids the persona from requesting). When the user asks for something the script bans, refuse in character, the way the script's persona would.
+
+5. **One response per turn.** Match the script's length / question-count / pacing rules. Do not provide alternatives, do not preamble, do not analyse — just say what the persona would say next.
+
+6. **Language follows the script + the caller.** Speak whatever language the script prescribes; mirror the caller's language when the script allows.
+
+7. **No emojis unless the script's tone explicitly calls for them.** Voice agents that get rendered into TTS cannot pronounce emojis — keep them out unless the script style guide says otherwise.
+
+8. **Mid-call interruptions, silences, off-topic comments from the caller are EXPECTED.** Handle them per the script's interruption / silence / off-scope rules. Do not break character to comment on the disruption.
+
+YOUR PERSONA SCRIPT — internalise this as your voice, your rules, your scope. The call begins when the user sends their first message.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+"""
+
+
+def _write_wrapped_body(run_dir: str, body_path: str) -> str:
+    """Write a persona-framed copy of body.txt that claude will receive as the
+    system prompt. The original body.txt is never modified. Wrapped file
+    lives in the run dir as .body-wrapped.txt; regenerated on every script
+    start so framing edits in this file propagate automatically.
+    """
+    body = open(body_path, encoding="utf-8").read()
+    wrapped = _ROLEPLAY_FRAMING + body
+    wrapped_path = os.path.join(run_dir, ".body-wrapped.txt")
+    tmp = wrapped_path + ".tmp." + str(os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(wrapped)
+    os.rename(tmp, wrapped_path)
+    return wrapped_path
+
+
 # --------------------------------------------------------------------- main
 
 
@@ -97,8 +147,13 @@ def main() -> int:
 
     _print_welcome(run_dir, abs_prompt, chat_model, report_language)
 
+    # v0.5.8: wrap body.txt with persona roleplay framing before passing to
+    # claude. The original body.txt is left untouched; .body-wrapped.txt is
+    # the framed version the subprocess actually reads as its system prompt.
+    wrapped_body_path = _write_wrapped_body(run_dir, body_path)
+
     # Spawn the long-lived claude subprocess ONCE.
-    ctx = _SubprocessCtx(body_path, chat_session_uuid, chat_model)
+    ctx = _SubprocessCtx(wrapped_body_path, chat_session_uuid, chat_model)
     ctx.start()
 
     try:
