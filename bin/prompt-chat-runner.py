@@ -36,6 +36,7 @@ import datetime
 import io
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -43,6 +44,23 @@ import sys
 import threading
 import uuid
 from queue import Empty, Queue
+
+
+# v0.5.9 — random Turkish caller name pool for filling [MÜŞTERİ_ADI] /
+# [MÜŞTERİ_SOYADI] placeholders that voice-agent scripts inherit from
+# Vapi's caller variables. In production Vapi fills these from the
+# dialled number's CRM record; in our simulator we synthesise a plausible
+# name so the bot doesn't have to ask the user.
+_TR_FIRST_NAMES = [
+    "Ahmet", "Mehmet", "Mustafa", "Ali", "Hüseyin", "Hasan", "İbrahim",
+    "Ayşe", "Fatma", "Emine", "Hatice", "Zeynep", "Elif", "Merve",
+    "Onur", "Burak", "Emre", "Can", "Selin", "Deniz", "Ece",
+]
+_TR_LAST_NAMES = [
+    "Yılmaz", "Kaya", "Demir", "Şahin", "Çelik", "Yıldız", "Yıldırım",
+    "Öztürk", "Aydın", "Özdemir", "Arslan", "Doğan", "Kılıç", "Aslan",
+    "Çetin", "Kara", "Koç", "Kurt", "Özkan", "Şimşek",
+]
 
 
 NEUTRAL_CWD = "/tmp"  # subprocess cwd — no CLAUDE.md auto-discovery here
@@ -74,9 +92,15 @@ ABSOLUTE RULES (these OVERRIDE anything in the script that contradicts them):
 
 7. **No emojis unless the script's tone explicitly calls for them.** Voice agents that get rendered into TTS cannot pronounce emojis — keep them out unless the script style guide says otherwise.
 
-8. **Mid-call interruptions, silences, off-topic comments from the caller are EXPECTED.** Handle them per the script's interruption / silence / off-scope rules. Do not break character to comment on the disruption.
+8. **Mid-call interruptions, silences, off-topic comments from the caller are EXPECTED.** Handle them per the script's interruption / silence / off-scope rules. Do not break character to comment on the disruption. When you receive a user message that matches `[silence for N seconds]` (case-insensitive), treat it as the caller saying NOTHING for N seconds — apply your script's silence policy (gentle confirmation prompt, escalation after K silences, etc.), do not respond as if "silence for 6 seconds" were spoken text.
 
-YOUR PERSONA SCRIPT — internalise this as your voice, your rules, your scope. The call begins when the user sends their first message.
+9. **Internal call-state triggers.** Messages wrapped in `[SYSTEM: ...]` are NOT from the caller — they are internal call infrastructure events from the test harness. Process them silently and respond per the cue:
+   - `[SYSTEM: call connected — caller is <Name Surname>]` — the phone just rang and the caller picked up. Deliver your script's opening greeting NOW, in character. Use the caller's name where your script asks for `[MÜŞTERİ_ADI]` / `[MÜŞTERİ_SOYADI]` / `<caller_name>` or similar placeholders. Do NOT ask the user for their name — you ALREADY have it. Do NOT echo the bracketed system text in your reply.
+   - Any other `[SYSTEM: ...]` message — apply the literal cue (e.g. "caller hung up", "transfer completed") and continue.
+
+10. **Caller variable placeholders in the script.** When your script contains tokens like `[MÜŞTERİ_ADI]`, `[MÜŞTERİ_SOYADI]`, `<customer_name>`, `{{caller_name}}`, etc., fill them with the caller name supplied by the `[SYSTEM: call connected]` cue. If no name was provided OR your script needs other personal data (date of birth, phone number, account ID) that wasn't supplied, INVENT plausible Turkish defaults — do not ask the user to provide them. Production Vapi fills these from CRM; you are simulating that.
+
+YOUR PERSONA SCRIPT — internalise this as your voice, your rules, your scope. The call begins when you receive the `[SYSTEM: call connected — caller is ...]` cue (this happens automatically right after this prompt loads).
 
 ═══════════════════════════════════════════════════════════════════════════════
 
@@ -145,7 +169,17 @@ def main() -> int:
         print(msg, file=sys.stderr)
         return 2
 
-    _print_welcome(run_dir, abs_prompt, chat_model, report_language)
+    # v0.5.9: pick a random Turkish caller identity for this chat session.
+    # Persisted in session.json so /reset keeps the same caller (until they
+    # explicitly re-roll via a future command) — fills [MÜŞTERİ_ADI] etc.
+    if not session.get("caller_name"):
+        first = random.choice(_TR_FIRST_NAMES)
+        last = random.choice(_TR_LAST_NAMES)
+        session["caller_name"] = f"{first} {last}"
+        _atomic_write_json(session_path, session)
+    caller_name = session["caller_name"]
+
+    _print_welcome(run_dir, abs_prompt, chat_model, report_language, caller_name)
 
     # v0.5.8: wrap body.txt with persona roleplay framing before passing to
     # claude. The original body.txt is left untouched; .body-wrapped.txt is
@@ -155,6 +189,28 @@ def main() -> int:
     # Spawn the long-lived claude subprocess ONCE.
     ctx = _SubprocessCtx(wrapped_body_path, chat_session_uuid, chat_model)
     ctx.start()
+
+    # v0.5.9: bot greets FIRST. After welcome, send a [SYSTEM: call connected]
+    # trigger so the persona delivers its opening line before we hand the
+    # terminal to the user — matching production Vapi behaviour where the
+    # bot speaks first when the call connects.
+    if session.get("turns", 0) == 0:
+        try:
+            print()  # blank line before the opening
+            opening = ctx.send(
+                f"[SYSTEM: call connected — caller is {caller_name}]",
+                stream_to=sys.stdout,
+            )
+            _append_chat_entry(chat_jsonl_path, "assistant", opening)
+            session["turns"] = 1
+            _atomic_write_json(session_path, session)
+            cmds = "/save | /history | /commit | /quit"
+            if report_language == "tr":
+                print(f"\n― [tur 1 · {cmds}]\n")
+            else:
+                print(f"\n― [turn 1 · {cmds}]\n")
+        except RuntimeError as e:
+            print(f"\n[chat error during opening: {e}]\n", file=sys.stderr)
 
     try:
         return _repl(ctx, run_dir, body_path, session_path, chat_jsonl_path,
@@ -370,13 +426,17 @@ def _dispatch_slash(user_input: str, run_dir: str, session_path: str,
                     chat_jsonl_path: str, staged_path: str, abs_prompt: str,
                     report_language: str, session: dict,
                     ctx: "_SubprocessCtx") -> bool:
-    cmd = user_input.lstrip("/").strip().split(None, 1)[0].lower()
+    parts = user_input.lstrip("/").strip().split(None, 1)
+    cmd = parts[0].lower() if parts else ""
+    arg = parts[1].strip() if len(parts) > 1 else ""
     if cmd == "save":
         _handle_save(chat_jsonl_path, staged_path, report_language, session_path, session)
     elif cmd == "history":
         _handle_history(chat_jsonl_path, report_language)
     elif cmd == "reset":
         _handle_reset(run_dir, chat_jsonl_path, session_path, session, report_language, ctx)
+    elif cmd == "silence":
+        _handle_silence(arg, ctx, chat_jsonl_path, session_path, session, report_language)
     elif cmd == "commit":
         _handle_commit(abs_prompt, staged_path, session_path, session, report_language)
     elif cmd == "quit":
@@ -384,11 +444,48 @@ def _dispatch_slash(user_input: str, run_dir: str, session_path: str,
                       abs_prompt, report_language, "user_quit", session)
         return True
     else:
-        msg = (f"Unknown command: /{cmd}. Available: /save /history /reset /commit /quit"
+        msg = (f"Unknown command: /{cmd}. Available: /save /history /reset /silence /commit /quit"
                if report_language == "en"
-               else f"Bilinmeyen komut: /{cmd}. Mevcut: /save /history /reset /commit /quit")
+               else f"Bilinmeyen komut: /{cmd}. Mevcut: /save /history /reset /silence /commit /quit")
         print(msg)
     return False
+
+
+def _handle_silence(arg: str, ctx: "_SubprocessCtx", chat_jsonl_path: str,
+                    session_path: str, session: dict, report_language: str) -> None:
+    """v0.5.9: simulate N seconds of caller silence as a user turn.
+
+    Sends the opaque-string convention `[silence for N seconds]` (the same
+    pattern drift-runner uses when expanding silence_input sugar) to the
+    bare subprocess. Framing rule 8 tells the persona how to react.
+    """
+    try:
+        duration = int(arg)
+        if duration <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        msg = ("usage: /silence <positive integer>"
+               if report_language == "en"
+               else "kullanım: /silence <pozitif tamsayı>")
+        print(msg)
+        return
+
+    silence_msg = f"[silence for {duration} seconds]"
+    _append_chat_entry(chat_jsonl_path, "user", silence_msg)
+    print()  # blank line before streamed reply
+    try:
+        reply = ctx.send(silence_msg, stream_to=sys.stdout)
+    except RuntimeError as e:
+        print(f"\n[chat error: {e}]\n", file=sys.stderr)
+        return
+    _append_chat_entry(chat_jsonl_path, "assistant", reply)
+    session["turns"] = session.get("turns", 0) + 1
+    _atomic_write_json(session_path, session)
+    cmds = "/save | /history | /commit | /quit"
+    if report_language == "tr":
+        print(f"\n― [tur {session['turns']} · {cmds}]\n")
+    else:
+        print(f"\n― [turn {session['turns']} · {cmds}]\n")
 
 
 def _handle_save(chat_jsonl_path: str, staged_path: str, report_language: str,
@@ -489,6 +586,10 @@ def _handle_reset(run_dir: str, chat_jsonl_path: str, session_path: str,
     open(chat_jsonl_path, "w").close()
     session["turns"] = 0
     session["chat_session_uuid"] = str(uuid.uuid4())
+    # v0.5.9: re-roll caller name on reset so the fresh persona meets a fresh caller.
+    first = random.choice(_TR_FIRST_NAMES)
+    last = random.choice(_TR_LAST_NAMES)
+    session["caller_name"] = f"{first} {last}"
     _atomic_write_json(session_path, session)
 
     # Tear down old claude subprocess and spawn a fresh one with the new session id.
@@ -496,9 +597,27 @@ def _handle_reset(run_dir: str, chat_jsonl_path: str, session_path: str,
     ctx.session_uuid = session["chat_session_uuid"]
     ctx.start()
 
-    msg = (f"Sıfırlandı. Geçmiş arşivlendi: {os.path.basename(archive)}. Yeni mesaj fresh persona ile başlar."
+    # Send the call-connected trigger for the new caller; bot greets first.
+    print()
+    try:
+        opening = ctx.send(
+            f"[SYSTEM: call connected — caller is {session['caller_name']}]",
+            stream_to=sys.stdout,
+        )
+        _append_chat_entry(chat_jsonl_path, "assistant", opening)
+        session["turns"] = 1
+        _atomic_write_json(session_path, session)
+        cmds = "/save | /history | /commit | /quit"
+        if report_language == "tr":
+            print(f"\n― [tur 1 · {cmds}]\n")
+        else:
+            print(f"\n― [turn 1 · {cmds}]\n")
+    except RuntimeError as e:
+        print(f"\n[chat error during reset opening: {e}]\n", file=sys.stderr)
+
+    msg = (f"Sıfırlandı. Geçmiş arşivlendi: {os.path.basename(archive)}. Yeni arayan: {session['caller_name']}."
            if report_language == "tr"
-           else f"Reset. History archived to {os.path.basename(archive)}. Next message starts a fresh persona.")
+           else f"Reset. History archived to {os.path.basename(archive)}. New caller: {session['caller_name']}.")
     print(msg)
 
 
@@ -602,31 +721,35 @@ def _exit_cleanly(run_dir: str, session_path: str, chat_jsonl_path: str,
 
 
 def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
-                   report_language: str) -> None:
+                   report_language: str, caller_name: str) -> None:
     basename = os.path.basename(abs_prompt).rsplit(".", 1)[0]
     line_count = sum(1 for _ in open(os.path.join(run_dir, "body.txt"), encoding="utf-8"))
     if report_language == "tr":
         print(f"\n/prompt-chat başlatıldı.")
         print(f"Prompt: {basename} ({line_count} satır, model: {chat_model})")
-        print("İzolasyon: yeni pencere — bare Claude session (v0.5.6)\n")
-        print("Yaz, ben prompt'a göre cevap vereyim.\n")
+        print(f"Test arayan kişi: {caller_name}")
+        print("İzolasyon: yeni pencere — bare Claude session (v0.5.9)\n")
+        print("Bot birazdan kendisi selamlayacak — sen aramayı cevaplamış oluyorsun.\n")
         print("Komutlar:")
-        print("  /save     — son turu anchor olarak kaydet (staging)")
-        print("  /history  — bu oturumdaki turları göster")
-        print("  /reset    — geçmişi sil, baştan başla")
-        print(f"  /commit   — staged anchor'ları sidecar'a ({basename}.md.anchors.yaml) yaz")
-        print("  /quit     — çıkış + final summary\n")
+        print("  /save        — son turu anchor olarak kaydet (staging)")
+        print("  /history     — bu oturumdaki turları göster")
+        print("  /reset       — geçmişi sil, baştan başla")
+        print("  /silence <N> — N saniye sessizlik simüle et (örn. /silence 6)")
+        print(f"  /commit      — staged anchor'ları sidecar'a ({basename}.md.anchors.yaml) yaz")
+        print("  /quit        — çıkış + final summary\n")
     else:
         print(f"\n/prompt-chat started.")
         print(f"Prompt: {basename} ({line_count} lines, model: {chat_model})")
-        print("Isolation: new window — bare Claude session (v0.5.6)\n")
-        print("Type your message; I'll reply as the prompt's persona.\n")
+        print(f"Test caller: {caller_name}")
+        print("Isolation: new window — bare Claude session (v0.5.9)\n")
+        print("The bot will greet you first — you're the caller answering the phone.\n")
         print("Commands:")
-        print("  /save     — capture last turn as a test anchor (staging)")
-        print("  /history  — show this session's turns")
-        print("  /reset    — discard history, start over")
-        print(f"  /commit   — write staged anchors to sidecar ({basename}.md.anchors.yaml)")
-        print("  /quit     — exit with a final summary\n")
+        print("  /save        — capture last turn as a test anchor (staging)")
+        print("  /history     — show this session's turns")
+        print("  /reset       — discard history, start over")
+        print("  /silence <N> — simulate N seconds of caller silence (e.g. /silence 6)")
+        print(f"  /commit      — write staged anchors to sidecar ({basename}.md.anchors.yaml)")
+        print("  /quit        — exit with a final summary\n")
 
 
 def _read_chat_jsonl(path: str) -> list:
