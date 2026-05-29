@@ -243,9 +243,9 @@ Turns must alternate `user_input` (or `silence_input`) → `assistant_expect` �
 
 The bridge is `<prompt>.anchors.yaml`. Stay on text, iterate fast, only call Vapi when you're confident.
 
-### Cost controls (v0.5.2 + v0.5.3)
+### Cost controls (v0.5.2 → v0.5.4)
 
-Four additive cost reductions kick in automatically — most users never need to think about them, but they're documented here for tuning:
+Five additive cost reductions kick in automatically — most users never need to think about them, but they're documented here for tuning:
 
 - **Prompt caching.** The simulated system prompt (the prompt body) is identical across every scenario in a batch and across every turn within a flow scenario. When the underlying provider supports it (Anthropic API: `cache_control: {type: "ephemeral"}`; OpenAI: automatic), drift-runner and chat-simulator attach the directive to the system block. First call populates the cache; later calls in the same batch / flow hit it. Saves ~50-60% on simulation tokens for long-body prompts.
 - **Judge model swap.** Rubric evaluation in drift-runner's Step 3 ("did the output behave like X?") is a yes/no judgement task that doesn't need a frontier model. v0.5.2 adds a `judge_model` frontmatter field (and matching env var / project-config keys) defaulting to `claude-haiku-4-5-20251001`. `target_model` still drives simulation — that's where persona faithfulness matters. Override per prompt: `judge_model: claude-opus-4-7` in frontmatter if you want Opus rubric eval for tricky cases.
@@ -263,6 +263,15 @@ Net effect on the canonical sample-vapi flow anchor (4 turns):
 - v0.5.1: 4 Opus simulation + 4 Opus judge = 8 Opus calls per anchor.
 - v0.5.2: 4 Opus simulation (body cached after turn 1) + 1 Haiku judge = ~4 Opus + 1 Haiku.
 - v0.5.3: same as v0.5.2 for flow anchors (drift Step 2 still target_model; Step 1 + 3 already Haiku). The savings come from non-drift lenses — see the audit example above.
+
+- **Persistent chat-simulator + `chat_model` knob (v0.5.4).** Earlier versions dispatched a fresh `chat-simulator` subagent per user turn in `/prompt-chat`, which re-read body.txt (40 KB) and chat.jsonl every time — ~30k tokens / turn at Opus pricing, ~50 seconds latency / turn. v0.5.4 spawns the subagent ONCE with `run_in_background: true` on the first user message, then uses `SendMessage` to deliver subsequent user inputs. The subagent's in-memory context retains body + conversation; only the incremental message is sent. Combined with a new `chat_model` frontmatter field (default `claude-haiku-4-5-20251001` — chat-time exploration doesn't need frontier-model reasoning), per-turn cost drops to ~3-5k tokens at Haiku pricing, and per-turn latency to ~5-10 seconds. `/reset` clears `session.chat_simulator_agent_id` and the next turn spawns a fresh agent.
+
+  | knob | default | scope |
+  |---|---|---|
+  | `target_model` | `claude-opus-4-7` | drift Step 2 simulation (regression — production fidelity) |
+  | `worker_model` | `claude-haiku-4-5-20251001` | static-lens × 4, tr-phonetic, drift Step 1 + 3 |
+  | `judge_model` | `claude-haiku-4-5-20251001` | drift Step 3 rubric eval (separately tunable, cross-provider OK) |
+  | `chat_model` | `claude-haiku-4-5-20251001` | chat-simulator persona dispatches (exploration — fast + cheap) |
 
 ## Output layout
 

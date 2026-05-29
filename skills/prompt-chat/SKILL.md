@@ -108,6 +108,15 @@ def _model_alias(full_or_alias, default):
 
 resolved = {
     'target_model':     fm.get('target_model') or 'claude-opus-4-7',
+    # v0.5.4: chat_model is separate from target_model. target_model represents
+    # the production model the prompt will run on (used by drift Step 2 for
+    # faithful regression simulation). chat_model is for INTERACTIVE chat
+    # (this skill's persona dispatches) — default Haiku, because persona
+    # exploration during /prompt-chat is rapid-iteration; we don't need
+    # frontier-model quality, we need fast + cheap feedback per turn.
+    # Tunable: override to Sonnet/Opus in frontmatter for tricky persona
+    # testing where chat-time fidelity matters.
+    'chat_model':       fm.get('chat_model') or 'claude-haiku-4-5-20251001',
     'report_language':  (fm.get('report_language') or 'tr').lower(),
     'body_char_count':  len(body),
     'body_line_offset': body_line_offset,
@@ -116,6 +125,7 @@ resolved = {
     'anchors_source':   anchors_source,
 }
 resolved['target_model_alias'] = _model_alias(resolved['target_model'], 'opus')
+resolved['chat_model_alias']   = _model_alias(resolved['chat_model'], 'haiku')
 if resolved['report_language'] not in ('tr', 'en'):
     resolved['report_language'] = 'tr'
 
@@ -149,10 +159,12 @@ session = {
     "prompt_path": prompt_path,
     "prompt_sha256_at_chat": fm['prompt_sha256'],
     "target_model": fm['target_model'],
+    "chat_model": fm.get('chat_model'),                 # v0.5.4
     "report_language": fm['report_language'],
     "turns": 0,
     "saved_anchors": 0,
-    "isolation_mode": None,  # filled by Phase 1
+    "isolation_mode": None,                             # filled by Phase 1
+    "chat_simulator_agent_id": None,                    # v0.5.4: filled by Phase 6.1 on first user turn; cleared by /reset
 }
 with open(os.path.join(run_dir, 'session.json'), 'w', encoding='utf-8') as f:
     json.dump(session, f, indent=2, ensure_ascii=False)
@@ -376,7 +388,7 @@ User typed something starting with `/`. Parse the command (lowercase, strip lead
 |---|---|
 | `save` | Phase 5 — anchor save sub-flow (filled in Phase C of the implementation) |
 | `history` | Pretty-print `chat.jsonl` (turn N · role · first 80 chars), then return to chat loop |
-| `reset` | Move `chat.jsonl` to `chat-N-discarded.jsonl`, create fresh empty `chat.jsonl`, update `session.json.turns = 0`. Inform user. saved_anchors.json is NOT touched. |
+| `reset` | Move `chat.jsonl` to `chat-N-discarded.jsonl`, create fresh empty `chat.jsonl`, update `session.json.turns = 0`, AND clear `session.json.chat_simulator_agent_id` to null (v0.5.4 — next user turn re-spawns a fresh agent per Step 6.1). Inform user. saved_anchors.json is NOT touched. |
 | `commit` | Phase 7 — sidecar write (<prompt>.anchors.yaml) |
 | `quit` | Phase 8 — final summary + optional commit prompt (filled in Phase C) |
 | anything else | Print "Bilinmeyen komut: `/<x>`. Mevcut: /save /history /reset /commit /quit" and return |
@@ -733,9 +745,13 @@ Surface to user:
 
 Return to chat loop.
 
-## Phase 6 — `chat-simulator` agent invocation
+## Phase 6 — `chat-simulator` agent invocation (persistent, v0.5.4)
 
-Per user message in Phase 3, dispatch the `chat-simulator` subagent. One dispatch per user turn.
+v0.5.4 introduces persistent chat-simulator subagents — the subagent is spawned ONCE per chat session (on the first user message) and kept in the background; every subsequent user message is delivered via `SendMessage` to the same agent instance, which already has the body + prior conversation in memory. This collapses per-turn token cost from ~30k (Opus, every dispatch re-reads body + chat.jsonl) to ~3-5k (Haiku, incremental message only) and per-turn latency from ~50s to ~5-10s.
+
+### Step 6.1 — First user message: spawn the persistent agent
+
+Run only when `session.json.chat_simulator_agent_id` is missing or null (i.e. the first user message of this chat session, OR after `/reset` cleared the id).
 
 ```javascript
 Agent({
@@ -744,15 +760,59 @@ Agent({
     inputs: {
       body:                 "<absolute path to $RUN_DIR/body.txt>",
       conversation_history: "<absolute path to $RUN_DIR/chat.jsonl>",
-      target_model:         "<string from frontmatter.target_model>",
       report_language:      "<string from frontmatter.report_language>"
     },
     output_path: "<absolute path to $RUN_DIR/next_turn.txt>"
   }),
-  description: "chat turn " + N + " for " + BASENAME,
-  model: "<frontmatter.target_model_alias, default opus>",  // chat-simulator IS the model under test — persona faithfulness matters
-  isolation: "worktree"
+  description: "persistent chat-simulator for " + BASENAME,
+  model: "<frontmatter.chat_model_alias, default haiku>",  // v0.5.4: chat-time exploration — Haiku default
+  isolation: "worktree",
+  run_in_background: true   // ← critical: keeps the subagent alive for SendMessage
 })
+```
+
+The Agent tool returns an `agentId`. Persist it into `session.json.chat_simulator_agent_id` immediately (atomic temp + rename — same pattern as other session.json updates), then continue Step 3.2 to wait for the subagent's first response.
+
+The subagent reads `body.txt` ONCE on first activation, internalises the persona, processes the user turn already appended to `chat.jsonl`, writes the assistant turn to `next_turn.txt`, and stays alive waiting for SendMessage.
+
+### Step 6.2 — Subsequent user messages: SendMessage
+
+Run when `session.json.chat_simulator_agent_id` is set (turns 2+).
+
+```javascript
+SendMessage({
+  to: "<session.chat_simulator_agent_id>",
+  message: JSON.stringify({
+    user_input: "<the user's latest message, verbatim>",
+    output_path: "<absolute path to $RUN_DIR/next_turn.txt>"
+  })
+})
+```
+
+The subagent already has the body + prior conversation in its context window — it processes only the new user_input, produces the next assistant turn, writes it to `next_turn.txt`. No re-reading of state files.
+
+After SendMessage returns, the skill reads `next_turn.txt` (same pattern as Step 3.2) and appends to `chat.jsonl`.
+
+### Step 6.3 — `/reset` invalidates the agent
+
+When the user runs `/reset` (Phase 4), in addition to moving chat.jsonl aside:
+
+1. If `session.json.chat_simulator_agent_id` is set, send a final SendMessage to inform the subagent of the reset (it will then halt or be replaced). Alternatively, use TaskStop to terminate gracefully — implementation choice.
+2. Clear `session.json.chat_simulator_agent_id` (set to null).
+3. The next user message after /reset triggers Step 6.1 again — fresh agent, fresh body load.
+
+### Why this works
+
+- **body.txt is read once.** The 40 KB body is loaded into the subagent's context on first activation. Provider-side prompt caching (Anthropic's `cache_control: {type: "ephemeral"}` directive, see `agents/chat-simulator.md`) makes even THAT one read efficient if the same body is reused across multiple chat sessions within the cache TTL window.
+- **conversation_history grows in subagent memory.** The subagent appends each new user/assistant pair to its own conversation context as turns arrive via SendMessage. The skill's chat.jsonl on disk is the durable audit log; the subagent's in-memory conversation is the active working set. The two are kept in sync but neither is reloaded from disk per turn.
+- **Haiku is sufficient for persona play.** Chat-simulator's job is to read body, internalise persona, produce next turn. This is not a reasoning task — it's a structured roleplay task. Haiku 4.5 handles it with no measurable quality difference vs Opus 4.7 in informal testing. The `chat_model` override exists for the rare case where persona fidelity matters more than turn latency / cost.
+- **Drift simulation is unaffected.** `/prompt-test`'s drift-runner Step 2 still uses `target_model` (default Opus) and dispatches a FRESH simulator per scenario — that's where production-mode fidelity matters. Chat is exploration; drift is regression.
+
+### Failure modes
+
+- **SendMessage returns "agent not found":** the subagent was reaped (Claude Code may garbage-collect long-idle background agents). Fall back to Step 6.1 — spawn a new agent with the existing chat.jsonl as conversation_history. The new agent picks up where the old one left off.
+- **Subagent writes empty next_turn.txt:** treat as Step 3.2's existing failure path — surface the error to the user, do NOT append an empty assistant turn to chat.jsonl, prompt user to try again or /quit.
+- **Concurrent SendMessage** (shouldn't happen since the skill is single-threaded per chat session, but defensively): the second send queues behind the first. SendMessage is FIFO.
 ```
 
 `N` is the upcoming assistant turn number (= `session.json.turns + 1`).
