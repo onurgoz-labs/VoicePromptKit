@@ -1322,47 +1322,31 @@ def _term_size() -> tuple[int, int]:
 
 
 def _init_pin() -> None:
-    """Reserve the last terminal row for the footer; subsequent output
-    scrolls within rows 1..rows-1 only.
+    """v0.5.21: pinned footer disabled.
 
-    v0.5.19 (post-feedback): no longer parks the cursor at row rows-1
-    after setting DECSTBM. The old `\\033[{rows-1};1H` jump created an
-    ~10-line blank gap between the welcome banner and the bot's opening
-    line, since the banner sat at the top of the terminal and the
-    cursor leapt to the bottom. Leaving the cursor where it was (just
-    below the welcome banner) makes output flow naturally — the scroll
-    region still keeps the footer pinned on the last row.
+    v0.5.13 introduced DECSTBM (`\\033[1;{rows-1}r`) to reserve the last
+    terminal row for the footer. The trade-offs accumulated:
+      • DECSTBM moves the cursor to the scroll-region origin as a side
+        effect (xterm / Mac Terminal spec) — overwriting the welcome
+        banner or producing a ~10-line blank gap depending on which
+        compensating cursor jump we applied.
+      • The pinned footer's save/restore-cursor sequence collided with
+        the spinner's inline paint (v0.5.17 bug — bot replies rendered
+        blank), forcing further patches.
+      • Behaviour varied across emulators (Terminal.app, iTerm, tmux,
+        gnome-terminal), making the feature fragile.
+
+    v0.5.21 drops the pin entirely. _render_footer's existing non-TTY
+    fallback (inline `\\n footer \\n` per turn) is now the only path. A
+    little more scroll noise per turn, but the UI is deterministic and
+    no terminal mode tricks remain.
     """
-    global _PIN_ACTIVE
-    if not _TTY or _PIN_ACTIVE:
-        return
-    _cols, rows = _term_size()
-    if rows < 4:
-        return  # too small to bother
-    with _STDOUT_LOCK:
-        # Set DECSTBM scrolling region only; cursor stays where the
-        # caller left it.
-        sys.stdout.write(f"\033[1;{rows - 1}r")
-        sys.stdout.flush()
-    _PIN_ACTIVE = True
+    return
 
 
 def _release_pin() -> None:
-    """Restore the default scroll region (full screen) on exit."""
-    global _PIN_ACTIVE
-    if not _TTY or not _PIN_ACTIVE:
-        return
-    _cols, rows = _term_size()
-    with _STDOUT_LOCK:
-        # Clear the pinned footer row.
-        sys.stdout.write(f"\033[{rows};1H\033[2K")
-        # Reset scroll region to full screen.
-        sys.stdout.write(f"\033[1;{rows}r")
-        # Move cursor to bottom and emit a newline so the shell prompt
-        # appears below our last line of output.
-        sys.stdout.write(f"\033[{rows};1H\n")
-        sys.stdout.flush()
-    _PIN_ACTIVE = False
+    """v0.5.21: paired with _init_pin no-op — nothing to release."""
+    return
 
 
 def _render_footer(turn: int, report_language: str,
@@ -1725,7 +1709,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                         f"(toggle: /silence-auto)")
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.5.20"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.5.21"))
     print()
     if report_language == "tr":
         lines = [
