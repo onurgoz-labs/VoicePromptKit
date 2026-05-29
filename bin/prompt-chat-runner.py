@@ -1725,7 +1725,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                         f"(toggle: /silence-auto)")
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.5.19"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.5.20"))
     print()
     if report_language == "tr":
         lines = [
