@@ -66,6 +66,13 @@ _TR_LAST_NAMES = [
 NEUTRAL_CWD = "/tmp"  # subprocess cwd — no CLAUDE.md auto-discovery here
 CLAUDE_CLI = shutil.which("claude") or "/Users/onur/.local/bin/claude"
 
+# v0.5.9 — text-based stand-in for production Vapi's `end-call-tool`. The bare
+# claude subprocess has no tools available (--allowedTools ""), so when the
+# persona's script says "end the call now", the persona instead emits this
+# marker on its own line as the tail of its final reply. Python detects it,
+# strips it from the user-facing text, and auto-exits the REPL.
+END_CALL_MARKER = "<<END_CALL>>"
+
 
 # v0.5.8 — persona roleplay wrapper. body.txt is a voice-agent script (rules,
 # STEPs, internal notes) but doesn't tell the model "you are now this persona,
@@ -99,6 +106,12 @@ ABSOLUTE RULES (these OVERRIDE anything in the script that contradicts them):
    - Any other `[SYSTEM: ...]` message — apply the literal cue (e.g. "caller hung up", "transfer completed") and continue.
 
 10. **Caller variable placeholders in the script.** When your script contains tokens like `[MÜŞTERİ_ADI]`, `[MÜŞTERİ_SOYADI]`, `<customer_name>`, `{{caller_name}}`, etc., fill them with the caller name supplied by the `[SYSTEM: call connected]` cue. If no name was provided OR your script needs other personal data (date of birth, phone number, account ID) that wasn't supplied, INVENT plausible Turkish defaults — do not ask the user to provide them. Production Vapi fills these from CRM; you are simulating that.
+
+11. **Ending the call — text-based end-call marker.** Production Vapi gives you an `end-call-tool` you can invoke to hang up. In this simulator that tool does not exist; instead, when your script's logic says "end the call now" (call closure, customer hangs up, transfer to human completed, callback scheduled, refusal final, etc.), do this:
+   - Deliver your final closing line in character (as you normally would right before invoking end-call-tool).
+   - Then on a NEW LINE by itself, write exactly: `<<END_CALL>>`
+   - That is the entire reply: your closing line + a newline + `<<END_CALL>>`. Nothing after the marker, no explanation.
+   The harness watches for this marker, strips it before displaying your reply to the user, and closes the chat session automatically (equivalent to running /quit). DO NOT use the marker in non-ending replies — false positives hang up the call prematurely. ONLY at the point your script would have called end-call-tool.
 
 YOUR PERSONA SCRIPT — internalise this as your voice, your rules, your scope. The call begins when you receive the `[SYSTEM: call connected — caller is ...]` cue (this happens automatically right after this prompt loads).
 
@@ -197,10 +210,11 @@ def main() -> int:
     if session.get("turns", 0) == 0:
         try:
             print()  # blank line before the opening
-            opening = ctx.send(
+            opening_raw = ctx.send(
                 f"[SYSTEM: call connected — caller is {caller_name}]",
                 stream_to=sys.stdout,
             )
+            opening, opening_ended = _strip_end_call_marker(opening_raw)
             _append_chat_entry(chat_jsonl_path, "assistant", opening)
             session["turns"] = 1
             _atomic_write_json(session_path, session)
@@ -209,6 +223,12 @@ def main() -> int:
                 print(f"\n― [tur 1 · {cmds}]\n")
             else:
                 print(f"\n― [turn 1 · {cmds}]\n")
+            if opening_ended:
+                # Persona ended the call on the opening (rare — refused to take
+                # the call, e.g. the script's "wrong number / decline" branch).
+                _exit_cleanly(run_dir, session_path, chat_jsonl_path, staged_path,
+                              abs_prompt, report_language, "end_call_marker", session)
+                return 0
         except RuntimeError as e:
             print(f"\n[chat error during opening: {e}]\n", file=sys.stderr)
 
@@ -217,6 +237,20 @@ def main() -> int:
                     staged_path, abs_prompt, report_language, session)
     finally:
         ctx.close()
+
+
+def _strip_end_call_marker(reply: str) -> tuple[str, bool]:
+    """Returns (clean_reply, end_call_signalled).
+
+    v0.5.9: the persona writes `<<END_CALL>>` (on its own line, at the tail
+    of the reply) when its script would have invoked end-call-tool. Strip
+    the marker so it doesn't appear in chat.jsonl or in the user-facing
+    reply (the streaming output may flash it briefly — acceptable for MVP).
+    """
+    if END_CALL_MARKER not in reply:
+        return reply, False
+    cleaned = reply.replace(END_CALL_MARKER, "").rstrip()
+    return cleaned, True
 
 
 # ------------------------------------------------------- subprocess context
@@ -403,11 +437,12 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
         _append_chat_entry(chat_jsonl_path, "user", user_input)
         print()  # blank line before the streaming reply
         try:
-            reply = ctx.send(user_input, stream_to=sys.stdout)
+            reply_raw = ctx.send(user_input, stream_to=sys.stdout)
         except RuntimeError as e:
             print(f"\n[chat error: {e}]\n", file=sys.stderr)
             continue
 
+        reply, ended = _strip_end_call_marker(reply_raw)
         _append_chat_entry(chat_jsonl_path, "assistant", reply)
         session["turns"] = session.get("turns", 0) + 1
         _atomic_write_json(session_path, session)
@@ -417,6 +452,19 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
             print(f"\n― [tur {session['turns']} · {cmds}]\n")
         else:
             print(f"\n― [turn {session['turns']} · {cmds}]\n")
+
+        if ended:
+            # v0.5.9: persona signalled end-of-call via <<END_CALL>>. Treat
+            # as auto-quit — print a short banner so the user knows why we're
+            # closing, then run the normal exit path (with the staged-anchor
+            # commit prompt if any).
+            banner = ("Persona aramayı kapattı (end-call-tool eşdeğeri)."
+                      if report_language == "tr"
+                      else "Persona ended the call (end-call-tool equivalent).")
+            print(f"\n[{banner}]\n")
+            _exit_cleanly(run_dir, session_path, chat_jsonl_path, staged_path,
+                          abs_prompt, report_language, "end_call_marker", session)
+            return 0
 
 
 # ---------------------------------------------------------- slash commands
@@ -474,10 +522,11 @@ def _handle_silence(arg: str, ctx: "_SubprocessCtx", chat_jsonl_path: str,
     _append_chat_entry(chat_jsonl_path, "user", silence_msg)
     print()  # blank line before streamed reply
     try:
-        reply = ctx.send(silence_msg, stream_to=sys.stdout)
+        reply_raw = ctx.send(silence_msg, stream_to=sys.stdout)
     except RuntimeError as e:
         print(f"\n[chat error: {e}]\n", file=sys.stderr)
         return
+    reply, ended = _strip_end_call_marker(reply_raw)
     _append_chat_entry(chat_jsonl_path, "assistant", reply)
     session["turns"] = session.get("turns", 0) + 1
     _atomic_write_json(session_path, session)
@@ -486,6 +535,16 @@ def _handle_silence(arg: str, ctx: "_SubprocessCtx", chat_jsonl_path: str,
         print(f"\n― [tur {session['turns']} · {cmds}]\n")
     else:
         print(f"\n― [turn {session['turns']} · {cmds}]\n")
+    if ended:
+        # Silence policy escalated to hangup — persona dropped the call.
+        # Note: _handle_silence is called from _dispatch_slash which doesn't
+        # propagate an exit code; setting a flag on session signals the REPL
+        # to exit on the next iteration. Simpler: just raise SystemExit here.
+        banner = ("Persona aramayı kapattı (sessizlik politikası — end-call eşdeğeri)."
+                  if report_language == "tr"
+                  else "Persona ended the call (silence policy → end-call equivalent).")
+        print(f"\n[{banner}]\n")
+        raise SystemExit(0)
 
 
 def _handle_save(chat_jsonl_path: str, staged_path: str, report_language: str,
