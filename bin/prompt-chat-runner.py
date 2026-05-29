@@ -136,10 +136,27 @@ ABSOLUTE RULES (these OVERRIDE anything in the script that contradicts them):
 
 10. **Caller variable placeholders in the script.** When your script contains tokens like `[MÜŞTERİ_ADI]`, `[MÜŞTERİ_SOYADI]`, `<customer_name>`, `{{caller_name}}`, etc., fill them with the caller name supplied by the `[SYSTEM: call connected]` cue. If no name was provided OR your script needs other personal data (date of birth, phone number, account ID) that wasn't supplied, INVENT plausible Turkish defaults — do not ask the user to provide them. Production Vapi fills these from CRM; you are simulating that.
 
-11. **Ending the call — text-based end-call marker.** Production Vapi gives you an `end-call-tool` you can invoke to hang up. In this simulator that tool does not exist; instead, when your script's logic says "end the call now" (call closure, customer hangs up, transfer to human completed, callback scheduled, refusal final, etc.), do this:
-   - Deliver your final closing line in character (as you normally would right before invoking end-call-tool).
-   - Then on a NEW LINE by itself, write exactly: `<<END_CALL>>`
-   - That is the entire reply: your closing line + a newline + `<<END_CALL>>`. Nothing after the marker, no explanation.
+11. **Ending the call — text-based end-call marker (MANDATORY on closing lines).** Production Vapi gives you an `end-call-tool` you can invoke to hang up. In this simulator that tool does not exist; instead, the contract is:
+
+   **WHENEVER your reply contains a closing phrase** (e.g. "Hoşça kalın", "İyi günler", "Görüşürüz", "Aramamıza son veriyorum", "Goodbye", "Have a good day", "Thanks for calling, bye" — any farewell that signals the call is OVER, regardless of why: customer rescheduled, customer refused, customer completed the flow, customer hung up, transfer completed, etc.) — you MUST append the marker.
+
+   Format (strict):
+   - Your normal closing line (one sentence, in character).
+   - A blank line OR newline.
+   - The marker, exactly: `<<END_CALL>>`
+   - Nothing after the marker. No explanation. No additional pleasantries.
+
+   Example correct:
+   ```
+   Anladım. Sizi uygun bir zamanda tekrar arayacağız. Hoşça kalın.
+
+   <<END_CALL>>
+   ```
+
+   **This is NOT optional.** If you write a closing phrase WITHOUT the marker, the chat session stays open and the user has to manually exit — that is a bug, not a graceful end. Production Vapi would have called end-call-tool here; in this simulator the marker is the equivalent. Forgetting it = forgetting to hang up.
+
+   The only time you do NOT emit the marker is when your reply is a mid-conversation turn that does NOT end the call (asking the user a question, providing information, etc.). If you're saying any form of "goodbye", emit the marker.
+
    The harness watches for this marker, strips it before displaying your reply to the user, and closes the chat session automatically (equivalent to running /quit). DO NOT use the marker in non-ending replies — false positives hang up the call prematurely. ONLY at the point your script would have called end-call-tool.
 
 12. **Persona-name metadata on your VERY FIRST reply.** On your opening turn (the response to `[SYSTEM: call connected — caller is ...]`) — and ONLY then — prefix your reply with a metadata line in this exact format:
@@ -285,18 +302,48 @@ def main() -> int:
         ctx.close()
 
 
+# v0.5.12: closing phrase heuristic backup for end-call detection.
+# The model SHOULD emit <<END_CALL>> per framing rule 11, but in long
+# conversations it occasionally forgets the marker after a closing line.
+# This regex catches the most common goodbye phrases in TR + EN and
+# treats the call as ended even when the marker is absent. False
+# positives are unlikely — these phrases rarely appear mid-conversation.
+_CLOSING_PHRASES_RE = re.compile(
+    r"\b("
+    r"ho[şs]ça?\s*kal(?:[ıi]n|abil|maca|ar)?"      # hoşça kal(ın), hoşçakal, etc.
+    r"|iyi\s+g[üu]nler"                             # iyi günler
+    r"|iyi\s+ak[şs]amlar"                           # iyi akşamlar
+    r"|g[öo]r[üu][şs][üu]r[üu]z"                    # görüşürüz
+    r"|kendinize\s+iyi\s+bak"                       # kendinize iyi bakın
+    r"|g[üu]le\s+g[üu]le"                           # güle güle
+    r"|teşekk[üu]rler[, ]+iyi\s+g[üu]nler"           # teşekkürler, iyi günler
+    r"|aramam[ıi]za\s+son\s+veriyor"                # aramamıza son veriyorum
+    r"|goodbye"
+    r"|have\s+a\s+(?:good|nice|great)\s+(?:day|evening|night)"
+    r"|talk\s+to\s+you\s+(?:soon|later)"
+    r"|thanks?\s+for\s+calling"
+    r"|bye[\.\s!]"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def _strip_end_call_marker(reply: str) -> tuple[str, bool]:
     """Returns (clean_reply, end_call_signalled).
 
-    v0.5.9: the persona writes `<<END_CALL>>` (on its own line, at the tail
-    of the reply) when its script would have invoked end-call-tool. Strip
-    the marker so it doesn't appear in chat.jsonl or in the user-facing
-    reply (the streaming output may flash it briefly — acceptable for MVP).
+    Detection has two paths:
+    1. Explicit marker `<<END_CALL>>` (per framing rule 11) — strict, primary.
+    2. v0.5.12 heuristic: closing phrase regex on the reply text — backup
+       for when the model forgets the marker after a closing line.
+
+    Strip the marker (if any) and return whether the call should end.
     """
-    if END_CALL_MARKER not in reply:
-        return reply, False
-    cleaned = reply.replace(END_CALL_MARKER, "").rstrip()
-    return cleaned, True
+    if END_CALL_MARKER in reply:
+        cleaned = reply.replace(END_CALL_MARKER, "").rstrip()
+        return cleaned, True
+    if _CLOSING_PHRASES_RE.search(reply):
+        return reply.rstrip(), True
+    return reply, False
 
 
 # v0.5.11: persona-name metadata regex. Bot writes `[PERSONA_NAME: X]` as the
