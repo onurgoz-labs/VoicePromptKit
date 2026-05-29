@@ -76,14 +76,63 @@ if sys.platform != "win32":
 else:
     _IDLE_TIMEOUT_OK = False
 
-# v0.5.14: seconds of inactivity before auto-firing a silence event.
-# v0.5.22: default back to enabled at 30s — long enough that a thinking
-# user isn't ambushed (the 10s default in v0.5.14-v0.5.18 was too
-# tight), short enough to actually exercise the script's silence
-# policy in a normal session. `/silence-auto off` disables it; manual
-# `/silence <N>` works regardless of the auto setting.
-_DEFAULT_IDLE_SILENCE_SECS = 30
+# v0.5.24: silence threshold is now sourced from the prompt itself, not
+# a hard-coded default — _detect_silence_threshold reads (1) the
+# frontmatter's `idle_silence_secs` / `silence_threshold_secs` field if
+# the author set one, (2) the body's `1st silence (≥N sec)` pattern via
+# regex, (3) returns 0 (auto-silence off) when nothing is found.
+#
+# _SILENCE_ON_DEFAULT_SECS stays as a fallback for `/silence-auto on`
+# when the user wants to enable auto-silence interactively and the
+# prompt didn't declare a threshold.
 _SILENCE_ON_DEFAULT_SECS = 30
+
+
+# Regex for the common voice-agent script pattern:
+#   "1st silence (≥15 sec)" / "1st silence (>=15 sec)" / "first silence (≥15s)"
+# Anchored on the "1st" or "first" word + "silence" + an opening paren
+# containing a ≥/>= comparison against a number. Case-insensitive.
+_SILENCE_BODY_RE = re.compile(
+    r"(?:1st|first|ilk)[\s\-_]*silence[^(\n]*\(\s*[≥>]=?\s*(\d+)\s*(?:sec|second|seconds|sn|s)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_silence_threshold(fm: dict, body_path: str) -> tuple[int, str]:
+    """Return (threshold_seconds, source) where source indicates where the
+    value came from.
+
+    Resolution order:
+      1. Frontmatter `idle_silence_secs` (preferred) or
+         `silence_threshold_secs` (alias) — explicit author intent.
+      2. Regex scan of body.txt for "1st silence (≥N sec)" — common
+         voice-agent script pattern.
+      3. Fallback (0, "none"): auto-silence stays disabled, user can
+         enable it manually via `/silence-auto on`.
+
+    `source` is one of {"frontmatter", "body", "none"}.
+    """
+    for key in ("idle_silence_secs", "silence_threshold_secs"):
+        val = fm.get(key)
+        if isinstance(val, int) and val > 0:
+            return val, "frontmatter"
+        if isinstance(val, str) and val.strip().isdigit():
+            n = int(val.strip())
+            if n > 0:
+                return n, "frontmatter"
+    try:
+        body = open(body_path, encoding="utf-8").read()
+    except OSError:
+        return 0, "none"
+    m = _SILENCE_BODY_RE.search(body)
+    if m:
+        try:
+            secs = int(m.group(1))
+            if secs > 0:
+                return secs, "body"
+        except (ValueError, TypeError):
+            pass
+    return 0, "none"
 
 # v0.5.11: ANSI escape sequences for color. Stdlib-only (no rich/colorama).
 # We only emit these when stdout is a real TTY — piping to a file would
@@ -351,6 +400,16 @@ def main() -> int:
             datetime.timezone.utc).isoformat()
         _atomic_write_json(session_path, session)
 
+    # v0.5.24: detect the auto-silence threshold from the prompt itself
+    # rather than a hard-coded default. Frontmatter > body regex > 0.
+    # Persisted with a source label so /silence-auto can mark its
+    # changes as "user" and the welcome banner can show provenance.
+    if "idle_silence_secs" not in session:
+        secs, source = _detect_silence_threshold(fm, body_path)
+        session["idle_silence_secs"] = secs
+        session["idle_silence_source"] = source
+        _atomic_write_json(session_path, session)
+
     if not (os.path.exists(CLAUDE_CLI) or shutil.which("claude")):
         msg = ("error: 'claude' CLI not found on PATH. Install Claude Code first."
                if report_language == "en"
@@ -368,7 +427,8 @@ def main() -> int:
         _atomic_write_json(session_path, session)
     caller_name = session["caller_name"]
 
-    _print_welcome(run_dir, abs_prompt, chat_model, report_language, caller_name)
+    _print_welcome(run_dir, abs_prompt, chat_model, report_language,
+                   caller_name, session)
 
     # v0.5.13: pin a status footer to the bottom terminal row via ANSI
     # scroll region. Conversation scrolls within rows 1..rows-1; the
@@ -665,9 +725,9 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
     # keeps the user's preference. 0 / negative disables. Unix-only —
     # _read_with_idle_timeout transparently falls back to blocking
     # input() on Windows or non-TTY streams.
-    if "idle_silence_secs" not in session:
-        session["idle_silence_secs"] = _DEFAULT_IDLE_SILENCE_SECS
-        _atomic_write_json(session_path, session)
+    # v0.5.24: the threshold is now set up-front in main() via
+    # _detect_silence_threshold (reads frontmatter / body) instead of
+    # being defaulted here.
 
     # v0.5.19: post-call mode. When the persona ends the call (END_CALL
     # marker or closing-phrase regex) we no longer auto-exit; this flag
@@ -938,6 +998,7 @@ def _handle_silence_auto(arg: str, session_path: str, session: dict,
 
     if arg_l in ("off", "kapat", "kapali", "kapalı", "0"):
         session["idle_silence_secs"] = 0
+        session["idle_silence_source"] = "user"
         _atomic_write_json(session_path, session)
         print("Otomatik sessizlik kapatıldı." if report_language == "tr"
               else "Auto-silence disabled.")
@@ -945,6 +1006,7 @@ def _handle_silence_auto(arg: str, session_path: str, session: dict,
 
     if arg_l in ("on", "ac", "aç", "open"):
         session["idle_silence_secs"] = _SILENCE_ON_DEFAULT_SECS
+        session["idle_silence_source"] = "user"
         _atomic_write_json(session_path, session)
         msg = (f"Otomatik sessizlik açıldı · eşik: {_SILENCE_ON_DEFAULT_SECS} sn."
                if report_language == "tr"
@@ -964,6 +1026,7 @@ def _handle_silence_auto(arg: str, session_path: str, session: dict,
         return
 
     session["idle_silence_secs"] = n
+    session["idle_silence_source"] = "user"
     _atomic_write_json(session_path, session)
     if n == 0:
         print("Otomatik sessizlik kapatıldı." if report_language == "tr"
@@ -1719,28 +1782,45 @@ def _send_with_spinner(ctx: "_SubprocessCtx", msg: str,
 
 
 def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
-                   report_language: str, caller_name: str) -> None:
+                   report_language: str, caller_name: str,
+                   session: dict) -> None:
     """v0.5.19: replaced the legacy three-bar layout with a single boxed
     frame so the welcome reads as one card. Same information density —
     prompt name + line count, caller, isolation mode, idle-silence hint,
     command crib — but visually cohesive with the end-call banner and
-    final summary card that share the same _render_box helper."""
+    final summary card that share the same _render_box helper.
+
+    v0.5.24: idle-silence hint shows the threshold AND its source so
+    the user can see whether the value came from the prompt itself or
+    a manual /silence-auto override."""
     basename = os.path.basename(abs_prompt).rsplit(".", 1)[0]
     line_count = sum(1 for _ in open(os.path.join(run_dir, "body.txt"), encoding="utf-8"))
+    idle_secs = int(session.get("idle_silence_secs", 0) or 0)
+    idle_source = session.get("idle_silence_source", "none")
     if not _IDLE_TIMEOUT_OK:
         idle_hint_tr = "Otomatik sessizlik: bu platformda kapalı (manuel /silence <N>)."
         idle_hint_en = "Auto-silence: disabled on this platform (use manual /silence <N>)."
-    elif _DEFAULT_IDLE_SILENCE_SECS <= 0:
-        idle_hint_tr = "Otomatik sessizlik: kapalı (açmak için /silence-auto on)."
-        idle_hint_en = "Auto-silence: off (enable with /silence-auto on)."
+    elif idle_secs <= 0:
+        idle_hint_tr = ("Otomatik sessizlik: kapalı (prompt'ta eşik bulunamadı · "
+                        "açmak için /silence-auto on)")
+        idle_hint_en = ("Auto-silence: off (no threshold in prompt · "
+                        "enable with /silence-auto on)")
     else:
-        idle_hint_tr = (f"Otomatik sessizlik: {_DEFAULT_IDLE_SILENCE_SECS} sn boş bekle → silence "
-                        f"(değiştir: /silence-auto)")
-        idle_hint_en = (f"Auto-silence: {_DEFAULT_IDLE_SILENCE_SECS}s idle → silence event "
-                        f"(toggle: /silence-auto)")
+        src_label_tr = {
+            "frontmatter": "frontmatter'dan",
+            "body": "prompt body'sinden algılandı",
+            "user": "manuel ayar",
+        }.get(idle_source, "")
+        src_label_en = {
+            "frontmatter": "from frontmatter",
+            "body": "detected from prompt body",
+            "user": "manual override",
+        }.get(idle_source, "")
+        idle_hint_tr = f"Otomatik sessizlik: {idle_secs} sn ({src_label_tr})"
+        idle_hint_en = f"Auto-silence: {idle_secs}s ({src_label_en})"
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.5.23"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.5.24"))
     print()
     if report_language == "tr":
         lines = [
