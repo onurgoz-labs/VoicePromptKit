@@ -74,10 +74,15 @@ if sys.platform != "win32":
 else:
     _IDLE_TIMEOUT_OK = False
 
-# v0.5.14: default seconds of inactivity before auto-firing a silence
-# event. Long enough that the tester can think; short enough to actually
-# exercise the script's silence policy.
-_DEFAULT_IDLE_SILENCE_SECS = 10
+# v0.5.14: seconds of inactivity before auto-firing a silence event.
+# v0.5.19 (post-feedback): default is 0 (disabled). The previous 10s
+# threshold ambushed users who were still composing a reply, and the
+# silence event sometimes wedged the cooked/cbreak terminal mode
+# transition. Auto-silence is now opt-in via `/silence-auto on` —
+# turning it on uses _SILENCE_ON_DEFAULT_SECS (30s, a comfortable
+# think-time floor). Manual `/silence <N>` still works regardless.
+_DEFAULT_IDLE_SILENCE_SECS = 0
+_SILENCE_ON_DEFAULT_SECS = 30
 
 # v0.5.11: ANSI escape sequences for color. Stdlib-only (no rich/colorama).
 # We only emit these when stdout is a real TTY — piping to a file would
@@ -809,7 +814,7 @@ def _handle_help(report_language: str) -> None:
         print(f"  {_c(_COL_USER, '/history')}              — bu oturumdaki turları göster")
         print(f"  {_c(_COL_USER, '/reset')}                — geçmişi sil, baştan başla (fresh persona + arayan)")
         print(f"  {_c(_COL_USER, '/silence <N>')}          — N saniye sessizlik simüle et (manuel)")
-        print(f"  {_c(_COL_USER, '/silence-auto [on|off|N]')} — boş bekleyince otomatik sessizlik (varsayılan {_DEFAULT_IDLE_SILENCE_SECS} sn)")
+        print(f"  {_c(_COL_USER, '/silence-auto [on|off|N]')} — boş bekleyince otomatik sessizlik (kapalı; açıldığında {_SILENCE_ON_DEFAULT_SECS} sn)")
         print(f"  {_c(_COL_USER, '/commit')}               — staged anchor'ları sidecar dosyaya yaz")
         print(f"  {_c(_COL_USER, '/help')}                 — bu listeyi göster")
         print(f"  {_c(_COL_USER, '/quit')}                 — çıkış + final summary")
@@ -821,7 +826,7 @@ def _handle_help(report_language: str) -> None:
         print(f"  {_c(_COL_USER, '/history')}              — show this session's turns")
         print(f"  {_c(_COL_USER, '/reset')}                — discard history, fresh persona + caller")
         print(f"  {_c(_COL_USER, '/silence <N>')}          — simulate N seconds of caller silence (manual)")
-        print(f"  {_c(_COL_USER, '/silence-auto [on|off|N]')} — fire silence after idle (default {_DEFAULT_IDLE_SILENCE_SECS}s)")
+        print(f"  {_c(_COL_USER, '/silence-auto [on|off|N]')} — fire silence after idle (off; when enabled {_SILENCE_ON_DEFAULT_SECS}s)")
         print(f"  {_c(_COL_USER, '/commit')}               — write staged anchors to the sidecar file")
         print(f"  {_c(_COL_USER, '/help')}                 — show this list")
         print(f"  {_c(_COL_USER, '/quit')}                 — exit with a final summary")
@@ -895,10 +900,10 @@ def _handle_silence_auto(arg: str, session_path: str, session: dict,
                         f"Disable: /silence-auto off")
         else:
             msg = (f"Otomatik sessizlik KAPALI. Açmak için: /silence-auto on "
-                   f"(varsayılan {_DEFAULT_IDLE_SILENCE_SECS} sn)"
+                   f"(varsayılan {_SILENCE_ON_DEFAULT_SECS} sn)"
                    if report_language == "tr"
                    else f"Auto-silence OFF. Enable: /silence-auto on "
-                        f"(default {_DEFAULT_IDLE_SILENCE_SECS}s)")
+                        f"(default {_SILENCE_ON_DEFAULT_SECS}s)")
         print(msg)
         return
 
@@ -910,11 +915,11 @@ def _handle_silence_auto(arg: str, session_path: str, session: dict,
         return
 
     if arg_l in ("on", "ac", "aç", "open"):
-        session["idle_silence_secs"] = _DEFAULT_IDLE_SILENCE_SECS
+        session["idle_silence_secs"] = _SILENCE_ON_DEFAULT_SECS
         _atomic_write_json(session_path, session)
-        msg = (f"Otomatik sessizlik açıldı · eşik: {_DEFAULT_IDLE_SILENCE_SECS} sn."
+        msg = (f"Otomatik sessizlik açıldı · eşik: {_SILENCE_ON_DEFAULT_SECS} sn."
                if report_language == "tr"
-               else f"Auto-silence enabled · threshold: {_DEFAULT_IDLE_SILENCE_SECS}s.")
+               else f"Auto-silence enabled · threshold: {_SILENCE_ON_DEFAULT_SECS}s.")
         print(msg)
         return
 
@@ -1318,7 +1323,16 @@ def _term_size() -> tuple[int, int]:
 
 def _init_pin() -> None:
     """Reserve the last terminal row for the footer; subsequent output
-    scrolls within rows 1..rows-1 only."""
+    scrolls within rows 1..rows-1 only.
+
+    v0.5.19 (post-feedback): no longer parks the cursor at row rows-1
+    after setting DECSTBM. The old `\\033[{rows-1};1H` jump created an
+    ~10-line blank gap between the welcome banner and the bot's opening
+    line, since the banner sat at the top of the terminal and the
+    cursor leapt to the bottom. Leaving the cursor where it was (just
+    below the welcome banner) makes output flow naturally — the scroll
+    region still keeps the footer pinned on the last row.
+    """
     global _PIN_ACTIVE
     if not _TTY or _PIN_ACTIVE:
         return
@@ -1326,11 +1340,9 @@ def _init_pin() -> None:
     if rows < 4:
         return  # too small to bother
     with _STDOUT_LOCK:
-        # Set DECSTBM scrolling region: top=1, bottom=rows-1.
+        # Set DECSTBM scrolling region only; cursor stays where the
+        # caller left it.
         sys.stdout.write(f"\033[1;{rows - 1}r")
-        # Park cursor at row rows-1 (top of conversation area) so the
-        # welcome content we just printed isn't overwritten.
-        sys.stdout.write(f"\033[{rows - 1};1H")
         sys.stdout.flush()
     _PIN_ACTIVE = True
 
@@ -1700,14 +1712,17 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
     final summary card that share the same _render_box helper."""
     basename = os.path.basename(abs_prompt).rsplit(".", 1)[0]
     line_count = sum(1 for _ in open(os.path.join(run_dir, "body.txt"), encoding="utf-8"))
-    if _IDLE_TIMEOUT_OK:
+    if not _IDLE_TIMEOUT_OK:
+        idle_hint_tr = "Otomatik sessizlik: bu platformda kapalı (manuel /silence <N>)."
+        idle_hint_en = "Auto-silence: disabled on this platform (use manual /silence <N>)."
+    elif _DEFAULT_IDLE_SILENCE_SECS <= 0:
+        idle_hint_tr = "Otomatik sessizlik: kapalı (açmak için /silence-auto on)."
+        idle_hint_en = "Auto-silence: off (enable with /silence-auto on)."
+    else:
         idle_hint_tr = (f"Otomatik sessizlik: {_DEFAULT_IDLE_SILENCE_SECS} sn boş bekle → silence "
                         f"(değiştir: /silence-auto)")
         idle_hint_en = (f"Auto-silence: {_DEFAULT_IDLE_SILENCE_SECS}s idle → silence event "
                         f"(toggle: /silence-auto)")
-    else:
-        idle_hint_tr = "Otomatik sessizlik: bu platformda kapalı (manuel /silence <N>)."
-        idle_hint_en = "Auto-silence: disabled on this platform (use manual /silence <N>)."
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
              _c(_COL_DIM, " · interactive persona simulator · v0.5.19"))
