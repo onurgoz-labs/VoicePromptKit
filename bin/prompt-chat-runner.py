@@ -98,6 +98,61 @@ _COL_DIM       = "2"         # dim    — secondary text (timestamps, hints)
 _COL_BOLD      = "1"         # bold   — emphasis
 _COL_ERR       = "38;5;196"  # red    — errors
 _COL_SPIN      = "38;5;82"   # green  — thinking spinner (matches bot)
+_COL_ENDCALL   = "38;5;208"  # orange — end-call banner accent (v0.5.19)
+_COL_OK        = "38;5;82"   # green  — summary card accent (v0.5.19)
+
+
+# v0.5.19 — Unicode box-drawing helpers. Used by the welcome banner, the
+# end-call banner, and the final summary card so the chat lifecycle reads
+# as one coherent UI instead of three separately styled prints.
+_BOX_TL, _BOX_TR = "╭", "╮"
+_BOX_BL, _BOX_BR = "╰", "╯"
+_BOX_H,  _BOX_V  = "─", "│"
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _visible_len(text: str) -> int:
+    """Length of text with ANSI escape codes stripped — needed because we
+    embed colored fragments inside box rows and the right border must
+    align with the visible character count, not the byte count."""
+    return len(_ANSI_RE.sub("", text))
+
+
+def _render_box(title: str, lines: list[str], width: int | None = None) -> None:
+    """Print a Unicode-bordered frame around `lines` with `title` in the
+    top edge. ANSI-colored content inside lines is preserved verbatim;
+    padding is computed against the visible width via _visible_len.
+
+    Lines wider than the inner width are truncated with an ellipsis (no
+    wrapping — callers are expected to keep rows short). On non-TTY
+    streams the box still renders since print() emits the box characters
+    as plain UTF-8.
+    """
+    cols = _term_size()[0]
+    width = width if width else min(78, max(40, cols - 2))
+    inner = max(20, width - 2)
+    bar_v = _c(_COL_DIM, _BOX_V)
+
+    if title:
+        title_seg = f" {title} "
+        seg_visible = _visible_len(title_seg)
+        head_fill = max(0, inner - seg_visible - 1)
+        top = (_c(_COL_DIM, _BOX_TL + _BOX_H) + title_seg
+               + _c(_COL_DIM, _BOX_H * head_fill + _BOX_TR))
+    else:
+        top = _c(_COL_DIM, _BOX_TL + _BOX_H * inner + _BOX_TR)
+    bot = _c(_COL_DIM, _BOX_BL + _BOX_H * inner + _BOX_BR)
+
+    print(top)
+    for line in lines:
+        vis = _visible_len(line)
+        if vis > inner - 2:
+            line = line[: inner - 3] + "…"
+            vis = _visible_len(line)
+        pad = " " * max(0, inner - 2 - vis)
+        print(f"{bar_v} {line}{pad} {bar_v}")
+    print(bot)
 
 
 # v0.5.9 — random Turkish caller name pool for filling [MÜŞTERİ_ADI] /
@@ -257,6 +312,16 @@ def main() -> int:
         _atomic_write_json(session_path, session)
     chat_session_uuid = session["chat_session_uuid"]
 
+    # v0.5.19: stamp the session start time the first time this run dir is
+    # opened, so the final summary card can show a wall-clock duration.
+    # /reset (and the post-call auto-restart path) refresh this stamp via
+    # _start_fresh_call, scoping "duration" to the current call rather
+    # than the original Phase 0 creation moment.
+    if not session.get("session_started_at"):
+        session["session_started_at"] = datetime.datetime.now(
+            datetime.timezone.utc).isoformat()
+        _atomic_write_json(session_path, session)
+
     if not (os.path.exists(CLAUDE_CLI) or shutil.which("claude")):
         msg = ("error: 'claude' CLI not found on PATH. Install Claude Code first."
                if report_language == "en"
@@ -296,6 +361,7 @@ def main() -> int:
     # trigger so the persona delivers its opening line before we hand the
     # terminal to the user — matching production Vapi behaviour where the
     # bot speaks first when the call connects.
+    initial_post_call = False
     if session.get("turns", 0) == 0:
         try:
             print()  # blank line before the opening
@@ -320,19 +386,24 @@ def main() -> int:
             session["turns"] = 1
             _atomic_write_json(session_path, session)
             _render_bot_reply(opening_clean, session.get("persona_name"))
-            _render_footer(session["turns"], report_language)
+            _render_footer(session["turns"], report_language,
+                           post_call=opening_ended)
             if opening_ended:
-                # Persona ended the call on the opening (rare — refused to take
-                # the call, e.g. the script's "wrong number / decline" branch).
-                _exit_cleanly(run_dir, session_path, chat_jsonl_path, staged_path,
-                              abs_prompt, report_language, "end_call_marker", session)
-                return 0
+                # v0.5.19: persona refused the call on opening (rare —
+                # "wrong number / decline" branches). Used to auto-exit;
+                # now we drop into post-call mode so the user can still
+                # /save the opening turn or /quit explicitly.
+                _render_end_call_box(report_language)
+                _render_footer(session["turns"], report_language,
+                               post_call=True)
+                initial_post_call = True
         except RuntimeError as e:
             print(_c(_COL_ERR, f"\n[chat error during opening: {e}]\n"), file=sys.stderr)
 
     try:
         return _repl(ctx, run_dir, body_path, session_path, chat_jsonl_path,
-                    staged_path, abs_prompt, report_language, session)
+                    staged_path, abs_prompt, report_language, session,
+                    initial_post_call=initial_post_call)
     finally:
         ctx.close()
         _release_pin()
@@ -553,7 +624,8 @@ def _now_monotonic() -> float:
 
 def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str,
           chat_jsonl_path: str, staged_path: str, abs_prompt: str,
-          report_language: str, session: dict) -> int:
+          report_language: str, session: dict,
+          initial_post_call: bool = False) -> int:
     # v0.5.14: idle-silence threshold. Persisted on session so /reset
     # keeps the user's preference. 0 / negative disables. Unix-only —
     # _read_with_idle_timeout transparently falls back to blocking
@@ -562,9 +634,26 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
         session["idle_silence_secs"] = _DEFAULT_IDLE_SILENCE_SECS
         _atomic_write_json(session_path, session)
 
+    # v0.5.19: post-call mode. When the persona ends the call (END_CALL
+    # marker or closing-phrase regex) we no longer auto-exit; this flag
+    # stays True until either (a) the user types a non-slash message,
+    # which restarts the call with that message as the first user turn,
+    # or (b) the user explicitly /quits / Ctrl-D's out.
+    # `initial_post_call` lets main() seed the loop already in post-call
+    # mode when the persona ends the call on its opening reply.
+    in_post_call = initial_post_call
+
     while True:
-        idle = session.get("idle_silence_secs", 0) or 0
-        idle_arg = idle if idle > 0 and _IDLE_TIMEOUT_OK else None
+        # Idle-silence is meaningless in post-call mode (there's no call
+        # to be silent on). Suppress the timer so an idle user lingering
+        # on the post-call screen isn't ambushed by a silence event aimed
+        # at a persona that already hung up.
+        if in_post_call:
+            idle_arg = None
+        else:
+            idle = session.get("idle_silence_secs", 0) or 0
+            idle_arg = idle if idle > 0 and _IDLE_TIMEOUT_OK else None
+
         try:
             user_input, timed_out = _input_prompt(idle_arg)
         except EOFError:
@@ -582,7 +671,9 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
             # v0.5.14: auto-silence. The user sat idle past the threshold;
             # treat it as the caller staying quiet on the line and let the
             # persona's silence policy decide what to do (gentle prompt,
-            # escalation, eventual hangup).
+            # escalation, eventual hangup). v0.5.19: if the persona ends
+            # the call from a silence event, enter post-call mode instead
+            # of exiting so the user can still /save.
             duration = int(idle_arg or _DEFAULT_IDLE_SILENCE_SECS)
             banner = (f"  (otomatik sessizlik: {duration} sn — boş bekleme)"
                       if report_language == "tr"
@@ -593,14 +684,9 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
                 chat_jsonl_path, session_path, session, report_language,
             )
             if ended:
-                msg = ("Persona aramayı kapattı (sessizlik politikası)."
-                       if report_language == "tr"
-                       else "Persona ended the call (silence policy).")
-                print(_c(_COL_SYS, f"[{msg}]"))
-                print()
-                _exit_cleanly(run_dir, session_path, chat_jsonl_path, staged_path,
-                              abs_prompt, report_language, "end_call_marker", session)
-                return 0
+                _render_end_call_box(report_language)
+                _render_footer(session["turns"], report_language, post_call=True)
+                in_post_call = True
             continue
 
         user_input = (user_input or "").strip()
@@ -608,11 +694,47 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
             continue
 
         if user_input.startswith("/"):
-            should_quit = _dispatch_slash(user_input, run_dir, session_path,
-                                          chat_jsonl_path, staged_path,
-                                          abs_prompt, report_language, session, ctx)
+            # Parse the command name up-front so we can detect /reset
+            # and clear post_call below — /reset starts a fresh call so
+            # the user is no longer "post-call".
+            parts = user_input.lstrip("/").strip().split(None, 1)
+            cmd_word = parts[0].lower() if parts else ""
+
+            should_quit, entered_post_call = _dispatch_slash(
+                user_input, run_dir, session_path,
+                chat_jsonl_path, staged_path,
+                abs_prompt, report_language, session, ctx,
+            )
             if should_quit:
                 return 0
+            if entered_post_call:
+                # /silence just ended the call — flip into post-call mode.
+                in_post_call = True
+            elif in_post_call and cmd_word == "reset":
+                in_post_call = False
+            elif in_post_call:
+                # Re-paint the post-call footer in case the slash command's
+                # output scrolled past it (e.g., /history dumps many lines).
+                _render_footer(session["turns"], report_language, post_call=True)
+            continue
+
+        if in_post_call:
+            # v0.5.19: non-slash text after the previous call ended ==
+            # "start a new call, and this is what I want to say first".
+            # _start_fresh_call archives history, mints a new caller,
+            # renders the persona's opening, then sends `user_input` as
+            # the first user turn — preserving whatever the user typed
+            # instead of discarding it.
+            _archive, ended_again = _start_fresh_call(
+                ctx, run_dir, chat_jsonl_path, session_path, session,
+                report_language, pending_user_msg=user_input,
+            )
+            if ended_again:
+                _render_end_call_box(report_language)
+                _render_footer(session["turns"], report_language, post_call=True)
+                # in_post_call stays True
+            else:
+                in_post_call = False
             continue
 
         # Normal turn — delegate to the shared exchange helper.
@@ -620,18 +742,14 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
         ended = _exchange_turn(ctx, user_input, chat_jsonl_path, session_path,
                                session, report_language)
         if ended:
-            # v0.5.9 / v0.5.12: persona signalled end-of-call via
-            # <<END_CALL>> or a closing phrase. Print a short banner so
-            # the user knows why we're closing, then run the normal exit
-            # path (with the staged-anchor commit prompt if any).
-            banner = ("Persona aramayı kapattı (end-call-tool eşdeğeri)."
-                      if report_language == "tr"
-                      else "Persona ended the call (end-call-tool equivalent).")
-            print(_c(_COL_SYS, f"[{banner}]"))
-            print()
-            _exit_cleanly(run_dir, session_path, chat_jsonl_path, staged_path,
-                          abs_prompt, report_language, "end_call_marker", session)
-            return 0
+            # v0.5.19: persona signalled end-of-call. Previously this
+            # auto-exited via _exit_cleanly; that left no room to /save
+            # or /commit. Now we drop into post-call mode — slash
+            # commands still work, the footer advertises the options,
+            # and a non-slash message restarts the call.
+            _render_end_call_box(report_language)
+            _render_footer(session["turns"], report_language, post_call=True)
+            in_post_call = True
 
 
 # ---------------------------------------------------------- slash commands
@@ -640,10 +758,19 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
 def _dispatch_slash(user_input: str, run_dir: str, session_path: str,
                     chat_jsonl_path: str, staged_path: str, abs_prompt: str,
                     report_language: str, session: dict,
-                    ctx: "_SubprocessCtx") -> bool:
+                    ctx: "_SubprocessCtx") -> tuple[bool, bool]:
+    """Returns (should_quit, entered_post_call).
+
+    `entered_post_call` is True when a slash command produced a turn that
+    ended the call — currently only /silence can do this (it sends a
+    silence event to the persona, who may invoke the silence-policy
+    hangup). REPL uses the flag to flip into post-call mode after the
+    dispatch returns.
+    """
     parts = user_input.lstrip("/").strip().split(None, 1)
     cmd = parts[0].lower() if parts else ""
     arg = parts[1].strip() if len(parts) > 1 else ""
+    entered_post_call = False
     if cmd == "save":
         _handle_save(chat_jsonl_path, staged_path, report_language, session_path, session)
     elif cmd == "history":
@@ -651,7 +778,9 @@ def _dispatch_slash(user_input: str, run_dir: str, session_path: str,
     elif cmd == "reset":
         _handle_reset(run_dir, chat_jsonl_path, session_path, session, report_language, ctx)
     elif cmd == "silence":
-        _handle_silence(arg, ctx, chat_jsonl_path, session_path, session, report_language)
+        entered_post_call = _handle_silence(
+            arg, ctx, chat_jsonl_path, session_path, session, report_language,
+        )
     elif cmd in ("silence-auto", "silenceauto", "autosilence"):
         _handle_silence_auto(arg, session_path, session, report_language)
     elif cmd == "commit":
@@ -661,13 +790,13 @@ def _dispatch_slash(user_input: str, run_dir: str, session_path: str,
     elif cmd == "quit":
         _exit_cleanly(run_dir, session_path, chat_jsonl_path, staged_path,
                       abs_prompt, report_language, "user_quit", session)
-        return True
+        return True, False
     else:
         msg = (f"Unknown command: /{cmd}. Try /help."
                if report_language == "en"
                else f"Bilinmeyen komut: /{cmd}. /help yaz.")
         print(_c(_COL_ERR, msg))
-    return False
+    return False, entered_post_call
 
 
 def _handle_help(report_language: str) -> None:
@@ -699,13 +828,18 @@ def _handle_help(report_language: str) -> None:
 
 
 def _handle_silence(arg: str, ctx: "_SubprocessCtx", chat_jsonl_path: str,
-                    session_path: str, session: dict, report_language: str) -> None:
+                    session_path: str, session: dict,
+                    report_language: str) -> bool:
     """v0.5.9: simulate N seconds of caller silence as a user turn.
 
     Sends the opaque-string convention `[silence for N seconds]` (the same
     pattern drift-runner uses when expanding silence_input sugar) to the
     bare subprocess. Framing rule 8 tells the persona how to react.
     v0.5.14: turn-execution refactored into _exchange_turn.
+
+    v0.5.19: returns True when the persona ended the call from the
+    silence event (used to be a hard SystemExit; now the REPL flips into
+    post-call mode instead so the user can still /save / /commit).
     """
     try:
         duration = int(arg)
@@ -716,7 +850,7 @@ def _handle_silence(arg: str, ctx: "_SubprocessCtx", chat_jsonl_path: str,
                if report_language == "en"
                else "kullanım: /silence <pozitif tamsayı>")
         print(msg)
-        return
+        return False
 
     print()  # blank line before reply
     print(_c(_COL_SYS, f"  (sessizlik: {duration} saniye)" if report_language == "tr"
@@ -726,11 +860,10 @@ def _handle_silence(arg: str, ctx: "_SubprocessCtx", chat_jsonl_path: str,
         chat_jsonl_path, session_path, session, report_language,
     )
     if ended:
-        banner = ("Persona aramayı kapattı (sessizlik politikası — end-call eşdeğeri)."
-                  if report_language == "tr"
-                  else "Persona ended the call (silence policy → end-call equivalent).")
-        print(f"\n[{banner}]\n")
-        raise SystemExit(0)
+        _render_end_call_box(report_language)
+        _render_footer(session["turns"], report_language, post_call=True)
+        return True
+    return False
 
 
 def _handle_silence_auto(arg: str, session_path: str, session: dict,
@@ -899,37 +1032,55 @@ def _handle_history(chat_jsonl_path: str, report_language: str,
     print()
 
 
-def _handle_reset(run_dir: str, chat_jsonl_path: str, session_path: str,
-                  session: dict, report_language: str,
-                  ctx: "_SubprocessCtx") -> None:
-    if os.path.getsize(chat_jsonl_path) == 0 and session.get("turns", 0) == 0:
-        print("Geçmiş zaten boş." if report_language == "tr" else "History already empty.")
-        return
+def _start_fresh_call(ctx: "_SubprocessCtx", run_dir: str,
+                      chat_jsonl_path: str, session_path: str, session: dict,
+                      report_language: str,
+                      pending_user_msg: str | None = None
+                      ) -> tuple[str | None, bool]:
+    """v0.5.19: shared "start a new call" pipeline used by both /reset and
+    the post-call auto-restart path (user types a non-slash message after
+    the persona ended the previous call).
 
-    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    archive = os.path.join(run_dir, f"chat-{ts}-discarded.jsonl")
+    Steps: archive any existing chat.jsonl, mint fresh session_uuid /
+    caller_name / session_started_at, tear down the claude subprocess and
+    spawn a new one bound to the new session id, send the SYSTEM call-
+    connected cue so the persona delivers its opening line, render that
+    opening and the turn-1 footer.
+
+    When `pending_user_msg` is provided, that text is sent as the first
+    user turn immediately after the opening — this is how the post-call
+    auto-restart preserves whatever the user typed instead of throwing
+    their message away.
+
+    Returns (archive_basename_or_None, persona_ended_again_bool).
+    archive_basename is the filename of the discarded chat.jsonl backup
+    so callers (e.g., /reset's banner) can quote it; None when there was
+    nothing to archive. The boolean is True if the persona ended the new
+    call too — either on the opening (rare refusal branch) or via the
+    pending user turn — so callers can re-enter post-call mode.
+    """
+    archive_name: str | None = None
     if os.path.exists(chat_jsonl_path) and os.path.getsize(chat_jsonl_path) > 0:
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archive = os.path.join(run_dir, f"chat-{ts}-discarded.jsonl")
         shutil.move(chat_jsonl_path, archive)
+        archive_name = os.path.basename(archive)
     open(chat_jsonl_path, "w").close()
-    session["turns"] = 0
-    session["chat_session_uuid"] = str(uuid.uuid4())
-    # v0.5.9: re-roll caller name on reset so the fresh persona meets a fresh caller.
+
     first = random.choice(_TR_FIRST_NAMES)
     last = random.choice(_TR_LAST_NAMES)
+    session["turns"] = 0
+    session["chat_session_uuid"] = str(uuid.uuid4())
     session["caller_name"] = f"{first} {last}"
-    _atomic_write_json(session_path, session)
-
-    # /reset re-rolls the caller — also drop the persona_name; the bot
-    # re-emits [PERSONA_NAME: X] on its fresh opening.
     session["persona_name"] = None
+    session["session_started_at"] = datetime.datetime.now(
+        datetime.timezone.utc).isoformat()
     _atomic_write_json(session_path, session)
 
-    # Tear down old claude subprocess and spawn a fresh one with the new session id.
     ctx.close()
     ctx.session_uuid = session["chat_session_uuid"]
     ctx.start()
 
-    # Send the call-connected trigger for the new caller; bot greets first.
     print()
     try:
         opening_raw = _send_with_spinner(
@@ -938,22 +1089,51 @@ def _handle_reset(run_dir: str, chat_jsonl_path: str, session_path: str,
             None,
             report_language,
         )
-        opening, _ = _strip_end_call_marker(opening_raw)
-        opening, persona_name = _strip_persona_name_marker(opening)
-        if persona_name:
-            session["persona_name"] = persona_name
-        opening = opening.strip()
-        _append_chat_entry(chat_jsonl_path, "assistant", opening)
-        session["turns"] = 1
-        _atomic_write_json(session_path, session)
-        _render_bot_reply(opening, session.get("persona_name"))
-        _render_footer(session["turns"], report_language)
     except RuntimeError as e:
-        print(_c(_COL_ERR, f"\n[chat error during reset opening: {e}]\n"), file=sys.stderr)
+        print(_c(_COL_ERR, f"\n[chat error during call start: {e}]\n"),
+              file=sys.stderr)
+        return archive_name, False
 
-    msg = (f"Sıfırlandı. Geçmiş arşivlendi: {os.path.basename(archive)}. Yeni arayan: {session['caller_name']}."
-           if report_language == "tr"
-           else f"Reset. History archived to {os.path.basename(archive)}. New caller: {session['caller_name']}.")
+    opening, opening_ended = _strip_end_call_marker(opening_raw)
+    opening, persona_name = _strip_persona_name_marker(opening)
+    if persona_name:
+        session["persona_name"] = persona_name
+    opening = opening.strip()
+    _append_chat_entry(chat_jsonl_path, "assistant", opening)
+    session["turns"] = 1
+    _atomic_write_json(session_path, session)
+    _render_bot_reply(opening, session.get("persona_name"))
+    _render_footer(session["turns"], report_language)
+
+    if opening_ended:
+        return archive_name, True
+
+    if pending_user_msg:
+        print()
+        ended = _exchange_turn(ctx, pending_user_msg, chat_jsonl_path,
+                               session_path, session, report_language)
+        return archive_name, ended
+
+    return archive_name, False
+
+
+def _handle_reset(run_dir: str, chat_jsonl_path: str, session_path: str,
+                  session: dict, report_language: str,
+                  ctx: "_SubprocessCtx") -> None:
+    if os.path.getsize(chat_jsonl_path) == 0 and session.get("turns", 0) == 0:
+        print("Geçmiş zaten boş." if report_language == "tr" else "History already empty.")
+        return
+    archive_name, _ended = _start_fresh_call(
+        ctx, run_dir, chat_jsonl_path, session_path, session, report_language,
+    )
+    if archive_name:
+        msg = (f"Sıfırlandı. Geçmiş arşivlendi: {archive_name}. Yeni arayan: {session['caller_name']}."
+               if report_language == "tr"
+               else f"Reset. History archived to {archive_name}. New caller: {session['caller_name']}.")
+    else:
+        msg = (f"Sıfırlandı. Yeni arayan: {session['caller_name']}."
+               if report_language == "tr"
+               else f"Reset. New caller: {session['caller_name']}.")
     print(_c(_COL_SYS, msg))
 
 
@@ -1040,17 +1220,8 @@ def _exit_cleanly(run_dir: str, session_path: str, chat_jsonl_path: str,
 
     turns = session.get("turns", 0)
     total_committed = sum(c.get("count", 0) for c in session.get("commits", []))
-    run_name = os.path.basename(run_dir)
-    if report_language == "tr":
-        print(f"\n/prompt-chat oturumu kapatıldı — {run_name}")
-        print(f"- Konuşma turu: {turns}")
-        print(f"- Commit edilen anchor toplamı: {total_committed}")
-        print(f"- Run dir: {os.path.relpath(run_dir)}\n")
-    else:
-        print(f"\n/prompt-chat session closed — {run_name}")
-        print(f"- Turns: {turns}")
-        print(f"- Total committed anchors: {total_committed}")
-        print(f"- Run dir: {os.path.relpath(run_dir)}\n")
+    _render_summary_card(run_dir, report_language, turns, total_committed,
+                         session.get("session_started_at"))
 
 
 # ----------------------------------------------------------------- helpers
@@ -1116,16 +1287,26 @@ def _release_pin() -> None:
     _PIN_ACTIVE = False
 
 
-def _render_footer(turn: int, report_language: str) -> None:
+def _render_footer(turn: int, report_language: str,
+                   post_call: bool = False) -> None:
     """v0.5.13: redraw the pinned footer at the bottom terminal row.
 
     No longer prints inline; the footer lives on the reserved row set up
     by _init_pin(). Falls back to inline rendering when stdout is not a
     TTY (CI, piped output) so logs still show the turn marker.
+
+    v0.5.19: when `post_call` is True (the persona has ended the call but
+    the REPL is still open) the footer switches to a post-call hint that
+    advertises slash commands plus the "new message → new call" shortcut.
     """
-    cmds = "/save | /history | /commit | /quit | /help"
-    line = (f"― [tur {turn} · {cmds}]" if report_language == "tr"
-            else f"― [turn {turn} · {cmds}]")
+    cmds = "/save · /history · /commit · /quit · /help"
+    if post_call:
+        line = (f"― [arama bitti · {cmds} · yeni mesaj → yeni arama]"
+                if report_language == "tr"
+                else f"― [call ended · {cmds} · new message → new call]")
+    else:
+        line = (f"― [tur {turn} · {cmds}]" if report_language == "tr"
+                else f"― [turn {turn} · {cmds}]")
     if not _TTY or not _PIN_ACTIVE:
         # Non-TTY: keep the old inline behaviour for log readability.
         print()
@@ -1449,41 +1630,144 @@ def _send_with_spinner(ctx: "_SubprocessCtx", msg: str,
 
 def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                    report_language: str, caller_name: str) -> None:
+    """v0.5.19: replaced the legacy three-bar layout with a single boxed
+    frame so the welcome reads as one card. Same information density —
+    prompt name + line count, caller, isolation mode, idle-silence hint,
+    command crib — but visually cohesive with the end-call banner and
+    final summary card that share the same _render_box helper."""
     basename = os.path.basename(abs_prompt).rsplit(".", 1)[0]
     line_count = sum(1 for _ in open(os.path.join(run_dir, "body.txt"), encoding="utf-8"))
-    bar = _c(_COL_DIM, "─" * 60)
     if _IDLE_TIMEOUT_OK:
-        idle_hint_tr = (f"  Otomatik sessizlik: {_DEFAULT_IDLE_SILENCE_SECS} sn (boş bekle → silence). "
-                        f"/silence-auto ile değiştir.")
-        idle_hint_en = (f"  Auto-silence: {_DEFAULT_IDLE_SILENCE_SECS}s of idle fires a silence event. "
-                        f"Toggle via /silence-auto.")
+        idle_hint_tr = (f"Otomatik sessizlik: {_DEFAULT_IDLE_SILENCE_SECS} sn boş bekle → silence "
+                        f"(değiştir: /silence-auto)")
+        idle_hint_en = (f"Auto-silence: {_DEFAULT_IDLE_SILENCE_SECS}s idle → silence event "
+                        f"(toggle: /silence-auto)")
     else:
-        idle_hint_tr = "  Otomatik sessizlik: bu platformda kapalı (manuel /silence <N> kullan)."
-        idle_hint_en = "  Auto-silence: disabled on this platform (use manual /silence <N>)."
+        idle_hint_tr = "Otomatik sessizlik: bu platformda kapalı (manuel /silence <N>)."
+        idle_hint_en = "Auto-silence: disabled on this platform (use manual /silence <N>)."
+
+    title = (_c(_COL_BOLD, "/prompt-chat") +
+             _c(_COL_DIM, " · interactive persona simulator · v0.5.19"))
     print()
-    print(bar)
     if report_language == "tr":
-        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.18)"))
-        print(bar)
-        print(f"  Prompt:    {_c(_COL_BOLD, basename)} ({line_count} satır, model: {chat_model})")
-        print(f"  Arayan:    {_c(_COL_BOLD, caller_name)}")
-        print(f"  İzolasyon: yeni pencere · bare Claude session")
-        print(bar)
-        print(_c(_COL_DIM, "  Bot birazdan kendisi selamlayacak — sen aramayı cevapladın."))
-        print(_c(_COL_DIM, idle_hint_tr))
-        print(_c(_COL_DIM, "  Komutlar: /save  /history  /reset  /silence <N>  /silence-auto  /commit  /help  /quit"))
-        print(bar)
+        lines = [
+            f"{_c(_COL_DIM, 'Prompt   ')} {_c(_COL_BOLD, basename)} "
+            f"{_c(_COL_DIM, f'({line_count} satır · model: {chat_model})')}",
+            f"{_c(_COL_DIM, 'Arayan   ')} {_c(_COL_BOLD, caller_name)}",
+            f"{_c(_COL_DIM, 'İzolasyon')} {_c(_COL_DIM, 'yeni pencere · bare Claude session')}",
+            "",
+            _c(_COL_DIM, "Bot birazdan kendisi selamlayacak — aramayı cevapladın."),
+            _c(_COL_DIM, idle_hint_tr),
+            "",
+            _c(_COL_DIM, "Komutlar:") + " " + _c(_COL_USER,
+                "/save · /history · /reset · /silence · /commit · /help · /quit"),
+        ]
     else:
-        print(_c(_COL_BOLD, "  /prompt-chat — interactive persona simulator (v0.5.18)"))
-        print(bar)
-        print(f"  Prompt:    {_c(_COL_BOLD, basename)} ({line_count} lines, model: {chat_model})")
-        print(f"  Caller:    {_c(_COL_BOLD, caller_name)}")
-        print(f"  Isolation: new window · bare Claude session")
-        print(bar)
-        print(_c(_COL_DIM, "  The bot will greet you first — you're the caller answering."))
-        print(_c(_COL_DIM, idle_hint_en))
-        print(_c(_COL_DIM, "  Commands: /save  /history  /reset  /silence <N>  /silence-auto  /commit  /help  /quit"))
-        print(bar)
+        lines = [
+            f"{_c(_COL_DIM, 'Prompt   ')} {_c(_COL_BOLD, basename)} "
+            f"{_c(_COL_DIM, f'({line_count} lines · model: {chat_model})')}",
+            f"{_c(_COL_DIM, 'Caller   ')} {_c(_COL_BOLD, caller_name)}",
+            f"{_c(_COL_DIM, 'Isolation')} {_c(_COL_DIM, 'new window · bare Claude session')}",
+            "",
+            _c(_COL_DIM, "The bot will greet you first — you're the caller answering."),
+            _c(_COL_DIM, idle_hint_en),
+            "",
+            _c(_COL_DIM, "Commands:") + " " + _c(_COL_USER,
+                "/save · /history · /reset · /silence · /commit · /help · /quit"),
+        ]
+    _render_box(title, lines)
+
+
+def _render_end_call_box(report_language: str) -> None:
+    """v0.5.19: rendered when the persona ends the call (END_CALL marker
+    or closing-phrase regex hit). The REPL no longer auto-exits; this box
+    explains what just happened and surfaces the post-call options so the
+    user has time to /save the last turn or /commit staged anchors before
+    closing the session manually."""
+    title = _c(_COL_BOLD, _c(_COL_ENDCALL,
+        "ARAMA SONA ERDİ" if report_language == "tr" else "CALL ENDED"))
+    if report_language == "tr":
+        lines = [
+            _c(_COL_DIM, "Persona end-call-tool eşdeğeri ile aramayı kapattı."),
+            "",
+            _c(_COL_DIM, "Devam etmek için:"),
+            f"  {_c(_COL_USER, '/save')}    {_c(_COL_DIM, 'son turu anchor olarak kaydet')}",
+            f"  {_c(_COL_USER, '/history')} {_c(_COL_DIM, 'konuşmayı gözden geçir')}",
+            f"  {_c(_COL_USER, '/commit')}  {_c(_COL_DIM, 'staged anchorları sidecara yaz')}",
+            f"  {_c(_COL_USER, '/quit')}    {_c(_COL_DIM, 'oturumu kapat (final özet)')}",
+            "",
+            _c(_COL_DIM, "Yeni bir mesaj yazarsan yeni bir arama başlatılır."),
+        ]
+    else:
+        lines = [
+            _c(_COL_DIM, "Persona ended the call (end-call-tool equivalent)."),
+            "",
+            _c(_COL_DIM, "Next steps:"),
+            f"  {_c(_COL_USER, '/save')}    {_c(_COL_DIM, 'capture last turn as an anchor')}",
+            f"  {_c(_COL_USER, '/history')} {_c(_COL_DIM, 'review the conversation')}",
+            f"  {_c(_COL_USER, '/commit')}  {_c(_COL_DIM, 'write staged anchors to sidecar')}",
+            f"  {_c(_COL_USER, '/quit')}    {_c(_COL_DIM, 'close the session (final summary)')}",
+            "",
+            _c(_COL_DIM, "Typing a new message starts a fresh call."),
+        ]
+    print()
+    _render_box(title, lines)
+
+
+def _format_duration(started_at: str | None) -> str:
+    """Format wall-clock session duration as '4m 39s' / '12s'. Used by the
+    summary card. Falls back to '—' when the start timestamp is missing
+    or unparseable (e.g., legacy sessions before session_started_at was
+    persisted in v0.5.19)."""
+    if not started_at:
+        return "—"
+    try:
+        start_dt = datetime.datetime.fromisoformat(started_at)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        secs = int((now - start_dt).total_seconds())
+    except (ValueError, TypeError):
+        return "—"
+    if secs < 0:
+        return "—"
+    if secs < 60:
+        return f"{secs}s"
+    return f"{secs // 60}m {secs % 60}s"
+
+
+def _render_summary_card(run_dir: str, report_language: str, turns: int,
+                         total_committed: int, started_at: str | None) -> None:
+    """v0.5.19: replaces the four plain print lines at the end of
+    _exit_cleanly with a single bordered card that visually parallels the
+    welcome banner. Same fields plus an added wall-clock duration."""
+    run_name = os.path.basename(run_dir)
+    duration = _format_duration(started_at)
+    title = _c(_COL_BOLD, _c(_COL_OK,
+        "/prompt-chat oturum özeti" if report_language == "tr"
+        else "/prompt-chat session summary"))
+    if report_language == "tr":
+        rows = [
+            ("Run",            run_name),
+            ("Konuşma turu",   str(turns)),
+            ("Kayıtlı anchor", str(total_committed)),
+            ("Süre",           duration),
+            ("Run dir",        os.path.relpath(run_dir)),
+        ]
+    else:
+        rows = [
+            ("Run",      run_name),
+            ("Turns",    str(turns)),
+            ("Anchors",  str(total_committed)),
+            ("Duration", duration),
+            ("Run dir",  os.path.relpath(run_dir)),
+        ]
+    label_w = max(len(k) for k, _ in rows)
+    lines = [
+        f"{_c(_COL_DIM, k.ljust(label_w))}  {_c(_COL_BOLD, v)}"
+        for k, v in rows
+    ]
+    print()
+    _render_box(title, lines)
+    print()
 
 
 def _read_chat_jsonl(path: str) -> list:
