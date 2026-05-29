@@ -131,15 +131,12 @@ def _visible_len(text: str) -> int:
     return len(_ANSI_RE.sub("", text))
 
 
-def _render_box(title: str, lines: list[str], width: int | None = None) -> None:
+def _render_box(title: str, lines: list[str], width: int | None = None) -> int:
     """Print a Unicode-bordered frame around `lines` with `title` in the
-    top edge. ANSI-colored content inside lines is preserved verbatim;
-    padding is computed against the visible width via _visible_len.
-
-    Lines wider than the inner width are truncated with an ellipsis (no
-    wrapping — callers are expected to keep rows short). On non-TTY
-    streams the box still renders since print() emits the box characters
-    as plain UTF-8.
+    top edge. Returns the number of rows printed (top border + N content
+    rows + bottom border) so callers that need to know where the box
+    ended (e.g. main()'s DECSTBM scroll-region calc in v0.5.26) can
+    plan accordingly.
     """
     cols = _term_size()[0]
     width = width if width else min(78, max(40, cols - 2))
@@ -165,6 +162,7 @@ def _render_box(title: str, lines: list[str], width: int | None = None) -> None:
         pad = " " * max(0, inner - 2 - vis)
         print(f"{bar_v} {line}{pad} {bar_v}")
     print(bot)
+    return 2 + len(lines)
 
 
 # v0.5.9 — random Turkish caller name pool for filling [MÜŞTERİ_ADI] /
@@ -380,15 +378,17 @@ def main() -> int:
         _atomic_write_json(session_path, session)
     caller_name = session["caller_name"]
 
-    _print_welcome(run_dir, abs_prompt, chat_model, report_language,
-                   caller_name, session)
-
-    # v0.5.13: pin a status footer to the bottom terminal row via ANSI
-    # scroll region. Conversation scrolls within rows 1..rows-1; the
-    # footer ("― [tur N · /save | …]") lives on row N and is rewritten
-    # each turn. _release_pin in the finally block restores the default
-    # full-screen scroll region.
-    _init_pin()
+    # v0.5.26: enter the alternate screen buffer BEFORE printing the
+    # welcome banner so the chat session lives in an isolated canvas.
+    # The user's previous shell state (Last login, the `python3 ...`
+    # invocation, prior scrollback) is preserved and reappears when
+    # _leave_alt_screen runs at the end. The banner row count is
+    # captured so DECSTBM's scroll region can be set to start
+    # IMMEDIATELY BELOW the banner — pinning it to the top.
+    _enter_alt_screen()
+    welcome_rows = _print_welcome(run_dir, abs_prompt, chat_model,
+                                  report_language, caller_name, session)
+    _init_pin(top_row=welcome_rows + 1)
 
     # v0.5.22: clean up any pre-v0.5.22 .body-wrapped.txt left in this
     # run dir before we materialise the fresh tempfile copy. Silent;
@@ -454,7 +454,11 @@ def main() -> int:
                     initial_post_call=initial_post_call)
     finally:
         ctx.close()
+        # v0.5.26: _release_pin and _leave_alt_screen are idempotent —
+        # _exit_cleanly may have already called them before printing
+        # the summary card, in which case these are no-ops.
         _release_pin()
+        _leave_alt_screen()
 
 
 # v0.5.12: closing phrase heuristic backup for end-call detection.
@@ -1284,6 +1288,16 @@ def _exit_cleanly(run_dir: str, session_path: str, chat_jsonl_path: str,
 
     turns = session.get("turns", 0)
     total_committed = sum(c.get("count", 0) for c in session.get("commits", []))
+
+    # v0.5.26: leave the alternate screen BEFORE rendering the summary
+    # card so the card lands in the main terminal's scrollback. If we
+    # rendered it inside the alt screen, _leave_alt_screen would wipe
+    # the whole canvas — including the summary — as soon as main()'s
+    # finally block ran. _release_pin first so the print() calls
+    # below aren't constrained to the scroll region.
+    _release_pin()
+    _leave_alt_screen()
+
     _render_summary_card(run_dir, report_language, turns, total_committed,
                          session.get("session_started_at"))
 
@@ -1351,11 +1365,14 @@ def _render_bot_reply(text: str, persona_name: str | None) -> None:
 
 
 # v0.5.13: terminal width / height probe + pinned bottom footer.
-# Approach: set ANSI scroll region to rows 1..rows-1 so the conversation
-# scrolls in the upper region and the last row stays reserved for the
-# footer. Each turn, we redraw the footer text on that bottom row using
-# save/restore cursor sequences so the input prompt position is preserved.
+# v0.5.26: pinned footer now lives inside an alternate screen buffer
+# (`\033[?1049h`) so the main terminal scrollback is untouched.
+# DECSTBM scroll region starts at `_PIN_TOP_ROW` (right below the
+# welcome banner) and ends at `rows - 1`, leaving row `rows` reserved
+# for the sticky footer.
 _PIN_ACTIVE = False
+_PIN_TOP_ROW = 1
+_ALT_SCREEN_ACTIVE = False
 
 
 def _term_size() -> tuple[int, int]:
@@ -1363,34 +1380,87 @@ def _term_size() -> tuple[int, int]:
     return cols, rows
 
 
-def _init_pin() -> None:
-    """v0.5.23: pinned-footer experiment shelved AGAIN.
+def _enter_alt_screen() -> None:
+    """v0.5.26: switch to the terminal's alternate screen buffer so our
+    TUI (banner + conversation + sticky footer) lives in an isolated
+    canvas. The user's pre-chat terminal state — shell scrollback, the
+    `python3 ...` invocation, Last login — is preserved and reappears
+    on exit via _leave_alt_screen(). Idempotent."""
+    global _ALT_SCREEN_ACTIVE
+    if not _TTY or _ALT_SCREEN_ACTIVE:
+        return
+    with _STDOUT_LOCK:
+        sys.stdout.write("\033[?1049h")  # DECSET 1049 — enter alt screen
+        sys.stdout.write("\033[H")        # cursor home (1, 1)
+        sys.stdout.write("\033[2J")       # clear screen
+        sys.stdout.flush()
+    _ALT_SCREEN_ACTIVE = True
 
-    History recap:
-    - v0.5.13 introduced DECSTBM scroll region + manual cursor park.
-      Side effect: ~10-line gap below welcome banner.
-    - v0.5.19 removed the manual park; DECSTBM's own cursor-home side
-      effect then overwrote the banner.
-    - v0.5.21 dropped DECSTBM entirely; UI deterministic but no sticky
-      footer (footer printed inline per turn).
-    - v0.5.22 reinstated DECSTBM with save/restore (`\\033[s ... \\033[u`)
-      to neutralise the home jump. Bot opening still ended up scrolled
-      OFF the visible region in Terminal.app — save/restore is fragile
-      across emulators and scroll-off rows leak into terminal scrollback
-      asymmetrically.
 
-    v0.5.23: keep _init_pin a no-op. _render_footer falls back to its
-    inline path (printed once per turn). Status-line ambition postponed
-    until we can do it properly with an alternate screen buffer
-    (`\\033[?1049h`) — that's a TUI-style design and a bigger change
-    than a quick fix.
+def _leave_alt_screen() -> None:
+    """v0.5.26: leave the alternate screen buffer; main screen state
+    flips back into view. Called by _exit_cleanly before the summary
+    card is printed (so the card lands in the main scrollback and the
+    user can still read it after the chat exits)."""
+    global _ALT_SCREEN_ACTIVE
+    if not _TTY or not _ALT_SCREEN_ACTIVE:
+        return
+    with _STDOUT_LOCK:
+        sys.stdout.write("\033[?1049l")  # DECRST 1049 — exit alt screen
+        sys.stdout.flush()
+    _ALT_SCREEN_ACTIVE = False
+
+
+def _init_pin(top_row: int = 1) -> None:
+    """v0.5.26: reserve the last terminal row for the sticky footer and
+    set the scroll region to (top_row, rows - 1). top_row is normally
+    `welcome_banner_rows + 1` so the banner sits ABOVE the scroll
+    region and stays put while the conversation scrolls in the middle.
+
+    History recap (read before re-touching this code):
+      - v0.5.13: DECSTBM(1, rows-1) + manual cursor park to rows-1
+        → ~10-line blank gap under the banner.
+      - v0.5.19: removed the manual park → DECSTBM's cursor-home
+        side effect overwrote the banner.
+      - v0.5.22: re-introduced \\033[s / \\033[u save-restore around
+        DECSTBM → in Terminal.app, save/restore proved unreliable
+        and the bot's opening reply scrolled off-screen.
+      - v0.5.23: gave up and used inline footer per turn.
+      - v0.5.26 (this): wrapped in alt-screen + scroll region starts
+        AFTER the banner (top_row > 1). Banner is now outside the
+        scroll region and physically cannot be overwritten. Save/
+        restore is no longer needed for _init_pin itself — the
+        cursor naturally ends up at (top_row, 1) right after the
+        banner. _render_footer still uses save/restore (DECSC/DECRC
+        ESC 7 / ESC 8) to repaint the footer without losing the
+        in-progress input cursor.
     """
-    return
+    global _PIN_ACTIVE, _PIN_TOP_ROW
+    if not _TTY or _PIN_ACTIVE:
+        return
+    _cols, rows = _term_size()
+    if rows < top_row + 2:
+        return  # too small to bother
+    with _STDOUT_LOCK:
+        sys.stdout.write(f"\033[{top_row};{rows - 1}r")
+        sys.stdout.flush()
+    _PIN_ACTIVE = True
+    _PIN_TOP_ROW = top_row
 
 
 def _release_pin() -> None:
-    """v0.5.23: paired with _init_pin no-op — nothing to release."""
-    return
+    """v0.5.26: reset DECSTBM to full screen (1..rows) so anything
+    printed after the pin is released — e.g. the final summary card
+    after _leave_alt_screen — uses the normal full-screen scroll
+    region. Idempotent."""
+    global _PIN_ACTIVE
+    if not _TTY or not _PIN_ACTIVE:
+        return
+    _cols, rows = _term_size()
+    with _STDOUT_LOCK:
+        sys.stdout.write(f"\033[1;{rows}r")
+        sys.stdout.flush()
+    _PIN_ACTIVE = False
 
 
 def _render_footer(turn: int, report_language: str,
@@ -1422,11 +1492,15 @@ def _render_footer(turn: int, report_language: str,
     cols, rows = _term_size()
     visible = line[: max(1, cols - 1)]
     with _STDOUT_LOCK:
-        sys.stdout.write("\033[s")                 # save cursor
+        # v0.5.26: use DECSC/DECRC (ESC 7 / ESC 8) instead of CSI s/u.
+        # Mac Terminal handles the VT100-native pair more reliably; the
+        # xterm-style \033[s / \033[u was unstable around DECSTBM in
+        # v0.5.22 and caused the bot's opening reply to scroll off.
+        sys.stdout.write("\0337")                  # DECSC: save cursor
         sys.stdout.write(f"\033[{rows};1H")        # jump to footer row
         sys.stdout.write("\033[2K")                # clear it
         sys.stdout.write(_c(_COL_DIM, visible))    # write footer
-        sys.stdout.write("\033[u")                 # restore cursor
+        sys.stdout.write("\0338")                  # DECRC: restore cursor
         sys.stdout.flush()
 
 
@@ -1733,7 +1807,7 @@ def _send_with_spinner(ctx: "_SubprocessCtx", msg: str,
 
 def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                    report_language: str, caller_name: str,
-                   session: dict) -> None:
+                   session: dict) -> int:
     """v0.5.19: replaced the legacy three-bar layout with a single boxed
     frame so the welcome reads as one card. Same information density —
     prompt name + line count, caller, isolation mode, idle-silence hint,
@@ -1743,7 +1817,11 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
     v0.5.25: idle-silence hint simplified back to on/off. The prompt's
     own silence policy (1st/2nd/3rd silence stages with their own
     thresholds) is exercised via manual `/silence N` calls, not via a
-    single auto-fire threshold we'd have to pick for the user."""
+    single auto-fire threshold we'd have to pick for the user.
+
+    v0.5.26: returns the number of rows the banner occupies so main()
+    can size the DECSTBM scroll region to start RIGHT BELOW the
+    banner — banner stays pinned, conversation scrolls underneath."""
     basename = os.path.basename(abs_prompt).rsplit(".", 1)[0]
     line_count = sum(1 for _ in open(os.path.join(run_dir, "body.txt"), encoding="utf-8"))
     idle_secs = int(session.get("idle_silence_secs", 0) or 0)
@@ -1762,7 +1840,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                         f"disable with /silence-auto off)")
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.5.25"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.5.26"))
     print()
     if report_language == "tr":
         lines = [
@@ -1790,7 +1868,9 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
             _c(_COL_DIM, "Commands:") + " " + _c(_COL_USER,
                 "/save · /history · /reset · /silence · /commit · /help · /quit"),
         ]
-    _render_box(title, lines)
+    box_rows = _render_box(title, lines)
+    # 1 leading blank line (the print() above) + box rows.
+    return 1 + box_rows
 
 
 def _render_end_call_box(report_language: str) -> None:
