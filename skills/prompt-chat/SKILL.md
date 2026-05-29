@@ -173,61 +173,67 @@ PY
 
 ## Phase 1 — Run mode selection (isolation)
 
-You are running in the user's main Claude Code session. The chat loop in Phase 3 will accumulate user/assistant turns. **Without isolation, those turns pollute the main session's context** — the main-session assistant persona gets confused, and the user has trouble switching back to "normal work" after the chat ends.
+**v0.5.11 simplification:** the chat session **always opens in a new Terminal/tmux window**. No isolation-mode prompt — the previous "in-session" / "setup-only" alternatives caused confusion (in-session pollutes the main Claude Code context with persona turns; setup-only requires the user to type a command). User feedback was unambiguous: "chat ekranı her zaman yeni pencerede açılsın."
 
-Three isolation strategies, in preference order:
-
-1. **New window** (preferred when platform supports it) — spawn a new `claude` CLI subprocess in a separate Terminal / tmux window. The new process runs `/prompt-chat-session <run-dir>` (see below). Full process + memory + context isolation. Main session exits this skill immediately.
-2. **In-session** (fallback) — the skill enters its own loop and stays in the main session. The user only talks to the bot until `/quit`. Mental isolation; process is shared.
-3. **Setup-only** (manual fallback) — the skill prepares `$RUN_DIR` and prints the manual command to run; user opens a new window themselves.
-
-### Pre-flight check
+### Pre-flight check (silent, fail-fast)
 
 ```bash
-PLATFORM=$(uname)
-CLAUDE_CLI=$(command -v claude || true)
+# v0.5.11+ — detect platform + window-spawn capability. Supported:
+#   macOS:   osascript (Terminal.app — bundled with macOS)
+#   Linux:   tmux OR gnome-terminal
+#   Windows: cmd's `start` (built-in) OR Windows Terminal (`wt.exe`) when present
+PLATFORM=$(uname 2>/dev/null || echo Windows)
+CLAUDE_CLI=$(command -v claude 2>/dev/null || true)
 NEW_WINDOW_OK=false
 
 if [ -n "$CLAUDE_CLI" ]; then
   case "$PLATFORM" in
     Darwin)
-      # osascript is built-in on macOS; Terminal.app ships with macOS.
       command -v osascript >/dev/null && NEW_WINDOW_OK=true
       ;;
     Linux)
-      if command -v tmux >/dev/null || command -v gnome-terminal >/dev/null; then
+      if command -v tmux >/dev/null || command -v gnome-terminal >/dev/null \
+         || command -v xterm >/dev/null || command -v konsole >/dev/null; then
+        NEW_WINDOW_OK=true
+      fi
+      ;;
+    MINGW*|MSYS*|CYGWIN*|Windows*)
+      # Windows with Git-Bash / MSYS2 / WSL-on-Win etc. The `start` builtin
+      # works through cmd.exe; `wt.exe` (Windows Terminal) is also detected.
+      if command -v cmd.exe >/dev/null || command -v wt.exe >/dev/null \
+         || command -v start >/dev/null; then
         NEW_WINDOW_OK=true
       fi
       ;;
   esac
 fi
-echo "PLATFORM=$PLATFORM CLAUDE_CLI=$CLAUDE_CLI NEW_WINDOW_OK=$NEW_WINDOW_OK"
+
+# v0.5.11+ — also detect the Python interpreter name. Unix uses `python3`,
+# Windows ships `python` (and sometimes `py` launcher). Pick the first one
+# that actually resolves.
+PYTHON_CLI=""
+for p in python3 python py; do
+  if command -v "$p" >/dev/null 2>&1; then PYTHON_CLI="$p"; break; fi
+done
+if [ -z "$PYTHON_CLI" ]; then
+  echo "ERROR: no Python interpreter found on PATH (tried python3 / python / py)."
+  echo "Install Python 3.8+ and rerun /prompt-chat."
+  exit 1
+fi
+
+if [ "$NEW_WINDOW_OK" != "true" ]; then
+  echo "ERROR: /prompt-chat requires a way to open a new terminal window."
+  echo "Install one of:"
+  echo "  - macOS:   (Terminal.app + osascript — bundled, should be auto)"
+  echo "  - Linux:   tmux, gnome-terminal, xterm, or konsole"
+  echo "  - Windows: cmd.exe (built-in) or Windows Terminal (wt.exe)"
+  echo "You can still launch manually:"
+  echo "  $PYTHON_CLI $RUNNER $RUN_DIR"
+  exit 1
+fi
 ```
 
-### Ask the user
-
-Emit AskUserQuestion (mandatory — do not silently default):
-
-```
-question (TR):  "Chat oturumunu nasıl başlatayım?"
-question (EN):  "How should the chat session be started?"
-header:         "Isolation"
-multiSelect:    false
-options:
-  - label: "Yeni pencere aç" | "Open new window"
-    description: "Ayrı Terminal/tmux penceresinde yeni Claude session'ı. Tam izolasyon. (önerilen)"
-    enabled: NEW_WINDOW_OK
-  - label: "Burada (in-session)" | "Here (in-session)"
-    description: "Ana oturumda devam et. Skill kendi loop'unda kalır, /quit'e kadar sadece bot ile konuşursun."
-  - label: "Setup'ı yap, ben elle açarım" | "Set up only, I'll open manually"
-    description: "Skill run-dir'i hazırlayıp çıkar; kullanıcı manuel `claude '/prompt-chat-session <run-dir>'` yazar."
-```
-
-Wording follows `frontmatter.report_language` from Phase 0. If `NEW_WINDOW_OK == false`, surface the first option as disabled with a footnote (`platform desteği yok — tmux veya macOS Terminal kur`).
-
-### Dispatch per mode
-
-**Mode = "new window":**
+### Dispatch — always new window
 
 v0.5.7 — spawn the Python orchestrator DIRECTLY in the new Terminal/tmux window. Do NOT route through `claude '/prompt-chat-session ...'` because Claude Code's skill runtime wraps Python's REPL in a Bash tool call whose subshell has no interactive TTY — Python `input()` immediately hits EOF and the chat exits with 0 turns. Going directly to the Python script gives the runner the real terminal it needs.
 
@@ -243,22 +249,38 @@ for guess in \
 done
 
 if [ -z "$RUNNER" ]; then
-  echo "ERROR: bin/prompt-chat-runner.py not found — falling back to in-session mode."
-  MODE=in_session
-else
-  case "$PLATFORM" in
-    Darwin)
-      osascript -e "tell application \"Terminal\" to do script \"python3 '$RUNNER' '$RUN_DIR'\"" >/dev/null
-      ;;
-    Linux)
-      if command -v tmux >/dev/null; then
-        tmux new-window -n "chat-$BASENAME" "python3 '$RUNNER' '$RUN_DIR'"
-      else
-        gnome-terminal -- python3 "$RUNNER" "$RUN_DIR"
-      fi
-      ;;
-  esac
+  echo "ERROR: bin/prompt-chat-runner.py not found in repo or plugin cache."
+  echo "Reinstall PromptChecker (the runner script is part of the plugin distribution)."
+  exit 1
 fi
+
+case "$PLATFORM" in
+  Darwin)
+    osascript -e "tell application \"Terminal\" to do script \"$PYTHON_CLI '$RUNNER' '$RUN_DIR'\"" >/dev/null
+    ;;
+  Linux)
+    if command -v tmux >/dev/null; then
+      tmux new-window -n "chat-$BASENAME" "$PYTHON_CLI '$RUNNER' '$RUN_DIR'"
+    elif command -v gnome-terminal >/dev/null; then
+      gnome-terminal -- "$PYTHON_CLI" "$RUNNER" "$RUN_DIR"
+    elif command -v xterm >/dev/null; then
+      xterm -e "$PYTHON_CLI '$RUNNER' '$RUN_DIR'" &
+    elif command -v konsole >/dev/null; then
+      konsole -e "$PYTHON_CLI '$RUNNER' '$RUN_DIR'" &
+    fi
+    ;;
+  MINGW*|MSYS*|CYGWIN*|Windows*)
+    # Prefer Windows Terminal when present (modern UX), fall back to cmd's start.
+    if command -v wt.exe >/dev/null; then
+      wt.exe new-tab --title "chat-$BASENAME" "$PYTHON_CLI" "$RUNNER" "$RUN_DIR" &
+    else
+      # `start` opens a new console window. /B would suppress the window; we
+      # explicitly want a new one, so omit /B. The empty "" is the window title
+      # argument that `start` consumes when the first argument is quoted.
+      cmd.exe /c start "" "$PYTHON_CLI" "$RUNNER" "$RUN_DIR" &
+    fi
+    ;;
+esac
 ```
 
 The `/prompt-chat-session` skill remains available as a manual resume path (`claude '/prompt-chat-session <run-dir>'`) but is no longer the primary entry — the new Terminal window runs Python directly, owning the TTY.
@@ -271,33 +293,11 @@ Run dir: <relative path to $RUN_DIR>
 Yeni pencere kapandıktan sonra `cat <run-dir>/chat.jsonl` ile konuşmayı inceleyebilirsin.
 ```
 
-**Then exit this skill.** Main session is freed; user converses in the new window.
+**Then exit this skill.** Main session is freed; the entire chat happens in the new window.
 
-**Mode = "in-session":**
+### `/prompt-chat-session` skill (manual resume only, v0.5.11+)
 
-Record `session.json.isolation_mode = "in_session"`. Continue to Phase 2 in the current session. Main asistan persona's is on pause until `/quit`.
-
-**Mode = "setup-only":**
-
-Record `session.json.isolation_mode = "setup_only"`. Print:
-
-```
-Setup tamamlandı. Yeni bir terminal aç ve şu komutu çalıştır:
-
-  $CLAUDE_CLI '/prompt-chat-session $RUN_DIR'
-
-Veya tamamen interaktif bir Claude Code penceresi açıp Claude'a şu mesajı yaz:
-
-  /prompt-chat-session $RUN_DIR
-```
-
-Exit this skill.
-
-### `/prompt-chat-session` subagent skill
-
-A sibling skill at `skills/prompt-chat-session/SKILL.md` is invoked by the "new window" and "setup-only" modes. It takes `$1 = <run-dir>` (an existing chat-NNN directory created by `/prompt-chat` Phase 0), skips Phase 0-1, and enters Phase 2 directly. The two skills share Phase 2-8 logic — extract to a helper or document the duplication.
-
-For the MVP, the `prompt-chat-session` skill is a thin wrapper that re-enters this same file's Phase 2 onwards using the supplied `$RUN_DIR`. The `BASENAME` is derived from the parent directory name. Implementation can defer to a follow-up commit if Phase 2-8 below is generic enough.
+`skills/prompt-chat-session/SKILL.md` is the manual entry path — invoke it via `claude '/prompt-chat-session <run-dir>'` from a real Terminal prompt (NOT from inside another Claude Code session, where the Bash tool subshell has no interactive TTY and the chat would exit immediately). The skill validates the run dir, then execs `bin/prompt-chat-runner.py`. The primary path in v0.5.11 — `/prompt-chat` with the auto-spawned new window — does NOT route through this skill; it invokes the Python script directly.
 
 ## Phase 2 — Welcome screen
 
@@ -307,7 +307,7 @@ Render in `report_language`:
 ```
 /prompt-chat başlatıldı.
 Prompt: <basename> (<line count> satır, model: <target_model>)
-İzolasyon: <yeni pencere | in-session | setup-only>
+İzolasyon: yeni pencere (bare Claude session)
 
 Yaz, ben prompt'a göre cevap vereyim.
 
@@ -980,7 +980,6 @@ Read `session.json` for stats. Compute totals and print (in `report_language`):
 
 - Konuşma turu: <N>
 - Kaydedilen anchor: <M staged + K committed = total>
-- İzolasyon: <yeni pencere | in-session | setup-only>
 - Run dir: .promptcheck/<basename>/<chat-NNN>/
 
 Sonraki adım: <one of>
@@ -991,7 +990,7 @@ Sonraki adım: <one of>
 
 **EN:** same structure, English labels.
 
-If isolation_mode was `in_session`, the main asistan resumes after the skill exits. If `new_window` or `setup_only`, this is the final message in that window (window can be closed manually).
+The chat always runs in a separate new terminal window (v0.5.11+); after the summary prints, the window can be closed manually.
 
 ### Step 8.3 — Exit
 
