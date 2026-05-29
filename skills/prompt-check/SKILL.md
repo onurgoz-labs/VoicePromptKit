@@ -2201,7 +2201,7 @@ Possible feasibility outcomes (one per finding):
 - `no_concrete_fix` — empty or null `suggested_fix` (should never happen with v0.4.1+, but defensive)
 - `sha_mismatch` — stale audit detected at Phase 10 entry (Pre-flight saw `STALE_AUDIT == true`)
 - `ambiguous` — substring-strategy only: `current_excerpt` appears zero or multiple times on `finding.line`
-- `structural_declined` — user declined the risk warning for a `fix_strategy: "structural"` finding
+- `structural_declined` — **deprecated in v0.5.5**: previously emitted when the per-finding risk-warning prompt for `fix_strategy: "structural"` was declined. The per-finding prompt was removed (the user already opted in via the Phase 9 decision string); see 5b below. Resume tooling preserves the outcome for backward compat with older runs.
 - `applicable` — passes all feasibility checks; the prompt file is modified
 
 **Ordered feasibility rules — apply in this order:**
@@ -2223,10 +2223,15 @@ Possible feasibility outcomes (one per finding):
 
    **5b. `fix_strategy: "structural"`:**
    - Structural fixes may add a new clause, move a rule, or rewrite across lines. They do NOT replace a literal substring on a single line, so the `ambiguous` / `current_excerpt`-must-be-unique check from 5a is SKIPPED for structural fixes. (The sentinel guard in step 4 already filtered out TODO/Intentional sentinels.)
-   - Surface a risk warning to the user BEFORE applying: "⚠ Structural change for <finding-id>: the suggestion is an action description, not a literal substring. I will use the Edit tool to apply: <suggested_fix>. Confirm? (y/n)".
-   - If the user declines → outcome `structural_declined`. Route to overlay.
-   - If the user accepts → outcome `applicable`. Apply via the Edit tool (semantic edit reflecting the intent of `suggested_fix`).
-   - Implementation note: when the user said `hepsini düzelt` (wildcard), the risk-warning prompt is shown ONCE per structural finding, not bundled. Each structural application is its own decision point.
+   - **v0.5.5 change: no per-finding risk-warning prompt.** Apply via the Edit tool directly (semantic edit reflecting the intent of `suggested_fix`). Rationale: the user already explicitly opted in via the Phase 9 decision string (`düzelt` / `apply` verb on this finding's id). Re-prompting per finding turns N structural fixes into N extra round-trips and trains users to expect "düzelt" to mean "queue, ask again, then maybe apply" — which is the opposite of what the verb communicates.
+   - Outcome `applicable`. Apply via Edit tool. Log entry's `risk_acknowledged: true` field continues to reflect that the user opted in via the decision string (Phase 9), not via a per-finding prompt.
+   - **Per-finding interactive review is still available** — the user can pick `konuşalım` (the discuss verb) instead of `düzelt` in Phase 9, which routes the finding through the konuşalım sub-flow (§5 of `references/dialog-flow.md`) where they see the full rationale + suggested_fix in a blockquote and pick `kabul et` / `ben revize ediyorum` / `yorum bırak` / `atla`. That sub-flow exists precisely for the "I want to think about this one before applying" case.
+   - **Safety nets that still apply** (no UX regression):
+     - SHA256 stale-audit guard at Phase 10 entry — if the prompt file changed between audit and apply, the entire pass routes to overlay regardless of strategy.
+     - Substring `ambiguous` check (5a) — substring fixes still refuse to write if `current_excerpt` is missing or appears multiple times on the target line.
+     - Sentinel guard (step 4) — TODO / Intentional findings still skip.
+     - Git is the user's rollback path: `git diff` after the run; `git checkout <prompt>` to revert if the structural edit was wrong.
+   - **Backward compat with older skill versions:** decisions.jsonl entries from pre-v0.5.5 runs may contain `structural_declined` outcomes that originated from the now-removed per-finding prompt. Resume tooling treats these as legacy overlay routes, no change in semantics.
 
 **Single-event write per finding** based on the resolved outcome:
 

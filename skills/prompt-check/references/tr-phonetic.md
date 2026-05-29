@@ -191,6 +191,7 @@ Do not generate findings for any line that matches any of these:
 - **Quoted transcript** — line is inside a multi-line quoted block.
 - **Tabular content** — markdown table rows (`| ... |`).
 - **Inside any pronunciation block** (managed marker block OR legacy heading block detected in Phase 6.0) — the block content is the canonical source, not a target for new findings.
+- **`number_readability`-specific skip — already in spoken form.** Do NOT flag a `number_readability` finding when the relevant span contains NO Arabic numerals AND no currency abbreviations / symbols (`TL`, `₺`, `$`, `€`, `%`). Spoken-form expressions like `iki yüz Türk lirası`, `yüzde yirmi beş`, `on yedi Mayıs iki bin yirmi altı`, `on dört otuz` are already correctly written for TTS. The lens fires ONLY when there is a numeric / abbreviated token to transform — never to "trim" or "rephrase" prose that is already spoken. Rewording spoken expressions ("iki yüz Türk lirası" → "iki yüz lira", dropping `Türk` as "redundant") is semantic editing, forbidden by the **never translate / never semantically rewrite** hard rule above.
 
 If a line satisfies any skip rule, no finding is emitted regardless of detection match.
 
