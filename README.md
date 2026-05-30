@@ -200,7 +200,7 @@ schema_version: 1
 anchors:
   # Single-turn anchor — direct user input, no prior conversation.
   - input: "Merhaba"
-    expect_contains: ["Alex", "City Dental"]
+    expect_contains: ["Alex"]
     expect_not_contains: ["tekrar bağlanacağım"]
     rubric: "Bot identifies itself and states the call's purpose"
 
@@ -210,7 +210,7 @@ anchors:
   - input: "İptal etmek istiyorum"
     context:
       - role: assistant
-        content: "Merhaba, ben Alex. City Dental randevunuzu teyit etmek için arıyorum..."
+        content: "Merhaba, ben Alex. Rezervasyonunuzu teyit etmek için arıyorum..."
       - role: user
         content: "Tamam dinliyorum"
     expect_not_contains: ["tekrar bağlanacağım"]
@@ -271,7 +271,7 @@ An author-provided `chat_variables:` block in the prompt's frontmatter is read a
 ```
 1. /prompt-chat your-prompt.md
 2. Converse with the persona until something interesting happens.
-3. /save — pick single-turn or flow; stage the anchor.
+3. /save — stage a single-turn anchor (flow capture is planned; see the `/save` note above).
 4. (repeat 2-3 for more scenarios)
 5. /commit — write staged anchors to <prompt>.anchors.yaml.
 6. Edit the prompt body. (Prompt SHA stays stable; cached audits stay valid.)

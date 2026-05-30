@@ -484,7 +484,9 @@ User typed `/save`. Capture either (a) the most recent user → assistant exchan
 
 > **Implementation note (v0.7.0).** The canonical Python runner (`bin/prompt-chat-runner.py`, `_handle_save`) currently stages **single-turn anchors only** — it captures the last user → assistant exchange and prompts for `expect_contains` / `expect_not_contains` / `rubric`. The flow-anchor sub-flow described below (Steps 5.0 / 5.F*) is the planned design; until it lands, author multi-turn flow anchors by hand in `<prompt>.anchors.yaml`.
 
-### Step 5.0 — Anchor kind selector (v0.5.1)
+### Step 5.0 — Anchor kind selector (v0.5.1) — planned, not yet in the Python runner
+
+> Per the implementation note above, `bin/prompt-chat-runner.py` does not yet present this selector; it stages single-turn anchors directly. The selector + flow sub-flow below describe the planned design.
 
 Before collecting assertions, ask the user which kind of anchor they want to save:
 

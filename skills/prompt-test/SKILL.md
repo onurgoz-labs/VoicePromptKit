@@ -5,9 +5,9 @@ description: Runs the test anchors stored in a prompt's `<prompt>.anchors.yaml` 
 
 # prompt-test
 
-You take a prompt file `$1`, read its `frontmatter.anchors[]`, and run each anchor as a regression test scenario via the existing `drift-runner` subagent (in `regression_only: true` mode). The output is a pass/fail table — one row per anchor — and a `drift.json` artefact under `.voicepromptkit/<basename>/test-NNN/`.
+You take a prompt file `$1`, read its `<prompt>.anchors.yaml` sidecar (falling back to `frontmatter.anchors[]` only as a legacy path), and run each anchor as a regression test scenario via the existing `drift-runner` subagent (in `regression_only: true` mode). The output is a pass/fail table — one row per anchor — and a `drift.json` artefact under `.voicepromptkit/<basename>/test-NNN/`.
 
-Anchors are created by `/prompt-chat` (interactive simulator with `/save` + `/commit`) or by manual YAML editing of the prompt file's frontmatter. `/prompt-test` only **runs** them; it never creates or modifies them.
+Anchors are created by `/prompt-chat` (interactive simulator with `/save` + `/commit`) or by manually editing the `<prompt>.anchors.yaml` sidecar. `/prompt-test` only **runs** them; it never creates or modifies them.
 
 ## Inputs you have
 
