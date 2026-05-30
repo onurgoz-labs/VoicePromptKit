@@ -165,6 +165,8 @@ Every user message goes to the long-lived bare-Claude subprocess, which produces
 | `/commit` | Atomic-write the staged anchors into `<prompt>.anchors.yaml` (creates the sidecar if missing; refuses if schema_version != 1). Validation re-parses the temp file post-write; rollback on any failure. Archived to `committed-<UTC>.json`. |
 | `/quit` | Final summary. Offers to commit, keep, or discard any uncommitted staged anchors before exit. |
 
+**Modern terminal UI.** When [Rich](https://github.com/Textualize/rich) is installed (`pip install rich`), the chat renders as a modern surface: Markdown-formatted bot replies in bordered panels, right-aligned user bubbles, live token-by-token streaming, a responsive layout, and truecolor with automatic terminal detection (including Windows). Without Rich it falls back to a clean stdlib ANSI renderer — no extra dependency required. Set `VOICEPROMPTKIT_NO_RICH=1` to force the fallback, or the standard `NO_COLOR=1` for plain text.
+
 ### `/prompt-test` — replay anchors, report pass/fail
 
 ```
