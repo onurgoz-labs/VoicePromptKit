@@ -127,10 +127,10 @@ Voice agent developers test prompts by **calling the bot**: trigger Vapi, listen
 
 PromptChecker adds two skills that move that loop into text:
 
-- `/prompt-chat <prompt>` — opens an interactive text simulator. The prompt acts as the simulated system prompt for a `chat-simulator` subagent; you converse with the persona turn by turn. In-chat slash commands let you save interesting turns as test anchors.
+- `/prompt-chat <prompt>` — opens an interactive call simulator in a new terminal window. The prompt is loaded as the simulated system prompt of a long-lived bare-Claude subprocess (`bin/prompt-chat-runner.py`); you converse with the persona turn by turn, bind prompt variables, and save interesting turns as test anchors.
 - `/prompt-test <prompt>` — runs the saved anchors as regression tests. Each anchor becomes one scenario for the existing `drift-runner` (in `regression_only: true` mode), and you get a pass/fail table — one row per anchor.
 
-They share one contract: a sidecar file `<prompt>.anchors.yaml` next to the prompt (v0.5.1+). `/prompt-chat` writes anchors via `/commit`; `/prompt-test` reads them. The prompt file itself is never modified — its SHA stays stable across anchor edits, so `/prompt-check` audit caches remain valid.
+They share one contract: a sidecar file `<prompt>.anchors.yaml` next to the prompt (v0.5.1+). `/prompt-chat` writes anchors via `/commit`; `/prompt-test` reads them. `/prompt-chat` also writes a second sidecar, `<prompt>.vars.yaml`, for variable bindings (v0.6.0 — see [Variables](#variables-v060)). The prompt file itself is never modified — its SHA stays stable across anchor and variable edits, so `/prompt-check` audit caches remain valid.
 
 ### `/prompt-chat` — converse, save, commit
 
@@ -138,15 +138,18 @@ They share one contract: a sidecar file `<prompt>.anchors.yaml` next to the prom
 /prompt-chat path/to/prompt.md
 ```
 
-Phase 0 sets up `.promptcheck/<basename>/chat-NNN/`. Phase 1 asks how to isolate the chat session — new window (`osascript` on macOS, `tmux` or `gnome-terminal` on Linux), in-session (the skill enters its own loop in the main session), or setup-only (you open a new window manually). Then the welcome screen, then the chat loop.
+Phase 0 sets up `.promptcheck/<basename>/chat-NNN/` and detects prompt variables; Phase 0.5 binds any unbound ones; Phase 1 spawns `bin/prompt-chat-runner.py` in a fresh terminal window (`osascript` on macOS, `tmux` / `gnome-terminal` / `xterm` / `konsole` on Linux, `wt.exe` / `cmd` on Windows) and the skill exits. From there the runner owns the welcome screen and the chat loop.
 
-Every user message dispatches the `chat-simulator` subagent, which produces one assistant turn faithful to the prompt's persona. The output goes into `chat.jsonl` (append-only, atomic per turn). Slash commands while you chat:
+Every user message goes to the long-lived bare-Claude subprocess, which produces one assistant turn faithful to the prompt's persona. The exchange is appended to `chat.jsonl` (append-only, atomic per turn). Slash commands while you chat:
 
 | Command | Action |
 |---|---|
 | `/save` | Capture either the last user→assistant turn OR the whole conversation as a flow anchor. An AskUserQuestion picks the kind (single vs flow); the per-kind sub-flow then collects `expect_contains` / `expect_not_contains` / `rubric` per assertion turn. Auto-detects `[silence for N seconds]` user content and suggests the `silence_input` sugar. Staged in `saved_anchors.json` — never on disk yet. |
 | `/history` | Pretty-print the conversation so far. |
 | `/reset` | Move `chat.jsonl` aside and start fresh. `saved_anchors.json` is untouched. |
+| `/vars` | **(v0.6.0)** List detected variables with their current bound value (or `(random)` when unbound). |
+| `/set name=value` | **(v0.6.0)** Rebind a variable mid-chat. Persists to `<prompt>.vars.yaml` + applies on the next turn via a `[SYSTEM: variable update]` cue (no respawn → history preserved). |
+| `/unset name` | **(v0.6.0)** Drop a binding so the persona invents the value again. |
 | `/commit` | Atomic-write the staged anchors into `<prompt>.anchors.yaml` (creates the sidecar if missing; refuses if schema_version != 1). Validation re-parses the temp file post-write; rollback on any failure. Archived to `committed-<UTC>.json`. |
 | `/quit` | Final summary. Offers to commit, keep, or discard any uncommitted staged anchors before exit. |
 
@@ -227,6 +230,27 @@ anchors:
 Turns must alternate `user_input` (or `silence_input`) → `assistant_expect` → … → `end_call_expect`. The reader drops any anchor that violates alternation, with a warning.
 
 **Backward compatibility.** If `<prompt>.anchors.yaml` is missing but the prompt's frontmatter has an `anchors:` block, the legacy v0.5.0 path is used with a `"frontmatter.anchors is deprecated — migrate to <prompt>.anchors.yaml"` warning. Move the block over by hand or wait for the upcoming `/prompt-anchors-migrate` helper.
+
+### Variables (v0.6.0)
+
+Voice-agent scripts carry placeholder tokens that production Vapi fills from `assistantOverrides.variableValues` before a call connects. `/prompt-chat` mirrors this with an explicit **detect → bind → inject** layer, so caller data is a reproducible constant you control instead of something the persona invents at random.
+
+**Token forms detected:** Vapi mustache `{{ name }}` / `{{ customer.name }}` and bracketed upper-snake `[MÜŞTERİ_ADI]` (Turkish uppercase included). Harness-control brackets (`[SYSTEM: …]`, `[PERSONA_NAME: …]`, `[silence …]`) are never treated as variables.
+
+**Pre-chat binding.** When you launch `/prompt-chat`, Phase 0 detects the tokens and — for any not already bound — asks you for a value (with inferred sample options, or type your own; pick "random" to leave it to the model). Bound values are substituted into the system prompt before the call opens; unbound tokens are left for the persona to invent.
+
+**Storage — sidecar `<prompt>.vars.yaml`** (e.g. `mybot.md` → `mybot.md.vars.yaml`). Prompt-level and persistent across chats; the prompt file itself is never touched, so its SHA256 stays stable and cached `/prompt-check` audits remain valid — the same contract as the anchors sidecar.
+
+```yaml
+schema_version: 1
+variables:
+  musteri_adi: "Zeynep Kaya"
+  randevu_tarihi: "12 Haziran 14:00"
+```
+
+An author-provided `chat_variables:` block in the prompt's frontmatter is read as a **seed only** (never written back); the sidecar wins on conflict.
+
+**Mid-chat editing.** `/vars` shows the current bindings; `/set name=value` and `/unset name` change them live — persisted to the sidecar and applied on the next turn via a `[SYSTEM: variable update]` cue, with no subprocess respawn so the conversation history is preserved. `/reset` re-substitutes the current values into a fresh call.
 
 ### Workflow loop
 

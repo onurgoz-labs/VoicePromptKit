@@ -50,45 +50,25 @@ from queue import Empty, Queue
 
 # v0.5.11: readline is stdlib on macOS/Linux but not bundled on Windows.
 # Import for its side effect — enables arrow-key history + line editing on
-# the cooked-mode input() fallback (used when idle-silence is OFF, on
-# Windows, or on a non-TTY stream). The v0.5.16 raw-mode reader does not
-# use readline; readline-style history is intentionally absent there.
+# the cooked-mode input() prompt. Best-effort; absent on Windows.
 try:
     import readline  # noqa: F401
 except ImportError:
     pass
 
-# v0.5.16: raw-mode reader needs `tty` alongside `select` + `termios`.
-# Cooked-mode `select()` only signals stdin readable on Enter, so a user
-# actively typing a long reply got killed by the idle-silence timer mid-
-# word (their buffer was then tcflushed and discarded — see v0.5.14 bug).
-# Raw (cbreak) mode delivers each keystroke immediately, letting us reset
-# the deadline on every byte. On Windows / non-Unix we degrade to plain
-# input() with no idle timeout.
+# v0.6.0: only termios is needed now — _drain_stale_input uses tcflush to
+# discard ghost cooked-mode input typed while the bot is thinking. The
+# cbreak raw-mode reader (tty + select) and the idle-silence auto-timeout
+# were removed: manual `/silence N` is the silence interface (v0.5.25
+# decided layered silence policies don't map to one auto-fire threshold).
 if sys.platform != "win32":
     try:
-        import select as _select_mod
         import termios as _termios_mod
-        import tty as _tty_mod
-        _IDLE_TIMEOUT_OK = True
+        _TERMIOS_OK = True
     except ImportError:
-        _IDLE_TIMEOUT_OK = False
+        _TERMIOS_OK = False
 else:
-    _IDLE_TIMEOUT_OK = False
-
-# v0.5.25: auto-silence is OFF by default and stays the user's call to
-# enable. Earlier versions tried to be clever (10s default in v0.5.14;
-# 30s default in v0.5.22; prompt auto-detect in v0.5.24), but real
-# voice-agent scripts use *layered* silence policies — `1st silence
-# ≥15s`, `2nd silence ≥10s`, `3rd silence ≥5s` etc. Any single auto-
-# fire threshold mis-represents that layering. Testers exercise the
-# layered policy more naturally with manual `/silence N` calls: e.g.
-# `/silence 15 → /silence 10 → /silence 5` walks the persona through
-# all three stages with the script's own values.
-#
-# _SILENCE_ON_DEFAULT_SECS stays as the threshold `/silence-auto on`
-# uses when the user explicitly wants auto-fire (advanced use case).
-_SILENCE_ON_DEFAULT_SECS = 30
+    _TERMIOS_OK = False
 
 # v0.5.11: ANSI escape sequences for color. Stdlib-only (no rich/colorama).
 # We only emit these when stdout is a real TTY — piping to a file would
@@ -262,6 +242,12 @@ ABSOLUTE RULES (these OVERRIDE anything in the script that contradicts them):
    ```
    The harness strips this line before showing the reply to the user, and uses the name to prefix subsequent assistant turns ("❝ Aysel: ..."). Do NOT include the bracketed line on any subsequent reply — only the first. If your script doesn't give you a name, invent one in keeping with the persona's tone.
 
+13. **Live variable updates via `[SYSTEM: variable update — ...]` cues.** Caller-data placeholders in your script (Vapi-style `{{...}}` variables and bracketed `[BÜYÜK_HARF]` fields) are normally filled with concrete values BEFORE this prompt loads — you simply read them as ordinary text. Occasionally, mid-call, you will receive a line of this exact shape:
+
+   `[SYSTEM: variable update — NAME is now "VALUE". Use this value for the matching placeholder from now on.]`
+
+   This is an internal harness event (like the other `[SYSTEM: ...]` cues), NOT something the caller said. Silently adopt VALUE for that placeholder for the rest of the call, do NOT echo the bracketed line, and do NOT announce the change ("I've updated your name to…") unless it is natural in the flow. If a cue says a variable's value is now unknown, fall back to inventing a plausible value per rule 10. Continue your script's current beat as if the value had always been this.
+
 YOUR PERSONA SCRIPT — internalise this as your voice, your rules, your scope. The call begins when you receive the `[SYSTEM: call connected — caller is ...]` cue (this happens automatically right after this prompt loads).
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -279,7 +265,221 @@ def _safe_unlink(path: str) -> None:
         pass
 
 
-def _write_wrapped_body(body_path: str) -> str:
+# --------------------------------------------------------- variable binding
+# v0.6.0: explicit variable detection + binding layer. Voice-agent scripts
+# carry placeholder tokens (Vapi `{{...}}` dynamic variables, plus bracketed
+# `[BÜYÜK_HARF]` caller fields). Production Vapi fills these from
+# `variableValues` before the call connects; the simulator now does the same.
+# Values are bound pre-chat (skill, persisted in `<prompt>.vars.yaml`),
+# substituted into the system prompt at spawn (_write_wrapped_body), and
+# editable mid-chat via /set (delivered as a next-turn [SYSTEM: variable
+# update] cue — framing rule 13). The original prompt file is never touched,
+# so its SHA256 stays stable and cached /prompt-check audits remain valid.
+
+# Mustache: {{ name }} / {{ customer.name }} — Vapi dynamic-variable syntax.
+_VAR_MUSTACHE_RE = re.compile(r"\{\{\s*([\w.]+)\s*\}\}")
+# Bracketed upper-snake: [MÜŞTERİ_ADI] — TR uppercase letters included. The
+# harness-control brackets never match here: [SYSTEM: …] / [PERSONA_NAME: …]
+# carry a colon+space, [silence for N seconds] is lowercase.
+_VAR_BRACKET_RE = re.compile(r"\[([A-ZÇĞİÖŞÜ_][A-ZÇĞİÖŞÜ0-9_]*)\]")
+# Names never treated as user variables even if they match the bracket shape.
+_VAR_NAME_DENYLIST = {"SYSTEM", "PERSONA_NAME", "END_CALL"}
+
+
+def _detect_variables(body_text: str) -> list:
+    """Scan a prompt body for variable tokens.
+
+    Returns an ordered, de-duplicated list of {"name", "token"} dicts where
+    `token` is the exact source string (e.g. "{{musteri_adi}}" or
+    "[MÜŞTERİ_ADI]") used verbatim for substitution, and `name` is the
+    binding key (the inner identifier). First-seen document order is
+    preserved so the pre-chat binding questions follow the script order.
+    """
+    hits = []
+    for m in _VAR_MUSTACHE_RE.finditer(body_text):
+        hits.append((m.start(), m.group(0), m.group(1).strip()))
+    for m in _VAR_BRACKET_RE.finditer(body_text):
+        name = m.group(1).strip()
+        if name in _VAR_NAME_DENYLIST:
+            continue
+        hits.append((m.start(), m.group(0), name))
+    hits.sort(key=lambda h: h[0])
+    seen = set()
+    out = []
+    for _pos, token, name in hits:
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append({"name": name, "token": token})
+    return out
+
+
+def _vars_sidecar_path(prompt_path: str) -> str:
+    return prompt_path + ".vars.yaml"
+
+
+def _read_vars_sidecar(prompt_path: str) -> dict:
+    """Read {name: value} from <prompt>.vars.yaml.
+
+    Returns {} when the sidecar is missing, unparseable, or carries an
+    unknown schema_version — the caller treats a miss as "no values bound
+    yet". Mirrors the precedence/validation style of bin/read-anchors.py.
+    Values are coerced to str (YAML may parse "12" as int, a bare date as a
+    date object).
+    """
+    try:
+        import yaml
+    except ImportError:
+        return {}
+    path = _vars_sidecar_path(prompt_path)
+    if not os.path.exists(path):
+        return {}
+    try:
+        data = yaml.safe_load(open(path, encoding="utf-8")) or {}
+    except yaml.YAMLError:
+        return {}
+    if data.get("schema_version") != 1:
+        return {}
+    variables = data.get("variables") or {}
+    if not isinstance(variables, dict):
+        return {}
+    return {str(k): ("" if v is None else str(v)) for k, v in variables.items()}
+
+
+def _write_vars_sidecar(prompt_path: str, values: dict) -> tuple[bool, str]:
+    """Atomic-write {name: value} to <prompt>.vars.yaml with post-write
+    re-parse validation (same safety contract as _handle_commit). The
+    prompt file itself is never touched. Empty-string values are dropped
+    (an unset variable is simply absent). Returns (ok, basename_or_error).
+    """
+    try:
+        import yaml
+    except ImportError:
+        return False, "PyYAML missing — pip install pyyaml"
+    path = _vars_sidecar_path(prompt_path)
+    # Refuse to clobber an unknown future schema.
+    if os.path.exists(path):
+        try:
+            existing = yaml.safe_load(open(path, encoding="utf-8")) or {}
+        except yaml.YAMLError as e:
+            return False, f"existing vars sidecar unparseable — aborting: {e}"
+        if existing.get("schema_version") not in (1, None):
+            return False, (f"vars sidecar schema_version mismatch "
+                           f"(got {existing.get('schema_version')!r}, want 1)")
+    doc = {
+        "schema_version": 1,
+        "variables": {str(k): str(v) for k, v in values.items() if str(v) != ""},
+    }
+    new_text = yaml.safe_dump(doc, allow_unicode=True, sort_keys=False,
+                              default_flow_style=False)
+    tmp = path + ".vars.tmp." + str(os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    try:
+        check = yaml.safe_load(open(tmp, encoding="utf-8")) or {}
+        if check.get("schema_version") != 1 or not isinstance(check.get("variables"), dict):
+            raise ValueError("post-write shape invalid")
+    except Exception as e:
+        os.remove(tmp)
+        return False, f"post-write validation failed — rollback: {e}"
+    os.rename(tmp, path)
+    return True, os.path.basename(path)
+
+
+def _load_variables_state(run_dir: str, body_path: str, abs_prompt: str) -> dict:
+    """Resolve this chat's variable binding state.
+
+    Prefers run-dir `variables.json` (written by the skill's Phase 0 after
+    the pre-chat binding questions). Falls back to detecting tokens from
+    body.txt and reading values from the `<prompt>.vars.yaml` sidecar, so a
+    manually launched runner (no skill bootstrap) still binds variables.
+    Returns {"detected": [{name, token}], "values": {name: value}}.
+    """
+    vpath = os.path.join(run_dir, "variables.json")
+    if os.path.exists(vpath):
+        try:
+            with open(vpath, encoding="utf-8") as f:
+                state = json.load(f) or {}
+            detected = state.get("detected") or []
+            values = state.get("values") or {}
+            if isinstance(detected, list) and isinstance(values, dict):
+                return {
+                    "detected": detected,
+                    "values": {str(k): str(v) for k, v in values.items()},
+                }
+        except (json.JSONDecodeError, OSError):
+            pass
+    body_text = open(body_path, encoding="utf-8").read()
+    detected = _detect_variables(body_text)
+    sidecar_values = _read_vars_sidecar(abs_prompt)
+    names = {d["name"] for d in detected}
+    values = {k: v for k, v in sidecar_values.items() if k in names}
+    return {"detected": detected, "values": values}
+
+
+def _persist_variables(run_dir: str, abs_prompt: str, var_state: dict) -> tuple[bool, str]:
+    """Write the current values to BOTH the run-dir variables.json (this
+    session's resolved set) and the prompt-level sidecar (persistent across
+    chats). Returns the sidecar write result so callers can surface errors."""
+    _atomic_write_json(
+        os.path.join(run_dir, "variables.json"),
+        {"detected": var_state["detected"], "values": var_state["values"]},
+    )
+    return _write_vars_sidecar(abs_prompt, var_state["values"])
+
+
+# Caller-name variable keys: when one of these is bound, the persona's
+# [SYSTEM: call connected — caller is X] cue uses the bound value instead of
+# a random Turkish name. Full-name keys win; otherwise ADI(+SOYADI) combine.
+def _resolve_caller_name_override(values: dict) -> "str | None":
+    for k in ("caller_name", "customer.name", "customer_name", "MÜŞTERİ_ADSOYAD"):
+        if values.get(k):
+            return values[k]
+    first = values.get("MÜŞTERİ_ADI") or values.get("MUSTERI_ADI")
+    last = values.get("MÜŞTERİ_SOYADI") or values.get("MUSTERI_SOYADI")
+    if first and last:
+        return f"{first} {last}"
+    if first:
+        return first
+    return None
+
+
+def _apply_substitutions(body: str, detected: "list | None",
+                         values: "dict | None") -> str:
+    """Replace each bound token in `body` with its value. Unbound tokens are
+    left literal so framing rule 10 (model invents a default) still governs
+    them. Shared by _write_wrapped_body (spawn) and _refresh_wrapped_body
+    (re-spawn after a /set)."""
+    if not detected or not values:
+        return body
+    for d in detected:
+        name, token = d.get("name"), d.get("token")
+        if token and name in values and values[name] != "":
+            body = body.replace(token, values[name])
+    return body
+
+
+def _refresh_wrapped_body(ctx: "_SubprocessCtx", run_dir: str,
+                          var_state: "dict | None") -> None:
+    """Rewrite the wrapped-body tempfile in place so a re-spawned subprocess
+    (/reset, post-call restart) reflects any mid-chat /set changes. The live
+    subprocess can't reload its system prompt — that's why /set also sends a
+    [SYSTEM: variable update] cue — but the NEXT spawn reads this file."""
+    if not var_state:
+        return
+    body_path = os.path.join(run_dir, "body.txt")
+    try:
+        body = open(body_path, encoding="utf-8").read()
+        body = _apply_substitutions(body, var_state.get("detected"),
+                                    var_state.get("values"))
+        with open(ctx.body_path, "w", encoding="utf-8") as f:
+            f.write(_ROLEPLAY_FRAMING + body)
+    except OSError:
+        pass
+
+
+def _write_wrapped_body(body_path: str, detected: "list | None" = None,
+                        values: "dict | None" = None) -> str:
     """Write a persona-framed copy of body.txt that claude will receive
     as the --system-prompt-file payload. The original body.txt is never
     modified.
@@ -293,6 +493,10 @@ def _write_wrapped_body(body_path: str) -> str:
     Python shutdown; OS /tmp policy handles ungraceful exits.
     """
     body = open(body_path, encoding="utf-8").read()
+    # v0.6.0: substitute bound variable values into the body before framing —
+    # exactly what production Vapi does with variableValues. body.txt itself
+    # is never modified; only this /tmp copy is.
+    body = _apply_substitutions(body, detected, values)
     wrapped = _ROLEPLAY_FRAMING + body
     fd, path = tempfile.mkstemp(suffix=".body-wrapped.txt", prefix="promptchat-")
     try:
@@ -354,13 +558,6 @@ def main() -> int:
             datetime.timezone.utc).isoformat()
         _atomic_write_json(session_path, session)
 
-    # v0.5.25: auto-silence is off by default — see comment on
-    # _SILENCE_ON_DEFAULT_SECS for the rationale (layered prompt policies
-    # don't map cleanly to a single auto-fire threshold).
-    if "idle_silence_secs" not in session:
-        session["idle_silence_secs"] = 0
-        _atomic_write_json(session_path, session)
-
     if not (os.path.exists(CLAUDE_CLI) or shutil.which("claude")):
         msg = ("error: 'claude' CLI not found on PATH. Install Claude Code first."
                if report_language == "en"
@@ -378,14 +575,25 @@ def main() -> int:
         _atomic_write_json(session_path, session)
     caller_name = session["caller_name"]
 
-    # v0.5.27: alt-screen + DECSTBM removed (see _enter_alt_screen
-    # docstring). Welcome banner prints inline in the user's terminal;
-    # _print_welcome's return value (row count) is no longer used for
-    # scroll-region setup but kept for non-TTY logging.
-    _enter_alt_screen()  # no-op in v0.5.27
+    # v0.6.0: resolve this chat's variable bindings — run-dir variables.json
+    # (written by the skill after the pre-chat binding questions), else
+    # detected from body.txt + read from the <prompt>.vars.yaml sidecar.
+    # Bound values are substituted into the system prompt below, surfaced in
+    # the welcome banner, and editable mid-chat via /set.
+    var_state = _load_variables_state(run_dir, body_path, abs_prompt)
+    # When a caller-name variable is bound, it overrides the random caller
+    # identity so the [SYSTEM: call connected] cue and the body placeholders
+    # agree. Persisted so /reset's fresh-call path keeps the bound name.
+    bound_caller = _resolve_caller_name_override(var_state["values"])
+    session["bound_caller_name"] = bound_caller
+    if bound_caller and session.get("caller_name") != bound_caller:
+        session["caller_name"] = bound_caller
+        caller_name = bound_caller
+    _atomic_write_json(session_path, session)
+
+    # Welcome banner prints inline in the user's terminal.
     _print_welcome(run_dir, abs_prompt, chat_model, report_language,
-                   caller_name, session)
-    _init_pin()  # no-op in v0.5.27
+                   caller_name, session, var_state)
 
     # v0.5.22: clean up any pre-v0.5.22 .body-wrapped.txt left in this
     # run dir before we materialise the fresh tempfile copy. Silent;
@@ -396,7 +604,8 @@ def main() -> int:
     # claude. The original body.txt is left untouched.
     # v0.5.22: wrapped body now lives in /tmp (tempfile) instead of inside
     # the run dir — see _write_wrapped_body.
-    wrapped_body_path = _write_wrapped_body(body_path)
+    wrapped_body_path = _write_wrapped_body(
+        body_path, var_state["detected"], var_state["values"])
 
     # Spawn the long-lived claude subprocess ONCE.
     ctx = _SubprocessCtx(wrapped_body_path, chat_session_uuid, chat_model)
@@ -431,16 +640,12 @@ def main() -> int:
             session["turns"] = 1
             _atomic_write_json(session_path, session)
             _render_bot_reply(opening_clean, session.get("persona_name"))
-            _render_footer(session["turns"], report_language,
-                           post_call=opening_ended)
             if opening_ended:
                 # v0.5.19: persona refused the call on opening (rare —
                 # "wrong number / decline" branches). Used to auto-exit;
                 # now we drop into post-call mode so the user can still
                 # /save the opening turn or /quit explicitly.
                 _render_end_call_box(report_language)
-                _render_footer(session["turns"], report_language,
-                               post_call=True)
                 initial_post_call = True
         except RuntimeError as e:
             print(_c(_COL_ERR, f"\n[chat error during opening: {e}]\n"), file=sys.stderr)
@@ -448,14 +653,9 @@ def main() -> int:
     try:
         return _repl(ctx, run_dir, body_path, session_path, chat_jsonl_path,
                     staged_path, abs_prompt, report_language, session,
-                    initial_post_call=initial_post_call)
+                    var_state, initial_post_call=initial_post_call)
     finally:
         ctx.close()
-        # v0.5.26: _release_pin and _leave_alt_screen are idempotent —
-        # _exit_cleanly may have already called them before printing
-        # the summary card, in which case these are no-ops.
-        _release_pin()
-        _leave_alt_screen()
 
 
 # v0.5.12: closing phrase heuristic backup for end-call detection.
@@ -673,15 +873,15 @@ def _now_monotonic() -> float:
 
 def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str,
           chat_jsonl_path: str, staged_path: str, abs_prompt: str,
-          report_language: str, session: dict,
+          report_language: str, session: dict, var_state: dict,
           initial_post_call: bool = False) -> int:
-    # v0.5.14: idle-silence threshold. Persisted on session so /reset
-    # keeps the user's preference. 0 / negative disables. Unix-only —
-    # _read_with_idle_timeout transparently falls back to blocking
-    # input() on Windows or non-TTY streams.
-    # v0.5.24: the threshold is now set up-front in main() via
-    # _detect_silence_threshold (reads frontmatter / body) instead of
-    # being defaulted here.
+    # v0.6.0: queue of [SYSTEM: variable update — ...] cues produced by /set
+    # and /unset. They are NOT sent as their own turn (that would cost a
+    # model call and add a spurious reply); instead they ride as a hidden
+    # prefix on the NEXT user turn (see system_prefix in _exchange_turn), so
+    # the change lands exactly when the conversation continues and the user's
+    # recorded message in chat.jsonl stays clean.
+    pending_var_cues: list = []
 
     # v0.5.19: post-call mode. When the persona ends the call (END_CALL
     # marker or closing-phrase regex) we no longer auto-exit; this flag
@@ -693,23 +893,12 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
     in_post_call = initial_post_call
 
     while True:
-        # Idle-silence is meaningless in post-call mode (there's no call
-        # to be silent on). Suppress the timer so an idle user lingering
-        # on the post-call screen isn't ambushed by a silence event aimed
-        # at a persona that already hung up.
-        if in_post_call:
-            idle_arg = None
-        else:
-            idle = session.get("idle_silence_secs", 0) or 0
-            idle_arg = idle if idle > 0 and _IDLE_TIMEOUT_OK else None
-
         try:
             footer_line = _compute_footer_line(
                 session.get("turns", 0), report_language,
                 post_call=in_post_call,
             )
-            user_input, timed_out = _input_prompt(idle_arg, report_language,
-                                                   footer_line)
+            user_input = _input_prompt(report_language, footer_line)
         except EOFError:
             print()
             _exit_cleanly(run_dir, session_path, chat_jsonl_path, staged_path,
@@ -720,28 +909,6 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
             _exit_cleanly(run_dir, session_path, chat_jsonl_path, staged_path,
                           abs_prompt, report_language, "interrupt", session)
             return 0
-
-        if timed_out:
-            # v0.5.14: auto-silence. The user sat idle past the threshold;
-            # treat it as the caller staying quiet on the line and let the
-            # persona's silence policy decide what to do (gentle prompt,
-            # escalation, eventual hangup). v0.5.19: if the persona ends
-            # the call from a silence event, enter post-call mode instead
-            # of exiting so the user can still /save.
-            duration = int(idle_arg or _DEFAULT_IDLE_SILENCE_SECS)
-            banner = (f"  (otomatik sessizlik: {duration} sn — boş bekleme)"
-                      if report_language == "tr"
-                      else f"  (auto-silence: {duration}s — caller idle)")
-            print(_c(_COL_SYS, banner))
-            ended = _exchange_turn(
-                ctx, f"[silence for {duration} seconds]",
-                chat_jsonl_path, session_path, session, report_language,
-            )
-            if ended:
-                _render_end_call_box(report_language)
-                _render_footer(session["turns"], report_language, post_call=True)
-                in_post_call = True
-            continue
 
         user_input = (user_input or "").strip()
         if not user_input:
@@ -758,6 +925,7 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
                 user_input, run_dir, session_path,
                 chat_jsonl_path, staged_path,
                 abs_prompt, report_language, session, ctx,
+                var_state, pending_var_cues,
             )
             if should_quit:
                 return 0
@@ -766,10 +934,6 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
                 in_post_call = True
             elif in_post_call and cmd_word == "reset":
                 in_post_call = False
-            elif in_post_call:
-                # Re-paint the post-call footer in case the slash command's
-                # output scrolled past it (e.g., /history dumps many lines).
-                _render_footer(session["turns"], report_language, post_call=True)
             continue
 
         if in_post_call:
@@ -782,19 +946,21 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
             _archive, ended_again = _start_fresh_call(
                 ctx, run_dir, chat_jsonl_path, session_path, session,
                 report_language, pending_user_msg=user_input,
+                var_state=var_state,
             )
             if ended_again:
                 _render_end_call_box(report_language)
-                _render_footer(session["turns"], report_language, post_call=True)
                 # in_post_call stays True
             else:
                 in_post_call = False
             continue
 
-        # Normal turn — delegate to the shared exchange helper.
+        # Normal turn — delegate to the shared exchange helper. Any pending
+        # variable-update cues ride as a hidden prefix on this turn.
         print()  # blank line before the reply
         ended = _exchange_turn(ctx, user_input, chat_jsonl_path, session_path,
-                               session, report_language)
+                               session, report_language,
+                               system_prefix=_pop_var_cues(pending_var_cues))
         if ended:
             # v0.5.19: persona signalled end-of-call. Previously this
             # auto-exited via _exit_cleanly; that left no room to /save
@@ -802,7 +968,6 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
             # commands still work, the footer advertises the options,
             # and a non-slash message restarts the call.
             _render_end_call_box(report_language)
-            _render_footer(session["turns"], report_language, post_call=True)
             in_post_call = True
 
 
@@ -812,7 +977,8 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
 def _dispatch_slash(user_input: str, run_dir: str, session_path: str,
                     chat_jsonl_path: str, staged_path: str, abs_prompt: str,
                     report_language: str, session: dict,
-                    ctx: "_SubprocessCtx") -> tuple[bool, bool]:
+                    ctx: "_SubprocessCtx", var_state: dict,
+                    pending_var_cues: list) -> tuple[bool, bool]:
     """Returns (should_quit, entered_post_call).
 
     `entered_post_call` is True when a slash command produced a turn that
@@ -820,6 +986,10 @@ def _dispatch_slash(user_input: str, run_dir: str, session_path: str,
     silence event to the persona, who may invoke the silence-policy
     hangup). REPL uses the flag to flip into post-call mode after the
     dispatch returns.
+
+    v0.6.0: /vars, /set, /unset read & mutate `var_state` (the live variable
+    bindings) and append their [SYSTEM: variable update] cue to
+    `pending_var_cues`, which rides the next user turn.
     """
     parts = user_input.lstrip("/").strip().split(None, 1)
     cmd = parts[0].lower() if parts else ""
@@ -830,15 +1000,22 @@ def _dispatch_slash(user_input: str, run_dir: str, session_path: str,
     elif cmd == "history":
         _handle_history(chat_jsonl_path, report_language, session.get("persona_name"))
     elif cmd == "reset":
-        _handle_reset(run_dir, chat_jsonl_path, session_path, session, report_language, ctx)
+        _handle_reset(run_dir, chat_jsonl_path, session_path, session,
+                      report_language, ctx, var_state)
     elif cmd == "silence":
         entered_post_call = _handle_silence(
             arg, ctx, chat_jsonl_path, session_path, session, report_language,
         )
-    elif cmd in ("silence-auto", "silenceauto", "autosilence"):
-        _handle_silence_auto(arg, session_path, session, report_language)
     elif cmd == "commit":
         _handle_commit(abs_prompt, staged_path, session_path, session, report_language)
+    elif cmd in ("vars", "variables", "değişkenler", "degiskenler"):
+        _handle_vars(var_state, report_language)
+    elif cmd == "set":
+        _handle_set(arg, run_dir, abs_prompt, var_state, session_path, session,
+                    pending_var_cues, report_language)
+    elif cmd == "unset":
+        _handle_unset(arg, run_dir, abs_prompt, var_state, session_path, session,
+                      pending_var_cues, report_language)
     elif cmd == "help":
         _handle_help(report_language)
     elif cmd == "quit":
@@ -853,6 +1030,123 @@ def _dispatch_slash(user_input: str, run_dir: str, session_path: str,
     return False, entered_post_call
 
 
+def _pop_var_cues(pending_var_cues: list) -> str:
+    """Drain queued variable-update cues into a single hidden prefix for the
+    next user turn, then clear the queue. Empty string when nothing pending."""
+    if not pending_var_cues:
+        return ""
+    prefix = "\n".join(pending_var_cues) + "\n\n"
+    pending_var_cues.clear()
+    return prefix
+
+
+def _parse_set_arg(arg: str) -> "tuple[str | None, str | None]":
+    """Parse '/set name=value' or '/set name value'. Returns (name, value);
+    (None, None) when the arg has no value part."""
+    arg = (arg or "").strip()
+    if not arg:
+        return None, None
+    if "=" in arg:
+        name, value = arg.split("=", 1)
+        return name.strip(), value.strip()
+    pieces = arg.split(None, 1)
+    if len(pieces) == 2:
+        return pieces[0].strip(), pieces[1].strip()
+    return None, None
+
+
+def _handle_vars(var_state: dict, report_language: str) -> None:
+    """v0.6.0: list detected variables with their current bound value (or
+    '(rastgele)' when unbound — the model invents one per framing rule 10)."""
+    detected = var_state.get("detected") or []
+    values = var_state.get("values") or {}
+    print()
+    if not detected:
+        print(_c(_COL_DIM, "Bu prompt'ta değişken tespit edilmedi."
+                  if report_language == "tr"
+                  else "No variables detected in this prompt."))
+        print()
+        return
+    header = ("Değişkenler (/set ad=değer ile değiştir):" if report_language == "tr"
+              else "Variables (change with /set name=value):")
+    print(_c(_COL_BOLD, header))
+    name_w = max(len(d["name"]) for d in detected)
+    unbound_label = "(rastgele)" if report_language == "tr" else "(random)"
+    for d in detected:
+        name = d["name"]
+        val = values.get(name)
+        shown = _c(_COL_BOT, val) if val else _c(_COL_DIM, unbound_label)
+        print(f"  {_c(_COL_USER, name.ljust(name_w))}  {shown}  {_c(_COL_DIM, d['token'])}")
+    print()
+
+
+def _handle_set(arg: str, run_dir: str, abs_prompt: str, var_state: dict,
+                session_path: str, session: dict, pending_var_cues: list,
+                report_language: str) -> None:
+    """v0.6.0: bind/rebind a variable mid-chat. Updates the live state,
+    persists to both variables.json and the prompt-level sidecar, and queues
+    a [SYSTEM: variable update] cue that the persona adopts on the next turn
+    (no subprocess respawn → conversation history preserved)."""
+    name, value = _parse_set_arg(arg)
+    if not name or value is None:
+        print("kullanım: /set ad=değer  (ya da: /set ad değer)"
+              if report_language == "tr"
+              else "usage: /set name=value  (or: /set name value)")
+        return
+    detected_names = {d["name"] for d in var_state.get("detected") or []}
+    var_state.setdefault("values", {})[name] = value
+    ok, msg = _persist_variables(run_dir, abs_prompt, var_state)
+    # Keep the caller-name override in sync for any later /reset fresh-call.
+    session["bound_caller_name"] = _resolve_caller_name_override(var_state["values"])
+    _atomic_write_json(session_path, session)
+    pending_var_cues.append(
+        f'[SYSTEM: variable update — {name} is now "{value}". '
+        f'Use this value for the matching placeholder from now on.]'
+    )
+    if name not in detected_names:
+        print(_c(_COL_DIM,
+              f"  not: '{name}' prompt'ta token olarak görünmüyor — yine de kaydedildi."
+              if report_language == "tr"
+              else f"  note: '{name}' is not a detected token — stored anyway."))
+    if not ok:
+        print(_c(_COL_ERR, f"  sidecar yazılamadı: {msg}" if report_language == "tr"
+                  else f"  sidecar write failed: {msg}"))
+    print(_c(_COL_SYS,
+          f'{name} = "{value}" — sonraki turda uygulanacak, sidecar\'a yazıldı.'
+          if report_language == "tr"
+          else f'{name} = "{value}" — applies next turn, written to sidecar.'))
+
+
+def _handle_unset(arg: str, run_dir: str, abs_prompt: str, var_state: dict,
+                  session_path: str, session: dict, pending_var_cues: list,
+                  report_language: str) -> None:
+    """v0.6.0: drop a binding so the model invents the value again. Persists
+    the removal and queues a cue telling the persona the value is now unknown."""
+    name = (arg or "").strip().split("=", 1)[0].strip()
+    if not name:
+        print("kullanım: /unset ad" if report_language == "tr" else "usage: /unset name")
+        return
+    values = var_state.setdefault("values", {})
+    if name not in values:
+        print(f"'{name}' zaten bağlı değil." if report_language == "tr"
+              else f"'{name}' is not bound.")
+        return
+    values.pop(name, None)
+    ok, msg = _persist_variables(run_dir, abs_prompt, var_state)
+    session["bound_caller_name"] = _resolve_caller_name_override(var_state["values"])
+    _atomic_write_json(session_path, session)
+    pending_var_cues.append(
+        f"[SYSTEM: variable update — {name}'s value is now unknown. "
+        f"Invent a plausible value for the matching placeholder per your normal rules.]"
+    )
+    if not ok:
+        print(_c(_COL_ERR, f"  sidecar yazılamadı: {msg}" if report_language == "tr"
+                  else f"  sidecar write failed: {msg}"))
+    print(_c(_COL_SYS, f"{name} bağlantısı kaldırıldı — model uyduracak."
+              if report_language == "tr"
+              else f"{name} unbound — model will invent it."))
+
+
 def _handle_help(report_language: str) -> None:
     """v0.5.11: dump the command crib at any time during the chat."""
     if report_language == "tr":
@@ -862,7 +1156,9 @@ def _handle_help(report_language: str) -> None:
         print(f"  {_c(_COL_USER, '/history')}              — bu oturumdaki turları göster")
         print(f"  {_c(_COL_USER, '/reset')}                — geçmişi sil, baştan başla (fresh persona + arayan)")
         print(f"  {_c(_COL_USER, '/silence <N>')}          — N saniye sessizlik simüle et (manuel)")
-        print(f"  {_c(_COL_USER, '/silence-auto [on|off|N]')} — boş bekleyince otomatik sessizlik (kapalı; açıldığında {_SILENCE_ON_DEFAULT_SECS} sn)")
+        print(f"  {_c(_COL_USER, '/vars')}                 — tespit edilen değişkenleri + değerlerini göster")
+        print(f"  {_c(_COL_USER, '/set ad=değer')}         — değişkeni anlık değiştir (sonraki turda uygulanır)")
+        print(f"  {_c(_COL_USER, '/unset ad')}             — değişken bağını kaldır (model uydurur)")
         print(f"  {_c(_COL_USER, '/commit')}               — staged anchor'ları sidecar dosyaya yaz")
         print(f"  {_c(_COL_USER, '/help')}                 — bu listeyi göster")
         print(f"  {_c(_COL_USER, '/quit')}                 — çıkış + final summary")
@@ -874,7 +1170,9 @@ def _handle_help(report_language: str) -> None:
         print(f"  {_c(_COL_USER, '/history')}              — show this session's turns")
         print(f"  {_c(_COL_USER, '/reset')}                — discard history, fresh persona + caller")
         print(f"  {_c(_COL_USER, '/silence <N>')}          — simulate N seconds of caller silence (manual)")
-        print(f"  {_c(_COL_USER, '/silence-auto [on|off|N]')} — fire silence after idle (off; when enabled {_SILENCE_ON_DEFAULT_SECS}s)")
+        print(f"  {_c(_COL_USER, '/vars')}                 — show detected variables + their values")
+        print(f"  {_c(_COL_USER, '/set name=value')}       — rebind a variable live (applies next turn)")
+        print(f"  {_c(_COL_USER, '/unset name')}           — drop a binding (model invents it)")
         print(f"  {_c(_COL_USER, '/commit')}               — write staged anchors to the sidecar file")
         print(f"  {_c(_COL_USER, '/help')}                 — show this list")
         print(f"  {_c(_COL_USER, '/quit')}                 — exit with a final summary")
@@ -915,83 +1213,8 @@ def _handle_silence(arg: str, ctx: "_SubprocessCtx", chat_jsonl_path: str,
     )
     if ended:
         _render_end_call_box(report_language)
-        _render_footer(session["turns"], report_language, post_call=True)
         return True
     return False
-
-
-def _handle_silence_auto(arg: str, session_path: str, session: dict,
-                         report_language: str) -> None:
-    """v0.5.14: configure the idle-silence auto-timeout.
-
-      /silence-auto              → show current setting
-      /silence-auto off          → disable auto-silence (manual /silence only)
-      /silence-auto on           → enable with the default threshold (10s)
-      /silence-auto <N>          → enable with custom threshold N seconds
-                                   (N=0 disables; alias for off)
-    """
-    arg_l = (arg or "").strip().lower()
-    cur = int(session.get("idle_silence_secs", 0) or 0)
-
-    if not arg_l:
-        if not _IDLE_TIMEOUT_OK:
-            msg = ("Otomatik sessizlik bu platformda desteklenmiyor (Windows). "
-                   "Manuel /silence <N> kullan."
-                   if report_language == "tr"
-                   else "Auto-silence is not supported on this platform "
-                        "(Windows). Use manual /silence <N>.")
-        elif cur > 0:
-            msg = (f"Otomatik sessizlik AÇIK · eşik: {cur} sn. "
-                   f"Kapatmak için: /silence-auto off"
-                   if report_language == "tr"
-                   else f"Auto-silence ON · threshold: {cur}s. "
-                        f"Disable: /silence-auto off")
-        else:
-            msg = (f"Otomatik sessizlik KAPALI. Açmak için: /silence-auto on "
-                   f"(varsayılan {_SILENCE_ON_DEFAULT_SECS} sn)"
-                   if report_language == "tr"
-                   else f"Auto-silence OFF. Enable: /silence-auto on "
-                        f"(default {_SILENCE_ON_DEFAULT_SECS}s)")
-        print(msg)
-        return
-
-    if arg_l in ("off", "kapat", "kapali", "kapalı", "0"):
-        session["idle_silence_secs"] = 0
-        _atomic_write_json(session_path, session)
-        print("Otomatik sessizlik kapatıldı." if report_language == "tr"
-              else "Auto-silence disabled.")
-        return
-
-    if arg_l in ("on", "ac", "aç", "open"):
-        session["idle_silence_secs"] = _SILENCE_ON_DEFAULT_SECS
-        _atomic_write_json(session_path, session)
-        msg = (f"Otomatik sessizlik açıldı · eşik: {_SILENCE_ON_DEFAULT_SECS} sn."
-               if report_language == "tr"
-               else f"Auto-silence enabled · threshold: {_SILENCE_ON_DEFAULT_SECS}s.")
-        print(msg)
-        return
-
-    try:
-        n = int(arg_l)
-        if n < 0:
-            raise ValueError
-    except ValueError:
-        msg = ("kullanım: /silence-auto [on|off|<saniye>]"
-               if report_language == "tr"
-               else "usage: /silence-auto [on|off|<seconds>]")
-        print(msg)
-        return
-
-    session["idle_silence_secs"] = n
-    _atomic_write_json(session_path, session)
-    if n == 0:
-        print("Otomatik sessizlik kapatıldı." if report_language == "tr"
-              else "Auto-silence disabled.")
-    else:
-        msg = (f"Otomatik sessizlik eşiği: {n} sn."
-               if report_language == "tr"
-               else f"Auto-silence threshold: {n}s.")
-        print(msg)
 
 
 def _handle_save(chat_jsonl_path: str, staged_path: str, report_language: str,
@@ -1105,7 +1328,8 @@ def _handle_history(chat_jsonl_path: str, report_language: str,
 def _start_fresh_call(ctx: "_SubprocessCtx", run_dir: str,
                       chat_jsonl_path: str, session_path: str, session: dict,
                       report_language: str,
-                      pending_user_msg: str | None = None
+                      pending_user_msg: str | None = None,
+                      var_state: "dict | None" = None
                       ) -> tuple[str | None, bool]:
     """v0.5.19: shared "start a new call" pipeline used by both /reset and
     the post-call auto-restart path (user types a non-slash message after
@@ -1137,11 +1361,17 @@ def _start_fresh_call(ctx: "_SubprocessCtx", run_dir: str,
         archive_name = os.path.basename(archive)
     open(chat_jsonl_path, "w").close()
 
-    first = random.choice(_TR_FIRST_NAMES)
-    last = random.choice(_TR_LAST_NAMES)
+    # v0.6.0: a bound caller-name variable survives a fresh call (the user
+    # set it deliberately); otherwise re-roll a random Turkish identity.
+    bound_caller = session.get("bound_caller_name")
+    if bound_caller:
+        session["caller_name"] = bound_caller
+    else:
+        first = random.choice(_TR_FIRST_NAMES)
+        last = random.choice(_TR_LAST_NAMES)
+        session["caller_name"] = f"{first} {last}"
     session["turns"] = 0
     session["chat_session_uuid"] = str(uuid.uuid4())
-    session["caller_name"] = f"{first} {last}"
     session["persona_name"] = None
     session["session_started_at"] = datetime.datetime.now(
         datetime.timezone.utc).isoformat()
@@ -1149,6 +1379,10 @@ def _start_fresh_call(ctx: "_SubprocessCtx", run_dir: str,
 
     ctx.close()
     ctx.session_uuid = session["chat_session_uuid"]
+    # v0.6.0: re-substitute current variable values into the system prompt so
+    # the fresh call picks up any mid-chat /set edits before the subprocess
+    # reloads its --system-prompt-file.
+    _refresh_wrapped_body(ctx, run_dir, var_state)
     ctx.start()
 
     print()
@@ -1173,7 +1407,6 @@ def _start_fresh_call(ctx: "_SubprocessCtx", run_dir: str,
     session["turns"] = 1
     _atomic_write_json(session_path, session)
     _render_bot_reply(opening, session.get("persona_name"))
-    _render_footer(session["turns"], report_language)
 
     if opening_ended:
         return archive_name, True
@@ -1189,12 +1422,13 @@ def _start_fresh_call(ctx: "_SubprocessCtx", run_dir: str,
 
 def _handle_reset(run_dir: str, chat_jsonl_path: str, session_path: str,
                   session: dict, report_language: str,
-                  ctx: "_SubprocessCtx") -> None:
+                  ctx: "_SubprocessCtx", var_state: "dict | None" = None) -> None:
     if os.path.getsize(chat_jsonl_path) == 0 and session.get("turns", 0) == 0:
         print("Geçmiş zaten boş." if report_language == "tr" else "History already empty.")
         return
     archive_name, _ended = _start_fresh_call(
         ctx, run_dir, chat_jsonl_path, session_path, session, report_language,
+        var_state=var_state,
     )
     if archive_name:
         msg = (f"Sıfırlandı. Geçmiş arşivlendi: {archive_name}. Yeni arayan: {session['caller_name']}."
@@ -1291,15 +1525,6 @@ def _exit_cleanly(run_dir: str, session_path: str, chat_jsonl_path: str,
     turns = session.get("turns", 0)
     total_committed = sum(c.get("count", 0) for c in session.get("commits", []))
 
-    # v0.5.26: leave the alternate screen BEFORE rendering the summary
-    # card so the card lands in the main terminal's scrollback. If we
-    # rendered it inside the alt screen, _leave_alt_screen would wipe
-    # the whole canvas — including the summary — as soon as main()'s
-    # finally block ran. _release_pin first so the print() calls
-    # below aren't constrained to the scroll region.
-    _release_pin()
-    _leave_alt_screen()
-
     _render_summary_card(run_dir, report_language, turns, total_committed,
                          session.get("session_started_at"))
 
@@ -1373,57 +1598,13 @@ def _render_bot_reply(text: str, persona_name: str | None) -> None:
         print()
 
 
-# v0.5.13: terminal width / height probe + pinned bottom footer.
-# v0.5.26: pinned footer now lives inside an alternate screen buffer
-# (`\033[?1049h`) so the main terminal scrollback is untouched.
-# DECSTBM scroll region starts at `_PIN_TOP_ROW` (right below the
-# welcome banner) and ends at `rows - 1`, leaving row `rows` reserved
-# for the sticky footer.
-_PIN_ACTIVE = False
-_PIN_TOP_ROW = 1
-_ALT_SCREEN_ACTIVE = False
-
-
+# v0.5.13: terminal width / height probe.
+# v0.6.0: the alt-screen + DECSTBM pinned-footer experiment (v0.5.26) was
+# removed — it never shipped past v0.5.27's no-op stubs. The footer is drawn
+# logically by _input_prompt (above the arrow, cleared on Enter).
 def _term_size() -> tuple[int, int]:
     cols, rows = shutil.get_terminal_size((80, 24))
     return cols, rows
-
-
-def _enter_alt_screen() -> None:
-    """v0.5.27: alt-screen experiment shelved.
-
-    v0.5.26 wrapped the chat in `\\033[?1049h` so the banner could sit
-    on row 1 of a clean canvas and DECSTBM could pin a footer to the
-    bottom row. In Terminal.app the combination produced unpredictable
-    rendering — banner halves got overwritten by the spinner's inline
-    `\\r\\033[2K` paint, the bot's opening reply collided with the
-    input arrow, and the user saw a visual mess.
-
-    Sticky footer is back to a "logical" approach in v0.5.27:
-    _input_prompt prints the footer line right above the arrow, and
-    _rerender_user_oneliner clears both lines on Enter. The result is
-    a footer that's visible while the user is typing — the only moment
-    it matters — and gone from the scrollback between turns. No alt
-    screen, no scroll region, no terminal-mode trickery.
-    """
-    return
-
-
-def _leave_alt_screen() -> None:
-    """v0.5.27: paired with _enter_alt_screen no-op — nothing to leave."""
-    return
-
-
-def _init_pin(top_row: int = 1) -> None:
-    """v0.5.27: pinned-footer attempt deferred; see _enter_alt_screen
-    docstring for the rationale. Footer is now drawn by _input_prompt
-    and torn down by _rerender_user_oneliner."""
-    return
-
-
-def _release_pin() -> None:
-    """v0.5.27: paired no-op for _init_pin."""
-    return
 
 
 def _compute_footer_line(turn: int, report_language: str,
@@ -1444,37 +1625,15 @@ def _compute_footer_line(turn: int, report_language: str,
             else f"― [turn {turn} · {cmds}]")
 
 
-def _render_footer(turn: int, report_language: str,
-                   post_call: bool = False) -> None:
-    """v0.5.27: deprecated — footer is drawn by _input_prompt now,
-    immediately above the user's arrow prompt, so it stays visually
-    attached to the input area and disappears from the scrollback once
-    the user submits a turn. This stub stays as a no-op for backwards
-    compatibility with the existing call sites (main(), _repl,
-    _exchange_turn, _start_fresh_call, _handle_silence) — none of
-    them need to be touched until the next cleanup pass."""
-    return
+def _input_prompt(report_language: str = "tr", footer: str = "") -> str:
+    """Render the orange input prompt and read one line via cooked `input()`
+    (readline history + line editing). Returns the submitted text (may be
+    empty). EOFError / KeyboardInterrupt propagate to the REPL.
 
-
-def _input_prompt(idle_timeout: float | None = None,
-                  report_language: str = "tr",
-                  footer: str = "") -> tuple[str | None, bool]:
-    """Render the user input prompt in orange and read a line.
-
-    Returns (text, timed_out):
-      - (text, False) when the user submits a line (text may be empty).
-      - (None,  True) when no Enter arrived within `idle_timeout`
-        seconds (idle-silence trigger — Unix only).
-
-    v0.5.14: optional idle timeout that fires the auto-silence path.
-    v0.5.19: after input() returns we redraw the echo using the same
-    one-liner format as the bot ('sen [hh:mm] « text') instead of
-    pushing it to the right edge — matches the per-turn render style
-    introduced in v0.5.19.
-    v0.5.27: optional `footer` string is printed on its own line right
-    above the arrow so it visually attaches to the input area. Both
-    the echo and footer lines are cleared on Enter / timeout so they
-    don't accumulate in the scrollback between turns.
+    v0.5.27: optional `footer` is printed on its own line right above the
+    arrow so it visually attaches to the input area; the echo + footer
+    lines are cleared on Enter (via _rerender_user_oneliner) so they don't
+    accumulate in the scrollback between turns.
     """
     if footer and _TTY:
         with _STDOUT_LOCK:
@@ -1482,154 +1641,16 @@ def _input_prompt(idle_timeout: float | None = None,
             sys.stdout.write("\n")
             sys.stdout.flush()
     arrow = _c(_COL_USER, _c(_COL_BOLD, "❯ "))
-    text, timed_out = _read_with_idle_timeout(arrow, idle_timeout)
-    if timed_out:
-        # Clear the empty echoed prompt line AND the footer above it so
-        # the silence banner that follows renders on a fresh row.
-        if _TTY:
-            with _STDOUT_LOCK:
-                sys.stdout.write("\r\033[2K")
-                if footer:
-                    sys.stdout.write("\033[1A\r\033[2K")
-                sys.stdout.flush()
-        return None, True
+    text = input(arrow)
     if text and text.strip() and _TTY:
         _rerender_user_oneliner(text, report_language, has_footer=bool(footer))
-    return text, False
-
-
-def _read_with_idle_timeout(arrow_prompt: str,
-                            idle_timeout: float | None) -> tuple[str | None, bool]:
-    """Cross-platform line reader with optional idle timeout.
-
-    When idle_timeout is None / 0 / negative — or when running on Windows
-    / a non-TTY stream — falls back to blocking input() in cooked mode
-    (preserving full readline support). On Unix TTYs with a positive
-    timeout, switches to cbreak mode via _read_raw_with_idle_timeout so
-    the silence deadline resets on every keystroke (v0.5.16 — fixes the
-    v0.5.14 race where typing a long reply that hadn't reached Enter in
-    time was tcflushed as silence).
-    """
-    if (not idle_timeout) or idle_timeout <= 0 or (not _IDLE_TIMEOUT_OK) or (
-            not sys.stdin.isatty()):
-        return input(arrow_prompt), False
-    try:
-        return _read_raw_with_idle_timeout(arrow_prompt, float(idle_timeout))
-    except (OSError, ValueError):
-        # Raw-mode setup failed on this stream (unusual fd, no termios
-        # support, etc.). Degrade to cooked input() so the user can still
-        # type — they just lose the silence timer for this turn.
-        return input(), False
-
-
-def _read_raw_with_idle_timeout(arrow_prompt: str,
-                                idle_timeout: float) -> tuple[str | None, bool]:
-    """Read a line in cbreak mode, resetting the silence deadline on each
-    keystroke.
-
-    Minimal line editor — readline history and cursor navigation are
-    intentionally gone (the welcome banner no longer advertises arrow-key
-    history). Handles:
-      • UTF-8 multi-byte sequences via an incremental decoder so a code
-        point split across two os.read() chunks is never echoed half-way,
-      • Backspace (0x7f / 0x08) — pops one code point and emits ``\\b \\b``,
-      • Enter (CR or LF) — commits and returns the buffer,
-      • Ctrl-D on empty buffer → EOFError (cbreak keeps ISIG on, so
-        Ctrl-C still arrives as SIGINT → KeyboardInterrupt above us),
-      • CSI / SS3 escape sequences (arrow keys, function keys) — swallowed
-        silently across chunk boundaries via a small state machine,
-      • Other control bytes < 0x20 (Tab, etc.) — dropped to keep the line
-        rendering clean.
-
-    The deadline resets on every chunk received; only a select() that
-    elapses to zero with no further bytes triggers the silence return.
-    Typed chars echo in the terminal's default color — _rerender_user_right
-    repaints them in orange after Enter, matching the v0.5.13 cooked-mode
-    look.
-    """
-    import codecs
-    fd = sys.stdin.fileno()
-    old_attrs = _termios_mod.tcgetattr(fd)
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    buf: list[str] = []
-    in_escape = False
-    escape_first: int | None = None
-
-    with _STDOUT_LOCK:
-        sys.stdout.write(arrow_prompt)
-        sys.stdout.flush()
-
-    try:
-        _tty_mod.setcbreak(fd)
-        deadline = _now_monotonic() + idle_timeout
-        while True:
-            remaining = deadline - _now_monotonic()
-            if remaining <= 0:
-                return None, True
-            ready, _, _ = _select_mod.select([fd], [], [], remaining)
-            if not ready:
-                continue
-            try:
-                chunk = os.read(fd, 256)
-            except OSError:
-                continue
-            if not chunk:
-                raise EOFError
-            deadline = _now_monotonic() + idle_timeout
-
-            for b in chunk:
-                if in_escape:
-                    if escape_first is None:
-                        escape_first = b
-                        # ESC <char> alt-key shortcut terminates immediately
-                        # unless it introduces a CSI ('[') or SS3 ('O').
-                        if b not in (0x5b, 0x4f):
-                            in_escape = False
-                            escape_first = None
-                    elif 0x40 <= b <= 0x7e:
-                        # Final byte of CSI / SS3 sequence.
-                        in_escape = False
-                        escape_first = None
-                    continue
-                if b == 0x03:  # Ctrl-C — defensive: ISIG normally fires SIGINT
-                    raise KeyboardInterrupt
-                if b == 0x04:  # Ctrl-D
-                    if not buf:
-                        raise EOFError
-                    continue
-                if b in (0x0a, 0x0d):
-                    with _STDOUT_LOCK:
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
-                    return "".join(buf), False
-                if b in (0x7f, 0x08):
-                    if buf:
-                        buf.pop()
-                        with _STDOUT_LOCK:
-                            sys.stdout.write("\b \b")
-                            sys.stdout.flush()
-                    continue
-                if b == 0x1b:
-                    in_escape = True
-                    escape_first = None
-                    continue
-                if b < 0x20:
-                    continue
-                # Feed bytes one at a time so a multi-byte code point split
-                # across os.read() boundaries never echoes a half character.
-                ch = decoder.decode(bytes([b]))
-                if ch:
-                    buf.append(ch)
-                    with _STDOUT_LOCK:
-                        sys.stdout.write(ch)
-                        sys.stdout.flush()
-    finally:
-        _termios_mod.tcsetattr(fd, _termios_mod.TCSADRAIN, old_attrs)
+    return text
 
 
 def _exchange_turn(ctx: "_SubprocessCtx", user_msg: str,
                    chat_jsonl_path: str, session_path: str,
-                   session: dict, report_language: str) -> bool:
+                   session: dict, report_language: str,
+                   system_prefix: str = "") -> bool:
     """Send one user message, render the bot reply, return True if call ended.
 
     Centralises the append-user → ctx.send → strip-markers → append-
@@ -1638,11 +1659,17 @@ def _exchange_turn(ctx: "_SubprocessCtx", user_msg: str,
     responsible for any pre-render output (banners, blank lines) and
     end-of-call handling (banner + exit) — this helper only returns the
     "did the persona end the call" flag.
+
+    v0.6.0: `system_prefix` carries queued [SYSTEM: variable update] cues.
+    It is prepended to what the MODEL receives but NOT to the message
+    recorded in chat.jsonl — so anchors/history keep the user's clean text
+    while the persona still learns about the binding change.
     """
     _append_chat_entry(chat_jsonl_path, "user", user_msg)
     try:
         reply_raw = _send_with_spinner(
-            ctx, user_msg, session.get("persona_name"), report_language,
+            ctx, (system_prefix + user_msg) if system_prefix else user_msg,
+            session.get("persona_name"), report_language,
         )
     except RuntimeError as e:
         print(_c(_COL_ERR, f"\n[chat error: {e}]\n"), file=sys.stderr)
@@ -1656,7 +1683,6 @@ def _exchange_turn(ctx: "_SubprocessCtx", user_msg: str,
     session["turns"] = session.get("turns", 0) + 1
     _atomic_write_json(session_path, session)
     _render_bot_reply(reply, session.get("persona_name"))
-    _render_footer(session["turns"], report_language)
     return ended
 
 
@@ -1737,16 +1763,14 @@ class _ThinkingSpinner:
 def _drain_stale_input() -> None:
     """v0.5.17: discard chars the user typed during bot thinking.
 
-    Between bot turns the terminal is in cooked mode (cbreak is only
-    engaged inside _read_raw_with_idle_timeout). Anything typed while
-    ctx.send() blocks goes into the kernel line discipline buffer and
-    echoes inline. Without draining, those chars would (a) re-surface as
-    ghost input on the row where the next bot reply is about to render,
-    and (b) the kernel buffer would feed them straight into the next
-    cbreak select() — making it look like the user typed them
-    *after* the reply.
+    The terminal is in cooked mode between turns; anything typed while
+    ctx.send() blocks goes into the kernel line-discipline buffer and
+    echoes inline. Without draining, those chars would re-surface as ghost
+    input on the row where the next bot reply renders, and feed straight
+    into the next input() — looking like the user typed them after the
+    reply. Best-effort; needs termios (Unix TTY only).
     """
-    if not _IDLE_TIMEOUT_OK or not sys.stdin.isatty():
+    if not _TERMIOS_OK or not sys.stdin.isatty():
         return
     try:
         _termios_mod.tcflush(sys.stdin.fileno(), _termios_mod.TCIFLUSH)
@@ -1777,66 +1801,64 @@ def _send_with_spinner(ctx: "_SubprocessCtx", msg: str,
 
 def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                    report_language: str, caller_name: str,
-                   session: dict) -> int:
-    """v0.5.19: replaced the legacy three-bar layout with a single boxed
-    frame so the welcome reads as one card. Same information density —
-    prompt name + line count, caller, isolation mode, idle-silence hint,
-    command crib — but visually cohesive with the end-call banner and
-    final summary card that share the same _render_box helper.
-
-    v0.5.25: idle-silence hint simplified back to on/off. The prompt's
-    own silence policy (1st/2nd/3rd silence stages with their own
-    thresholds) is exercised via manual `/silence N` calls, not via a
-    single auto-fire threshold we'd have to pick for the user.
-
-    v0.5.26: returns the number of rows the banner occupies so main()
-    can size the DECSTBM scroll region to start RIGHT BELOW the
-    banner — banner stays pinned, conversation scrolls underneath."""
+                   session: dict, var_state: "dict | None" = None) -> int:
+    """v0.5.19: single boxed welcome card — prompt name + line count, caller,
+    variable-binding summary, isolation mode, and the command crib — sharing
+    the _render_box helper with the end-call banner and final summary card.
+    Returns the banner's row count (non-TTY logging only; v0.6.0 no longer
+    uses it for layout)."""
     basename = os.path.basename(abs_prompt).rsplit(".", 1)[0]
     line_count = sum(1 for _ in open(os.path.join(run_dir, "body.txt"), encoding="utf-8"))
-    idle_secs = int(session.get("idle_silence_secs", 0) or 0)
-    if not _IDLE_TIMEOUT_OK:
-        idle_hint_tr = "Otomatik sessizlik: bu platformda kapalı (manuel /silence <N>)."
-        idle_hint_en = "Auto-silence: disabled on this platform (use manual /silence <N>)."
-    elif idle_secs <= 0:
-        idle_hint_tr = ("Otomatik sessizlik: kapalı · persona silence policy'sini "
-                        "/silence <N> ile test et")
-        idle_hint_en = ("Auto-silence: off · use /silence <N> to trigger the persona's "
-                        "own silence policy stages")
-    else:
-        idle_hint_tr = (f"Otomatik sessizlik: {idle_secs} sn (manuel ayar · "
-                        f"kapatmak için /silence-auto off)")
-        idle_hint_en = (f"Auto-silence: {idle_secs}s (manual override · "
-                        f"disable with /silence-auto off)")
+    silence_hint_tr = "Sessizlik testi için /silence <N> kullan."
+    silence_hint_en = "Use /silence <N> to test the persona's silence policy."
+
+    # v0.6.0: one-line variable-binding summary (omitted when the prompt has
+    # no detected tokens) so the tester sees how many constants are bound
+    # before the call opens.
+    detected = (var_state or {}).get("detected") or []
+    values = (var_state or {}).get("values") or {}
+    bound_n = sum(1 for d in detected if values.get(d["name"]))
+    vars_line_tr = (f"{bound_n}/{len(detected)} bağlı · /vars ile gör · "
+                    f"/set ad=değer ile değiştir") if detected else None
+    vars_line_en = (f"{bound_n}/{len(detected)} bound · /vars to view · "
+                    f"/set name=value to change") if detected else None
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.5.29"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.6.0"))
     print()
     if report_language == "tr":
         lines = [
-            f"{_c(_COL_DIM, 'Prompt   ')} {_c(_COL_BOLD, basename)} "
+            f"{_c(_COL_DIM, 'Prompt    ')} {_c(_COL_BOLD, basename)} "
             f"{_c(_COL_DIM, f'({line_count} satır · model: {chat_model})')}",
-            f"{_c(_COL_DIM, 'Arayan   ')} {_c(_COL_BOLD, caller_name)}",
-            f"{_c(_COL_DIM, 'İzolasyon')} {_c(_COL_DIM, 'yeni pencere · bare Claude session')}",
+            f"{_c(_COL_DIM, 'Arayan    ')} {_c(_COL_BOLD, caller_name)}",
+        ]
+        if vars_line_tr:
+            lines.append(f"{_c(_COL_DIM, 'Değişken  ')} {_c(_COL_BOLD, vars_line_tr)}")
+        lines += [
+            f"{_c(_COL_DIM, 'İzolasyon ')} {_c(_COL_DIM, 'yeni pencere · bare Claude session')}",
             "",
             _c(_COL_DIM, "Bot birazdan kendisi selamlayacak — aramayı cevapladın."),
-            _c(_COL_DIM, idle_hint_tr),
+            _c(_COL_DIM, silence_hint_tr),
             "",
             _c(_COL_DIM, "Komutlar:") + " " + _c(_COL_USER,
-                "/save · /history · /reset · /silence · /commit · /help · /quit"),
+                "/save · /history · /reset · /silence · /vars · /set · /commit · /help · /quit"),
         ]
     else:
         lines = [
-            f"{_c(_COL_DIM, 'Prompt   ')} {_c(_COL_BOLD, basename)} "
+            f"{_c(_COL_DIM, 'Prompt    ')} {_c(_COL_BOLD, basename)} "
             f"{_c(_COL_DIM, f'({line_count} lines · model: {chat_model})')}",
-            f"{_c(_COL_DIM, 'Caller   ')} {_c(_COL_BOLD, caller_name)}",
-            f"{_c(_COL_DIM, 'Isolation')} {_c(_COL_DIM, 'new window · bare Claude session')}",
+            f"{_c(_COL_DIM, 'Caller    ')} {_c(_COL_BOLD, caller_name)}",
+        ]
+        if vars_line_en:
+            lines.append(f"{_c(_COL_DIM, 'Variables ')} {_c(_COL_BOLD, vars_line_en)}")
+        lines += [
+            f"{_c(_COL_DIM, 'Isolation ')} {_c(_COL_DIM, 'new window · bare Claude session')}",
             "",
             _c(_COL_DIM, "The bot will greet you first — you're the caller answering."),
-            _c(_COL_DIM, idle_hint_en),
+            _c(_COL_DIM, silence_hint_en),
             "",
             _c(_COL_DIM, "Commands:") + " " + _c(_COL_USER,
-                "/save · /history · /reset · /silence · /commit · /help · /quit"),
+                "/save · /history · /reset · /silence · /vars · /set · /commit · /help · /quit"),
         ]
     box_rows = _render_box(title, lines)
     # 1 leading blank line (the print() above) + box rows.

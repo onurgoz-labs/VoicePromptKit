@@ -5,23 +5,24 @@ description: Interactive chat simulator for a prompt file. Loads the prompt as t
 
 # prompt-chat
 
-You give a prompt file `$1` and a conversation. The skill loads the prompt as the simulated system prompt, spawns a `chat-simulator` subagent per turn to produce the persona's reply, accumulates the conversation, and lets you save turns as test anchors that `/prompt-test` can later replay.
+You give a prompt file `$1`. The skill bootstraps state, binds any prompt variables, then spawns `bin/prompt-chat-runner.py` in a new terminal window. The runner loads the prompt as the simulated system prompt of a long-lived bare-Claude subprocess and owns the turn-by-turn conversation, letting you save turns as test anchors that `/prompt-test` can later replay.
 
 `/prompt-chat` is an exploratory tool. It is intentionally separate from `/prompt-check` (audit) and `/prompt-test` (regression) — different mental model, different state, different artefacts. The bridge between them is `<prompt>.anchors.yaml` (the sidecar file — single source of truth for test scenarios; v0.5.1 moved this out of the prompt's frontmatter).
 
 ## Inputs you have
 
 - `$1` — relative or absolute path to the prompt file under chat.
-- `agents/chat-simulator.md` — the subagent that produces each assistant turn (you read its definition once; dispatching it for every turn is the chat loop).
+- `bin/prompt-chat-runner.py` — the Python orchestrator that owns the chat loop (spawned in a new window by Phase 1). v0.5.6 replaced the per-turn `chat-simulator` subagent with a single long-lived bare-Claude subprocess.
 
-## Phase 0+1 — Bootstrap & dispatch (v0.5.18: single bash invocation)
+## Phase 0+1 — Bootstrap, variable binding & dispatch (v0.6.0: two bash blocks)
 
-**IMPORTANT: execute the bash block below as ONE Bash tool call. Do not split it into multiple invocations.** Pre-v0.5.18 split this into five separate blocks (paths/atomic alloc → frontmatter parse → state files → pre-flight → dispatch), which meant the user had to approve five permission prompts per `/prompt-chat` invocation. The consolidated form below is functionally identical but only triggers one prompt.
+**IMPORTANT: execute each fenced bash block below as ONE Bash tool call.** v0.5.18 consolidated bootstrap+dispatch into a single block (one permission prompt). v0.6.0 splits it into **two** blocks because variable binding needs an `AskUserQuestion` in the middle (a main-session tool call cannot run inside a Bash subshell): **Phase 0** (bootstrap + variable detection) → `AskUserQuestion` for any unbound variables → **Phase 1** (persist bindings + pre-flight + dispatch). Two permission prompts, not one — the extra prompt is the cost of pre-chat variable binding. Each block is still self-contained; do not split a block further.
 
-The flow remains the same:
+The flow:
 
-1. **Phase 0** — read `$1`, parse frontmatter, allocate `.promptcheck/<basename>/chat-NNN/`, write `frontmatter.json` / `body.txt` / empty `chat.jsonl` / empty `saved_anchors.json` / initial `session.json`.
-2. **Phase 1** — detect platform + window-spawn capability + Python interpreter, resolve the runner script (dev-repo `bin/` first, plugin cache fallback), spawn the orchestrator in a fresh Terminal / tmux / Windows Terminal session, then exit this skill. The chat session always opens in a new window (v0.5.11 simplification — no in-session / setup-only alternatives).
+1. **Phase 0** — read `$1`, parse frontmatter, allocate `.promptcheck/<basename>/chat-NNN/`, write `frontmatter.json` / `body.txt` / empty `chat.jsonl` / empty `saved_anchors.json` / initial `session.json`; then **detect variables** (`{{...}}` + `[BÜYÜK_HARF]`), merge known values from the `<prompt>.vars.yaml` sidecar + `chat_variables` frontmatter seed, and emit the `UNBOUND_JSON` set.
+2. **Phase 0.5** — for each unbound variable, `AskUserQuestion` for a value (or leave random). Assemble the final `{name: value}` map.
+3. **Phase 1** — persist the bindings (`variables.json` in the run dir + `<prompt>.vars.yaml` sidecar), detect platform + window-spawn capability + Python interpreter, resolve the runner script (dev-repo `bin/` first, plugin cache fallback), spawn the orchestrator in a fresh Terminal / tmux / Windows Terminal session, then exit this skill. The chat session always opens in a new window (v0.5.11 simplification — no in-session / setup-only alternatives).
 
 v0.5.7 — spawn the Python orchestrator DIRECTLY in the new Terminal/tmux window. Do NOT route through `claude '/prompt-chat-session ...'` because Claude Code's skill runtime wraps Python's REPL in a Bash tool call whose subshell has no interactive TTY — Python `input()` immediately hits EOF and the chat exits with 0 turns. Going directly to the Python script gives the runner the real terminal it needs.
 
@@ -160,6 +161,127 @@ session = {
 }
 with open(os.path.join(run_dir, 'session.json'), 'w', encoding='utf-8') as f:
     json.dump(session, f, indent=2, ensure_ascii=False)
+PY
+
+# ---- 0.4: variable detection (v0.6.0) ------------------------------------
+# Scan body for Vapi {{...}} + bracketed [BÜYÜK_HARF] tokens, merge any
+# already-known values (sidecar <prompt>.vars.yaml wins over a frontmatter
+# `chat_variables` seed), and emit the UNBOUND set so the skill can ask the
+# user for values BEFORE the window opens. Writes detected.json (full
+# detected list + known values) and prints two stdout lines the skill
+# parses: DETECTED_JSON=... and UNBOUND_JSON=...
+python3 - "$ABS_PROMPT" "$RUN_DIR" <<'PY'
+import sys, re, json, os
+prompt_path, run_dir = sys.argv[1], sys.argv[2]
+body = open(os.path.join(run_dir, 'body.txt'), encoding='utf-8').read()
+
+MUSTACHE = re.compile(r'\{\{\s*([\w.]+)\s*\}\}')
+BRACKET  = re.compile(r'\[([A-ZÇĞİÖŞÜ_][A-ZÇĞİÖŞÜ0-9_]*)\]')
+DENY = {'SYSTEM', 'PERSONA_NAME', 'END_CALL'}
+
+hits = []
+for m in MUSTACHE.finditer(body):
+    hits.append((m.start(), m.group(0), m.group(1).strip()))
+for m in BRACKET.finditer(body):
+    name = m.group(1).strip()
+    if name not in DENY:
+        hits.append((m.start(), m.group(0), name))
+hits.sort(key=lambda h: h[0])
+seen, detected = set(), []
+for _p, token, name in hits:
+    if token not in seen:
+        seen.add(token)
+        detected.append({'name': name, 'token': token})
+
+# Known values: frontmatter chat_variables seed (read-only) < sidecar.
+known = {}
+try:
+    import yaml
+    text = open(prompt_path, encoding='utf-8').read()
+    fmm = re.match(r'^---\r?\n(.*?)\r?\n---\r?\n?', text, re.DOTALL)
+    if fmm:
+        cv = (yaml.safe_load(fmm.group(1)) or {}).get('chat_variables') or {}
+        if isinstance(cv, dict):
+            known.update({str(k): str(v) for k, v in cv.items()})
+    sidecar = prompt_path + '.vars.yaml'
+    if os.path.exists(sidecar):
+        sc = yaml.safe_load(open(sidecar, encoding='utf-8')) or {}
+        if sc.get('schema_version') == 1 and isinstance(sc.get('variables'), dict):
+            known.update({str(k): str(v) for k, v in sc['variables'].items()})
+except Exception:
+    pass
+
+names = [d['name'] for d in detected]
+values = {n: known[n] for n in names if known.get(n)}
+unbound = [n for n in names if n not in values]
+
+with open(os.path.join(run_dir, 'detected.json'), 'w', encoding='utf-8') as f:
+    json.dump({'detected': detected, 'values': values}, f, ensure_ascii=False, indent=2)
+print('DETECTED_JSON=' + json.dumps(detected, ensure_ascii=False))
+print('UNBOUND_JSON=' + json.dumps(unbound, ensure_ascii=False))
+PY
+```
+
+### Phase 0.5 — Pre-chat variable binding (v0.6.0)
+
+After the Phase 0 block returns, read its `UNBOUND_JSON` line.
+
+- **If `UNBOUND_JSON` is `[]`** (no variables, or all already bound in the sidecar / frontmatter seed): skip the questions — go straight to the Phase 1 block with `BOUND_VALUES_JSON='{}'`.
+- **If it has entries:** for each unbound variable, call `AskUserQuestion` (batch up to 4 variables per call) to collect a value. Per variable:
+  - `header`: the variable name (≤12 chars; truncate if longer).
+  - `question` (TR): `"<name> için ne atayayım?"` · (EN): `"What value for <name>?"`.
+  - `options` (2–4): infer 1–2 **plausible sample values from the name** (a name token → a Turkish full name; a date token → a near-future date; a phone token → a TR mobile number; an account/id token → a plausible id), each as a concrete-value option; plus a final `"(rastgele / model uydursun)"` · `"(random / let the model invent)"` option. The user can always type a custom value via the auto-provided **Other**.
+  - Map the answer: the **random** option → leave the name OUT of the final values (the persona invents it per framing rule 10); any concrete value (sample or Other) → record `name: value`.
+
+Assemble the final `{name: value}` object = (values already known from sidecar/frontmatter) merged with the newly answered ones. Substitute it for `BOUND_VALUES_JSON` in the Phase 1 block below. Prefer double-quoted JSON values.
+
+```bash
+# v0.6.0 Phase 1 — persist bindings, then pre-flight + dispatch.
+# Replace the placeholder with the final {name: value} JSON you assembled
+# (e.g. {"randevu_tarihi":"12 Haziran","MÜŞTERİ_ADI":"Zeynep"}); use {} when
+# there were no variables or the user left everything random.
+BOUND_VALUES_JSON='{}'
+
+# ---- 1.0: write variables.json (run-dir) + <prompt>.vars.yaml (sidecar) --
+# variables.json is this session's resolved set (read by the runner). The
+# sidecar persists values prompt-level across chats. The prompt file itself
+# is NEVER touched → its SHA256 stays stable, cached /prompt-check audits
+# remain valid (same contract as <prompt>.anchors.yaml).
+python3 - "$RUN_DIR" "$ABS_PROMPT" "$BOUND_VALUES_JSON" <<'PY'
+import sys, json, os
+run_dir, prompt_path, bound_json = sys.argv[1], sys.argv[2], sys.argv[3]
+detected = json.load(open(os.path.join(run_dir, 'detected.json'), encoding='utf-8')).get('detected', [])
+try:
+    bound = json.loads(bound_json) if bound_json.strip() else {}
+    bound = bound if isinstance(bound, dict) else {}
+except Exception:
+    bound = {}
+values = {str(k): str(v) for k, v in bound.items() if str(v) != ''}
+
+with open(os.path.join(run_dir, 'variables.json'), 'w', encoding='utf-8') as f:
+    json.dump({'detected': detected, 'values': values}, f, ensure_ascii=False, indent=2)
+
+if values:
+    try:
+        import yaml
+        sidecar = prompt_path + '.vars.yaml'
+        existing = {}
+        if os.path.exists(sidecar):
+            sc = yaml.safe_load(open(sidecar, encoding='utf-8')) or {}
+            if sc.get('schema_version') == 1 and isinstance(sc.get('variables'), dict):
+                existing = {str(k): str(v) for k, v in sc['variables'].items()}
+        doc = {'schema_version': 1, 'variables': {**existing, **values}}
+        tmp = sidecar + '.tmp.' + str(os.getpid())
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(yaml.safe_dump(doc, allow_unicode=True, sort_keys=False, default_flow_style=False))
+        chk = yaml.safe_load(open(tmp, encoding='utf-8')) or {}
+        if chk.get('schema_version') == 1 and isinstance(chk.get('variables'), dict):
+            os.rename(tmp, sidecar)
+        else:
+            os.remove(tmp)
+    except Exception as e:
+        print(f'WARN: vars sidecar not written: {e}', file=sys.stderr)
+print('OK variables persisted')
 PY
 
 # ---- 1.1: pre-flight — platform / python / window-spawn capability --------
@@ -316,89 +438,27 @@ Komutlar:
   /save           — son turu anchor olarak kaydet (staging)
   /history        — bu oturumdaki turları göster
   /reset          — geçmişi sil, baştan başla
+  /vars           — tespit edilen değişkenleri + değerlerini göster
+  /set ad=değer   — değişkeni anlık değiştir (sonraki turda uygulanır)
+  /unset ad       — değişken bağını kaldır (model uydurur)
   /commit         — staged anchor'ları sidecar'a (<prompt>.anchors.yaml) yaz
   /quit           — çıkış + final summary
 ```
 
 **EN:** same content, English labels.
 
-After printing, **stop**. Wait for the user's first message (Phase 3 starts on their next turn).
-
-**Crucial:** do not call any tool after printing the welcome. Skill emits the welcome text as its assistant turn, then the user types their first message, which becomes the next user turn. The skill resumes in Phase 3.
+After printing the welcome, the runner waits for the user's first message.
 
 ## Phase 3 — Chat loop (per user turn)
 
-Each time the user sends a message, this is your one assistant turn to process it:
+> **Implemented in `bin/prompt-chat-runner.py`, not executed by this skill.** After Phase 1 dispatches the runner into a new window, this skill has already exited — the runner owns every subsequent turn. This section (and Phases 4–8) documents the runner's behavior; the canonical implementation is the Python script (see Phase 6).
 
-### Step 3.1 — Slash command check
+Per user turn the runner:
 
-If `user_message.strip().startswith("/")`:
-- Parse the command + optional args
-- Dispatch to Phase 4
-- (Slash commands do NOT go to chat.jsonl; they are skill-level control)
-- Return to chat loop after Phase 4 completes
+1. **Slash command?** If the message starts with `/`, it dispatches to the matching handler (Phase 4); slash commands are control and are never written to `chat.jsonl`.
+2. **Otherwise** it appends the user message to `chat.jsonl`, sends it to the long-lived bare-Claude subprocess, streams the persona's reply, appends the reply to `chat.jsonl`, bumps `session.json.turns`, and renders the reply followed by the compact footer (`― [tur N · …]`, language per `report_language`). Then it waits for the next turn.
 
-### Step 3.2 — Normal message handling
-
-Append to `chat.jsonl` (atomic per-line append):
-
-```bash
-python3 - "$RUN_DIR" "$USER_MESSAGE" <<'PY'
-import sys, json, os, datetime
-run_dir, user_message = sys.argv[1], sys.argv[2]
-entry = {
-    "role": "user",
-    "content": user_message,
-    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat()
-}
-with open(os.path.join(run_dir, 'chat.jsonl'), 'a', encoding='utf-8') as f:
-    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-PY
-```
-
-Then invoke the `chat-simulator` subagent (Phase 6 for the dispatch shape). Wait for it to return.
-
-Read `<RUN_DIR>/next_turn.txt`, strip leading/trailing whitespace, append as assistant entry:
-
-```bash
-python3 - "$RUN_DIR" <<'PY'
-import sys, json, os, datetime
-run_dir = sys.argv[1]
-output_path = os.path.join(run_dir, 'next_turn.txt')
-text = open(output_path, encoding='utf-8').read().strip()
-entry = {
-    "role": "assistant",
-    "content": text,
-    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat()
-}
-with open(os.path.join(run_dir, 'chat.jsonl'), 'a', encoding='utf-8') as f:
-    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-# Update session.json turn count.
-session_path = os.path.join(run_dir, 'session.json')
-session = json.load(open(session_path, encoding='utf-8'))
-session['turns'] = session.get('turns', 0) + 1
-tmp = session_path + '.tmp'
-with open(tmp, 'w', encoding='utf-8') as f:
-    json.dump(session, f, indent=2, ensure_ascii=False)
-os.rename(tmp, session_path)
-
-# Print just the assistant text to the user (no JSON wrap).
-print(text)
-PY
-```
-
-Render the assistant's reply to the user, followed by a compact footer:
-
-```
-<assistant text>
-
-― [turn N · /save | /history | /commit | /quit]
-```
-
-The footer's separator (`―`) and label set follow `report_language`. Then stop, wait for the user's next turn.
-
-**Loop invariant:** every turn = one user message → one chat-simulator dispatch → one assistant reply → wait. No batching. No look-ahead. The skill returns control to the user after every assistant emission.
+**Loop invariant:** one user message → one subprocess exchange → one assistant reply → wait. No batching, no look-ahead.
 
 ## Phase 4 — Slash command dispatch
 
@@ -408,12 +468,15 @@ User typed something starting with `/`. Parse the command (lowercase, strip lead
 |---|---|
 | `save` | Phase 5 — anchor save sub-flow (filled in Phase C of the implementation) |
 | `history` | Pretty-print `chat.jsonl` (turn N · role · first 80 chars), then return to chat loop |
-| `reset` | Move `chat.jsonl` to `chat-N-discarded.jsonl`, create fresh empty `chat.jsonl`, update `session.json.turns = 0`, AND regenerate `session.json.chat_session_uuid` (v0.5.6 — the next user message spawns a new bare Claude subprocess with a fresh session id, body reloaded). Inform user. saved_anchors.json is NOT touched. |
+| `reset` | Move `chat.jsonl` to `chat-N-discarded.jsonl`, create fresh empty `chat.jsonl`, update `session.json.turns = 0`, AND regenerate `session.json.chat_session_uuid` (v0.5.6 — the next user message spawns a new bare Claude subprocess with a fresh session id, body reloaded). v0.6.0: re-substitutes current variable values into the wrapped body before the respawn. Inform user. saved_anchors.json is NOT touched. |
+| `vars` | v0.6.0 — list detected variables with their current bound value (or `(rastgele)` when unbound). Read-only; returns to the chat loop. |
+| `set <name>=<value>` | v0.6.0 — rebind a variable mid-chat. Updates `variables.json` + the `<prompt>.vars.yaml` sidecar and queues a `[SYSTEM: variable update]` cue applied on the next user turn (no respawn → history preserved). |
+| `unset <name>` | v0.6.0 — drop a binding so the persona invents the value again (framing rule 10); persists the removal + queues the cue. |
 | `commit` | Phase 7 — sidecar write (<prompt>.anchors.yaml) |
 | `quit` | Phase 8 — final summary + optional commit prompt (filled in Phase C) |
-| anything else | Print "Bilinmeyen komut: `/<x>`. Mevcut: /save /history /reset /commit /quit" and return |
+| anything else | Print "Bilinmeyen komut: `/<x>`. Mevcut: /save /history /reset /vars /set /unset /commit /quit" and return |
 
-All five commands are implemented: `/save` dispatches to Phase 5, `/commit` to Phase 7, `/quit` to Phase 8 (with optional commit prompt for any staged anchors). `/history` and `/reset` execute inline in this phase as they are simple state operations.
+These commands are implemented in the Python runner (`bin/prompt-chat-runner.py`, v0.5.6+): `/save` → Phase 5, `/commit` → Phase 7, `/quit` → Phase 8 (with optional commit prompt for staged anchors); `/history`, `/reset`, `/vars`, `/set`, `/unset` execute inline as state operations.
 
 ## Phase 5 — Anchor save sub-flow
 
@@ -795,7 +858,7 @@ Return to chat loop.
 ### What this changes for downstream phases
 
 - **session.json schema:** `chat_simulator_agent_id` field'ı kaldırıldı. Yerine `chat_session_uuid` — claude CLI subprocess'inin --session-id ile başlattığı conversation'ın id'si. Phase 0 bootstrap bu field'ı null olarak yazar; Python script ilk turn'de UUID üretir + persist eder; /reset onu yeni UUID ile değiştirir (eski subprocess kill edilir, fresh subprocess spawn olur).
-- **`agents/chat-simulator.md` deprecated.** Artık çağrılmıyor. Header note ile v0.5.6 deprecation işaretlendi; v0.6.0'da file silinecek.
+- **`agents/chat-simulator.md` removed.** The per-turn subagent is gone (deprecated v0.5.6, deleted in v0.6.0); the long-lived bare-Claude subprocess in `bin/prompt-chat-runner.py` replaced it.
 - **`/prompt-test` ve `drift-runner` etkilenmedi.** Drift simulation yine target_model (Opus) ile çalışır — chat exploration ile regression simulation farklı modeller, farklı runtime'lar.
 
 ### Failure modes for Phase 6 runtime
@@ -997,11 +1060,27 @@ The chat always runs in a separate new terminal window (v0.5.11+); after the sum
 
 Skill returns. No further user input is consumed by `/prompt-chat`. Main session control returns to the user.
 
+## Variables (v0.6.0)
+
+Voice-agent scripts carry placeholder tokens that production Vapi fills from `variableValues` before the call connects. `/prompt-chat` mirrors this with an explicit **detect → bind → inject** layer so constants are set (and reproducible) instead of being randomly invented by the persona.
+
+- **Token forms detected:** Vapi mustache `{{ name }}` / `{{ customer.name }}` and bracketed upper-snake `[BÜYÜK_HARF]` (TR uppercase included). Harness-control brackets (`[SYSTEM: …]`, `[PERSONA_NAME: …]`, `[silence …]`, `<<END_CALL>>`) are never detected — `SYSTEM` / `PERSONA_NAME` / `END_CALL` are also denylisted.
+- **Storage — sidecar `<prompt>.vars.yaml`** (prompt-level, persistent), NOT frontmatter. The prompt file is never touched → its SHA256 stays stable and cached `/prompt-check` audits remain valid (same contract as `<prompt>.anchors.yaml`). Schema:
+  ```yaml
+  schema_version: 1
+  variables:
+    musteri_adi: "Zeynep Kaya"
+    randevu_tarihi: "12 Haziran 14:00"
+  ```
+  An author-provided `chat_variables:` block in the prompt frontmatter is read as a **seed only** (never written); the sidecar wins.
+- **Pre-chat binding (Phase 0.5):** only *unbound* variables are asked (already-bound values from the sidecar / seed are reused silently). Values are substituted into the system prompt at spawn (`_write_wrapped_body`); unbound tokens are left literal so the persona invents them per framing rule 10.
+- **Mid-chat editing:** `/vars` lists state; `/set name=value` and `/unset name` update `variables.json` + the sidecar and queue a `[SYSTEM: variable update]` cue (framing rule 13) applied on the next user turn — no subprocess respawn, conversation history preserved. `/reset` re-substitutes current values into a fresh wrapped body.
+- **Run-dir contract:** `variables.json` = `{"detected": [{name, token}], "values": {name: value}}`. The runner falls back to detecting from `body.txt` + reading the sidecar when `variables.json` is absent (manual launch).
+
 ## Invariants
 
-- **Never read `next_turn.txt`** outside Step 3.2 (after the subagent writes it). Reading it earlier burns tool calls on a non-existent file.
 - **Never modify `body.txt`** in any phase. Body is read-only after Phase 0.
-- **Never modify the original prompt file outside Phase 7.** All chat-time state is in `chat-NNN/`.
+- **Never modify the original prompt file.** Anchors go to `<prompt>.anchors.yaml` (Phase 7); variable values go to `<prompt>.vars.yaml` (Phase 1 / `/set`). Both sidecars keep the prompt SHA256 stable. All other chat-time state is in `chat-NNN/`.
 - **Slash commands are case-insensitive.** `/SAVE` works the same as `/save`.
 - **Every persisted state update is atomic** (temp + rename) — never partial writes.
 - **`chat.jsonl` is append-only.** Never overwrite, never delete mid-session. `/reset` moves the file aside; it does not delete it.
