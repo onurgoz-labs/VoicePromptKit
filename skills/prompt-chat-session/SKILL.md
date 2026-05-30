@@ -43,14 +43,14 @@ RUNNER="$REPO_ROOT/bin/prompt-chat-runner.py"
 if [ ! -f "$RUNNER" ]; then
   # Fall back to the plugin's installed location if the dev repo isn't here.
   for guess in \
-    "$HOME/.claude/plugins/PromptChecker/bin/prompt-chat-runner.py" \
-    "/usr/local/share/claude/plugins/PromptChecker/bin/prompt-chat-runner.py"; do
+    "$HOME/.claude/plugins/VoicePromptKit/bin/prompt-chat-runner.py" \
+    "/usr/local/share/claude/plugins/VoicePromptKit/bin/prompt-chat-runner.py"; do
     if [ -f "$guess" ]; then RUNNER="$guess"; break; fi
   done
 fi
 if [ ! -f "$RUNNER" ]; then
   echo "ERROR: bin/prompt-chat-runner.py not found near $REPO_ROOT or in standard plugin paths."
-  echo "Reinstall PromptChecker (the runner script is part of the plugin distribution)."
+  echo "Reinstall VoicePromptKit (the runner script is part of the plugin distribution)."
   exit 1
 fi
 
@@ -95,7 +95,7 @@ Any feature changes to the chat loop — slash commands, anchor schema, model se
 
 - **`$1` is missing or not a directory** → bash sanity check; exit with usage hint.
 - **State files missing** → validation loop catches it; exit with "did you mean /prompt-chat?" hint.
-- **Python runner script not found** → search standard paths; if all fail, ask the user to reinstall PromptChecker.
+- **Python runner script not found** → search standard paths; if all fail, ask the user to reinstall VoicePromptKit.
 - **`exec` fails** (very rare, e.g. corrupted Python install) → the Claude Code process continues briefly with an error message before exiting on its own.
 
 ## When to use this skill manually

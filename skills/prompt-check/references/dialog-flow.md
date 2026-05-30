@@ -359,6 +359,6 @@ When the skill records a transient status, it immediately writes the next persis
 5. Re-prompt with the same free-form decision string (§3).
 6. Phase 10 runs against the filtered set only — already-applied / overlay / dismissed findings are not re-touched.
 
-The session.json schema is forward-compatible: unknown keys are preserved on rewrite. If `schema_version` is greater than the running skill version, abort with: `Session schema version N is newer than this skill (M) supports — upgrade PromptChecker first.`
+The session.json schema is forward-compatible: unknown keys are preserved on rewrite. If `schema_version` is greater than the running skill version, abort with: `Session schema version N is newer than this skill (M) supports — upgrade VoicePromptKit first.`
 
 If no `pending` findings remain, surface: `No pending decisions in run-NNN. Nothing to resume.` and exit cleanly.

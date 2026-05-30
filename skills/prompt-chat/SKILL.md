@@ -332,7 +332,7 @@ fi
 
 # ---- 1.2: resolve the orchestrator script --------------------------------
 # Dev repo: bin/prompt-chat-runner.py. Installed plugin:
-# ~/.claude/plugins/cache/onurgoz/PromptChecker/<version>/bin/.
+# ~/.claude/plugins/cache/onurgoz-labs/VoicePromptKit/<version>/bin/.
 #
 # v0.5.19: cache fallback now version-sorts. Pre-v0.5.19 the `for guess in
 # <glob>` loop relied on bash's alphabetic glob expansion, which made
@@ -347,13 +347,13 @@ if [ -n "$PROMPTCHECKER_RUNNER" ] && [ -f "$PROMPTCHECKER_RUNNER" ]; then
 elif [ -f "$REPO_ROOT/bin/prompt-chat-runner.py" ]; then
   RUNNER="$REPO_ROOT/bin/prompt-chat-runner.py"
 else
-  RUNNER=$(ls -d "$HOME/.claude/plugins/cache/onurgoz/PromptChecker/"*/bin/prompt-chat-runner.py 2>/dev/null \
+  RUNNER=$(ls -d "$HOME/.claude/plugins/cache/onurgoz-labs/VoicePromptKit/"*/bin/prompt-chat-runner.py 2>/dev/null \
     | sort -V | tail -1)
 fi
 
 if [ -z "$RUNNER" ] || [ ! -f "$RUNNER" ]; then
   echo "ERROR: bin/prompt-chat-runner.py not found in repo or plugin cache."
-  echo "Reinstall PromptChecker (the runner script is part of the plugin distribution)."
+  echo "Reinstall VoicePromptKit (the runner script is part of the plugin distribution)."
   exit 1
 fi
 

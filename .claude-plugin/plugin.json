@@ -1,11 +1,11 @@
 {
-  "name": "PromptChecker",
+  "name": "VoicePromptKit",
   "version": "0.6.0",
   "license": "MIT",
-  "description": "Audit prompts (/prompt-check) across six lenses, converse with a prompt's persona (/prompt-chat) to author test anchors, and replay them as regression tests (/prompt-test). Anchors live in sidecar <prompt>.anchors.yaml files; flow anchors support multi-turn scripted conversations with silence handling and call closure. Cost-tuned via target_model / worker_model / judge_model split — frontier model only where it matters.",
+  "description": "A Turkish-first toolkit for Vapi voice-agent prompts. Audit across six lenses (/prompt-check), converse with the prompt's persona in a live call simulator (/prompt-chat) — with variable binding, silence handling, and call closure — and replay saved scenarios as regression tests (/prompt-test). Scenarios and variables live in <prompt>.anchors.yaml / <prompt>.vars.yaml sidecars; the prompt file is never modified. Cost-tuned via target_model / worker_model / judge_model split.",
   "author": {
     "name": "Onur GOZ",
     "email": "gozonur@icloud.com"
   },
-  "homepage": "https://github.com/onurgoz/PromptChecker"
+  "homepage": "https://github.com/onurgoz-labs/VoicePromptKit"
 }

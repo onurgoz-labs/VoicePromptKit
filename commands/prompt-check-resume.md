@@ -6,7 +6,7 @@ allowed-tools: Skill, Read, Write, Bash, Agent, AskUserQuestion
 
 # /prompt-check-resume
 
-Resume an unfinished interactive PromptChecker session — replay the Phase 9 summary view and Phase 10 action dispatch over the findings whose `session.json` status is still `pending`.
+Resume an unfinished interactive VoicePromptKit session — replay the Phase 9 summary view and Phase 10 action dispatch over the findings whose `session.json` status is still `pending`.
 
 Procedure:
 

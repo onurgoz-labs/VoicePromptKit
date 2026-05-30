@@ -1063,10 +1063,10 @@ When the gate passes, `tr-phonetic-runner` seeds `pronunciation_map` from any ex
 
 **Category-based fix_kind (v0.4.2+):** TR findings carry `fix_kind: "advisory"` OR `fix_kind: "replace"` depending on the category:
 
-- `foreign_word` and `abbreviation` → `fix_kind: "advisory"` — PromptChecker never auto-applies these. They populate `pronunciation_entry` (and optionally `suggested_fix`) and are surfaced for the author to act on by hand. Phase 9.6's commit and Phase 10.3's TR advisory guard force-route any such finding decided as `applied` to `overlay` before any write happens.
+- `foreign_word` and `abbreviation` → `fix_kind: "advisory"` — VoicePromptKit never auto-applies these. They populate `pronunciation_entry` (and optionally `suggested_fix`) and are surfaced for the author to act on by hand. Phase 9.6's commit and Phase 10.3's TR advisory guard force-route any such finding decided as `applied` to `overlay` before any write happens.
 - `number_readability` and `punctuation` → `fix_kind: "replace"` — these are concrete substring replacements (e.g. "10kg" → "on kilogram", "—" → ", ") and follow the normal apply flow in Phase 10.3 (SHA check → fix_strategy dispatch → strategy-specific feasibility → apply). They are NOT force-routed to overlay.
 
-PromptChecker therefore auto-applies TR `replace` findings just like conflict / dominance / gap / drift findings, while keeping TR `advisory` findings author-driven. The author still owns the pronunciation_map injection — Phase 10 never writes pronunciation block content back into the prompt file.
+VoicePromptKit therefore auto-applies TR `replace` findings just like conflict / dominance / gap / drift findings, while keeping TR `advisory` findings author-driven. The author still owns the pronunciation_map injection — Phase 10 never writes pronunciation block content back into the prompt file.
 
 Pass inputs and the output path as **separate** top-level fields:
 
@@ -1156,7 +1156,7 @@ For backward compatibility: if `section_index.json` does not exist (older run di
 ```
 TEMPLATE_STRINGS = {
   "tr": {
-    "report_title": "PromptChecker Raporu — {basename}",
+    "report_title": "VoicePromptKit Raporu — {basename}",
     "prompt_label": "**Prompt:**",
     "run_label": "**Çalıştırma:**",
     "generated_label": "**Oluşturulma:**",
@@ -1208,7 +1208,7 @@ TEMPLATE_STRINGS = {
     "no_section_marker": "—"
   },
   "en": {
-    "report_title": "PromptChecker Report — {basename}",
+    "report_title": "VoicePromptKit Report — {basename}",
     "prompt_label": "**Prompt:**",
     "run_label": "**Run:**",
     "generated_label": "**Generated:**",
@@ -1570,7 +1570,7 @@ If `frontmatter.config_warnings[]` is non-empty, include them in the summary so 
 **`en` (English) template:**
 
 ```
-PromptChecker complete — <run-NNN>
+VoicePromptKit complete — <run-NNN>
 
 - Rules: <N> | Conflicts: <N> (<H> high) | Dominances: <N> | Gaps: <N> | Schema: <N> (<M> high) [applicability: <APPLICABLE | NOT APPLICABLE | SKIPPED>]
 - Drift: <skipped|<N> scenarios, <P> passed, <F> failed>
@@ -1596,7 +1596,7 @@ pending and resume later with /prompt-check-resume.
 **`tr` (Türkçe) template:**
 
 ```
-PromptChecker tamamlandı — <run-NNN>
+VoicePromptKit tamamlandı — <run-NNN>
 
 - Kurallar: <N> | Çelişki: <N> (<H> yüksek) | Baskınlık: <N> | Boşluk: <N> | Şema: <N> (<M> yüksek) [uygulanabilir: <AKTİF | DEĞİL | ATLANDI>]
 - Davranışsal sapma: <atlandı|<N> senaryo, <P> geçti, <F> kaldı>

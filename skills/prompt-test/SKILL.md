@@ -244,13 +244,13 @@ failed = total - passed
 if report_language == 'tr':
     headers = ['id', 'tür', 'input / name', 'geçti', 'puan', 'sebepler']
     type_label = {'regression': 'tek', 'flow_regression': 'akış'}
-    title = f"PromptChecker test — {os.path.basename(run_dir)}"
+    title = f"VoicePromptKit test — {os.path.basename(run_dir)}"
     totals_line = f"Toplam: {total} anchor, {passed} geçti, {failed} kaldı."
     detail_hint = f"Detay: {os.path.basename(run_dir)}/drift.json"
 else:
     headers = ['id', 'type', 'input / name', 'pass', 'score', 'reasons']
     type_label = {'regression': 'single', 'flow_regression': 'flow'}
-    title = f"PromptChecker test — {os.path.basename(run_dir)}"
+    title = f"VoicePromptKit test — {os.path.basename(run_dir)}"
     totals_line = f"Total: {total} anchors, {passed} passed, {failed} failed."
     detail_hint = f"Details: {os.path.basename(run_dir)}/drift.json"
 
@@ -339,7 +339,7 @@ Dispatch per answer:
 ## Phase 5 — Exit summary
 
 ```
-PromptChecker test tamamlandı — test-NNN
+VoicePromptKit test tamamlandı — test-NNN
 
 - Anchor: <N> (<passed> geçti, <failed> kaldı)
 - Run dir: .promptcheck/<basename>/test-NNN/

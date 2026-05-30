@@ -1,6 +1,8 @@
-# PromptChecker
+# VoicePromptKit
 
-A Claude Code plugin that audits your prompts the way a strict reviewer would: it finds rules that **contradict each other**, rules that **silently override others**, **gaps** the prompt itself raises but never resolves, **behavioural drift** between what the prompt asks and what the model actually does, and — for Turkish voice agents — **phonetic problems** that break text-to-speech.
+**VoicePromptKit** is a Turkish-first Claude Code toolkit for engineering Vapi voice-agent prompts — three commands sharing one workflow: audit (`/prompt-check`), a live call simulator (`/prompt-chat`), and regression testing (`/prompt-test`).
+
+`/prompt-check` audits your prompt the way a strict reviewer would: it finds rules that **contradict each other**, rules that **silently override others**, **gaps** the prompt itself raises but never resolves, **behavioural drift** between what the prompt asks and what the model actually does, and — for Turkish voice agents — **phonetic problems** that break text-to-speech.
 
 You run it on any prompt file (system prompt, Claude Code subagent definition, Vapi voice script, chained workflow) and step through an interactive session: pick the lenses you want, review the findings in one summary table, then decide finding-by-finding which to apply, route to an overlay, dismiss, or discuss. Each run leaves behind a human-readable `report.md`, a structured `findings.json`, and a per-decision audit trail.
 
@@ -9,8 +11,8 @@ The original prompt file is **never modified**. Every run lives in its own numbe
 ## Install
 
 ```
-/plugin marketplace add onurgoz/PromptChecker
-/plugin install PromptChecker@onurgoz
+/plugin marketplace add onurgoz-labs/VoicePromptKit
+/plugin install VoicePromptKit@onurgoz-labs
 ```
 
 The plugin auto-loads in every Claude Code session after that. No API keys, no SDK installs — the optional drift lens runs inside a single Claude Code subagent.
@@ -21,7 +23,7 @@ The plugin auto-loads in every Claude Code session after that. No API keys, no S
 /prompt-check path/to/your/prompt.md
 ```
 
-PromptChecker opens an interactive session. First it asks which lenses you want to apply (multi-select: conflict, dominance, gap, drift, TR phonetic — pre-checked based on your repo defaults). For `drift`, it asks `expand_count`. Then it dispatches the selected lenses as parallel subagents. After parallel lens dispatch completes, you see a summary table:
+VoicePromptKit opens an interactive session. First it asks which lenses you want to apply (multi-select: conflict, dominance, gap, drift, TR phonetic — pre-checked based on your repo defaults). For `drift`, it asks `expand_count`. Then it dispatches the selected lenses as parallel subagents. After parallel lens dispatch completes, you see a summary table:
 
 | id | mercek | önem | bölüm / satır | açıklama | düzeltme |
 |---|---|---|---|---|---|
@@ -50,7 +52,7 @@ The grammar accepts Turkish and English keywords:
 | `gerisini atla` / `gerisini yorum` / `gerisini düzelt` | wildcard for all unmarked findings |
 | `iptal` / `cancel` | exit and leave session at pending (resume later with `/prompt-check-resume`) |
 
-For findings you say "konuşalım" to, PromptChecker enters a per-finding dialogue: you see the full finding, then choose: accept the default suggestion / revise it yourself / route to overlay / dismiss. The dialogue terminates when every discussed finding has a final status.
+For findings you say "konuşalım" to, VoicePromptKit enters a per-finding dialogue: you see the full finding, then choose: accept the default suggestion / revise it yourself / route to overlay / dismiss. The dialogue terminates when every discussed finding has a final status.
 
 **TR phonetic — split by category.** For `foreign_word` and `abbreviation` findings, `düzelt` is auto-routed to the overlay (pronunciation hints are voice-design decisions the author owns — a silent prompt edit can poison a Vapi / ElevenLabs script). For `number_readability` and `punctuation` findings, `düzelt` follows the normal apply flow and modifies the prompt — these are textual corrections like missing commas or malformed Turkish numbers.
 
@@ -86,7 +88,7 @@ The lens never translates: `pound → paund` is a phonetic hint; `pound → İng
 
 ### Compact mode for long prompts
 
-When a prompt body exceeds `max_char_limit` (default `50000` chars; configurable via wizard, env var, project config, or per-prompt frontmatter), PromptChecker enters **compact mode** and applies cheaper analysis policies to trade depth for speed:
+When a prompt body exceeds `max_char_limit` (default `50000` chars; configurable via wizard, env var, project config, or per-prompt frontmatter), VoicePromptKit enters **compact mode** and applies cheaper analysis policies to trade depth for speed:
 
 - **Conflict / Gap lenses:** skip `low` severity findings; keep `medium` and `high`.
 - **Dominance lens:** emit only `role-override` and `recency` mechanisms; skip the subtler `position`, `length`, `specificity` effects.
@@ -125,7 +127,7 @@ All six lenses live in `skills/prompt-check/SKILL.md` and its `references/`.
 
 Voice agent developers test prompts by **calling the bot**: trigger Vapi, listen to a turn, hang up, edit the prompt, call again. Slow (each test is a real call), expensive (per-minute Vapi billing), manual, and the lessons learned in one iteration are lost on the next.
 
-PromptChecker adds two skills that move that loop into text:
+VoicePromptKit adds two skills that move that loop into text:
 
 - `/prompt-chat <prompt>` — opens an interactive call simulator in a new terminal window. The prompt is loaded as the simulated system prompt of a long-lived bare-Claude subprocess (`bin/prompt-chat-runner.py`); you converse with the persona turn by turn, bind prompt variables, and save interesting turns as test anchors.
 - `/prompt-test <prompt>` — runs the saved anchors as regression tests. Each anchor becomes one scenario for the existing `drift-runner` (in `regression_only: true` mode), and you get a pass/fail table — one row per anchor.
@@ -164,7 +166,7 @@ Reads `<prompt>.anchors.yaml` (falls back to `frontmatter.anchors[]` with a depr
 Output goes to `.promptcheck/<basename>/test-NNN/drift.json`. The skill renders a markdown table:
 
 ```
-PromptChecker test — test-001
+VoicePromptKit test — test-001
 
 | id | tür  | input / name                | geçti | puan | sebepler |
 |----|------|-----------------------------|-------|------|----------|
@@ -276,7 +278,7 @@ Six additive cost reductions kick in automatically — most users never need to 
 - **Batched flow rubric eval.** A flow anchor with K assertion steps previously cost K judge LLM calls (one per `assistant_expect` / `end_call_expect`). v0.5.2 collapses these into ONE batched judge call: the judge sees the full transcript + a numbered list of (step, rubric) pairs and returns all per-step verdicts in one JSON document. Simulation stays sequential (multi-turn state matters); judging batches safely because rubric eval is independent per step.
 - **`worker_model` for infrastructure subagents (v0.5.3).** Static-lens-runner (conflict, dominance, gap, schema pair comparison) and tr-phonetic-runner (line-level pattern matching) are structured tasks that don't need a frontier model. v0.5.3 adds `worker_model` frontmatter field (default `claude-haiku-4-5-20251001`) which the skill passes to subagent dispatches via the Agent tool's `model` parameter. `target_model` semantics narrows to "model under test" — drift Step 2 simulation and chat-simulator persona dispatches still use it (Opus by default, since those simulate the production model). The three knobs:
   - `target_model` (default `claude-opus-4-7`) — production model your prompt will run on. drift Step 2 + chat-simulator.
-  - `worker_model` (default `claude-haiku-4-5-20251001`) — PromptChecker's own LLM workers. static-lens + tr-phonetic + drift Step 1.
+  - `worker_model` (default `claude-haiku-4-5-20251001`) — VoicePromptKit's own LLM workers. static-lens + tr-phonetic + drift Step 1.
   - `judge_model` (default `claude-haiku-4-5-20251001`) — drift Step 3 rubric eval. Tunable separately for tricky judging.
 
   Single audit on an 840-line prompt with 116 rules:
@@ -336,7 +338,7 @@ Every run gets its own directory. Older runs are preserved so you can diff audit
 ### `report.md` — what humans read
 
 ```markdown
-# PromptChecker Report — mainprompt
+# VoicePromptKit Report — mainprompt
 
 - **Prompt:** `/Users/onur/repos/.../mainprompt.md`
 - **Run:** `run-003`
@@ -519,7 +521,7 @@ Phase 9 and Phase 10 are the interactive layer — they run automatically after 
 2. **Phase 1** — Allocate a fresh `run-NNN` directory (atomic; `latest` symlink is updated only on success).
 3. **Phase 2** — Parse frontmatter deterministically and split body. Stores `body_line_offset`, `prompt_sha256`, `body_char_count`, and `compact_mode` (true when body_char_count > max_char_limit AND max_char_limit > 0). Phase 4-6 dispatches propagate these to each runner.
 4. **Phase 3** — Extract atomic, line-anchored rules from `body.txt`.
-   - **Phase 3.5 — Per-run lens-selection wizard.** PromptChecker emits an `AskUserQuestion` widget asking which of the six lenses to apply. Repo defaults from `.promptchecker.json` seed which options are pre-checked, but the question itself is MANDATORY — prose substitutes are a contract violation. If the user is in a headless context where AskUserQuestion is unavailable, the audit aborts with a clear error rather than proceeding silently.
+   - **Phase 3.5 — Per-run lens-selection wizard.** VoicePromptKit emits an `AskUserQuestion` widget asking which of the six lenses to apply. Repo defaults from `.promptchecker.json` seed which options are pre-checked, but the question itself is MANDATORY — prose substitutes are a contract violation. If the user is in a headless context where AskUserQuestion is unavailable, the audit aborts with a clear error rather than proceeding silently.
 5. **Phase 4 — Parallel lens dispatch (5 concurrent Agent calls).** Emits five Agent calls in one turn:
    - `static-lens-runner` × 4 (conflict / dominance / gap / schema, each with singleton `selected_lenses`)
    - `tr-phonetic-runner` × 1 (conditional on user_intent.tr_phonetic_enabled)
