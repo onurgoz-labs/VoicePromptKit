@@ -63,7 +63,7 @@ Drift is the only lens whose cache reuse is opt-in. Conflict / dominance / gap /
 **Follow-up — all runs (advisory).** After lens selection, regardless of which lenses were picked:
 
 ```
-question: "Bu prompt'a anchor eklemek ister misin? (frontmatter'a yazılır — bu run'ı etkilemez)"
+question: "Bu prompt'a anchor eklemek ister misin? (anchors.yaml sidecar'ına yazılır — bu run'ı etkilemez)"
 header:   "Anchors"
 multiSelect: false
 options:
@@ -71,7 +71,7 @@ options:
   - label: "Evet, sonra"  description: "Remind me in the summary footer"
 ```
 
-This question is **advisory only** — anchors live in the prompt file's frontmatter, not in `session.json`. If the user says `Evet, sonra`, set `user_intent.anchors_added: false` and add a one-line reminder to the summary footer: `_Reminder: add anchors to <prompt> frontmatter before the next audit._`
+This question is **advisory only** — anchors live in the `<prompt>.anchors.yaml` sidecar, not in `session.json`. If the user says `Evet, sonra`, set `user_intent.anchors_added: false` and add a one-line reminder to the summary footer: `_Reminder: add anchors to <prompt>.anchors.yaml before the next audit._`
 
 **Report language (wizard's 7th question).** After the 6 lens-related questions, the wizard asks a 7th question: `report_language` (`tr` / `en`, default `tr`). This controls the language of skill-rendered text in report.md, the Phase 8 terminal summary, and Phase 9 dialog prompts. Lens-generated content (rationale, suggested_fix, current_excerpt) stays in whatever language the runner produced — only the skill's template strings translate. The full TEMPLATE_STRINGS dictionary lives in SKILL.md Phase 7; this file just acknowledges the field exists and its scope (template-only translation).
 
@@ -203,7 +203,7 @@ PLAN — onaylamak için "evet", iptal için "iptal":
      Belirsiz threshold → yorum bırak: "Pin a concrete duration..."
 
   T1..T3 [tr_phonetic, advisory]
-     3 auto-filed pronunciation hints (Gaggia, DHL, iPhone)
+     3 auto-filed pronunciation hints (Peugeot, DHL, iPhone)
 
   C3, D2 [düşük önem]
      2 atlanan finding
@@ -221,7 +221,7 @@ Schema findings (`S1`, `S2`, ...) follow the normal apply / overlay / dismiss / 
 
 TR phonetic findings split into two routing buckets based on `kind`:
 
-- **`foreign_word` / `abbreviation` (`fix_kind: "advisory"`) — auto-filed.** These findings are NEVER shown in the Phase 9 summary table, the plan prompt, or any decision view. They are silently routed to the overlay's Pronunciation map section without user input. Wildcard verbs (`hepsini düzelt`, `gerisini X`, `hepsini yorum bırak`, etc.) **ignore them entirely** — they are not part of the decision set. Pronunciation hints (DHL → "de-ha-el", Gaggia → "gacca") are voice-design decisions the author owns, and the user has already indicated they never want to be asked about them; surfacing them as a decision is a UX regression.
+- **`foreign_word` / `abbreviation` (`fix_kind: "advisory"`) — auto-filed.** These findings are NEVER shown in the Phase 9 summary table, the plan prompt, or any decision view. They are silently routed to the overlay's Pronunciation map section without user input. Wildcard verbs (`hepsini düzelt`, `gerisini X`, `hepsini yorum bırak`, etc.) **ignore them entirely** — they are not part of the decision set. Pronunciation hints (DHL → "de-ha-el", Peugeot → "pöjo") are voice-design decisions the author owns, and the user has already indicated they never want to be asked about them; surfacing them as a decision is a UX regression.
 - **`number_readability` / `punctuation` (`fix_kind: "replace"`) — normal flow.** These findings appear in the summary like any other finding. Wildcard verbs apply to them. `düzelt` modifies the prompt file (with substring replace) just like a `conflict` or `gap` finding; `yorum bırak` routes to overlay; `atla` dismisses; `konuşalım` enters the sub-flow.
 
 `konuşalım` is unavailable for auto-filed TR findings — they never enter the decision set, so the verb has nothing to attach to. See §5 below for the corner-case handling when the user explicitly references an auto-filed finding's id.

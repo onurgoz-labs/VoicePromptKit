@@ -70,17 +70,38 @@ if sys.platform != "win32":
 else:
     _TERMIOS_OK = False
 
-# v0.5.11: ANSI escape sequences for color. Stdlib-only (no rich/colorama).
-# We only emit these when stdout is a real TTY — piping to a file would
-# pollute it with raw escape codes otherwise.
-_TTY = sys.stdout.isatty()
+# v0.5.11: ANSI escape sequences for color (stdlib baseline — the fallback path).
+# v0.7.0: colour is suppressed when stdout is not a TTY, or the user opted out
+# via NO_COLOR / TERM=dumb — piping to a file would otherwise pollute it.
+_NO_COLOR = bool(os.environ.get("NO_COLOR")) or os.environ.get("TERM", "") == "dumb"
+_TTY = sys.stdout.isatty() and not _NO_COLOR
 
 
 def _c(code: str, text: str) -> str:
-    """Wrap text in ANSI color codes when stdout is a TTY; otherwise no-op."""
+    """Wrap text in ANSI 256-colour codes when colour is enabled; else no-op."""
     if not _TTY:
         return text
     return f"\033[{code}m{text}\033[0m"
+
+
+# v0.7.0: optional Rich renderer — the modern default when available.
+# Rich brings Markdown rendering, responsive panels, truecolor auto-detection,
+# Windows ANSI support, and a Live region for real token streaming. It is
+# OPTIONAL: when Rich is absent, disabled (VOICEPROMPTKIT_NO_RICH=1), or stdout
+# is not a terminal, every renderer falls back to the stdlib ANSI path below, so
+# the runner still works with zero extra dependencies. `pip install rich` to opt
+# in to the modern UI.
+_RICH = False
+_console = None
+if _TTY and os.environ.get("VOICEPROMPTKIT_NO_RICH", "").lower() not in ("1", "true", "yes", "on"):
+    try:
+        from rich.console import Console as _RichConsole
+
+        _console = _RichConsole(highlight=False, emoji=False)
+        _RICH = bool(_console.is_terminal)
+    except Exception:
+        _RICH = False
+        _console = None
 
 
 _COL_BOT       = "38;5;82"   # green  — persona reply (v0.5.13: was orange)
@@ -152,7 +173,7 @@ def _render_box(title: str, lines: list[str], width: int | None = None) -> int:
 # name so the bot doesn't have to ask the user.
 _TR_FIRST_NAMES = [
     "Ahmet", "Mehmet", "Mustafa", "Ali", "Hüseyin", "Hasan", "İbrahim",
-    "Ayşe", "Fatma", "Emine", "Hatice", "Zeynep", "Elif", "Merve",
+    "Ayşe", "Fatma", "Emine", "Hatice", "Zeynep", "Elif", "Büşra",
     "Onur", "Burak", "Emre", "Can", "Selin", "Deniz", "Ece",
 ]
 _TR_LAST_NAMES = [
@@ -163,7 +184,7 @@ _TR_LAST_NAMES = [
 
 
 NEUTRAL_CWD = "/tmp"  # subprocess cwd — no CLAUDE.md auto-discovery here
-CLAUDE_CLI = shutil.which("claude") or "/Users/onur/.local/bin/claude"
+CLAUDE_CLI = os.environ.get("VOICEPROMPTKIT_CLAUDE_CLI") or shutil.which("claude") or "claude"
 
 # v0.5.9 — text-based stand-in for production Vapi's `end-call-tool`. The bare
 # claude subprocess has no tools available (--allowedTools ""), so when the
@@ -514,7 +535,7 @@ def _write_wrapped_body(body_path: str, detected: "list | None" = None,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("run_dir", help="Absolute path to .promptcheck/<basename>/chat-NNN/")
+    parser.add_argument("run_dir", help="Absolute path to .voicepromptkit/<basename>/chat-NNN/")
     args = parser.parse_args()
 
     run_dir = os.path.abspath(args.run_dir)
@@ -619,13 +640,10 @@ def main() -> int:
     if session.get("turns", 0) == 0:
         try:
             print()  # blank line before the opening
-            # We can't stream the opening directly to stdout because the bot
-            # is required to emit [PERSONA_NAME: X] as its first line; that
-            # bracketed marker would flash on screen if we passed
-            # stream_to=sys.stdout. Buffer the opening, strip the marker,
-            # THEN print the clean reply with the persona prefix.
-            # v0.5.13: persona name unknown yet — spinner uses "Bot" label.
-            opening_raw = _send_with_spinner(
+            # _stream_reply renders the opening (Rich Live stream, or the
+            # stdlib spinner + buffered render) and strips the [PERSONA_NAME]
+            # and <<END_CALL>> markers safely, so neither leaks on screen.
+            opening_raw = _stream_reply(
                 ctx,
                 f"[SYSTEM: call connected — caller is {caller_name}]",
                 None,
@@ -639,7 +657,6 @@ def main() -> int:
             _append_chat_entry(chat_jsonl_path, "assistant", opening_clean)
             session["turns"] = 1
             _atomic_write_json(session_path, session)
-            _render_bot_reply(opening_clean, session.get("persona_name"))
             if opening_ended:
                 # v0.5.19: persona refused the call on opening (rare —
                 # "wrong number / decline" branches). Used to auto-exit;
@@ -786,7 +803,7 @@ class _SubprocessCtx:
             self.stderr_buf.append(line.rstrip())
 
     def send(self, user_input: str, timeout: int = 180,
-             stream_to: "io.TextIOBase | None" = None) -> str:
+             stream_to: "io.TextIOBase | None" = None, on_delta=None) -> str:
         """Send one user turn; block until the matching result event.
 
         When `stream_to` is provided (typically sys.stdout), `text_delta`
@@ -836,6 +853,8 @@ class _SubprocessCtx:
                         if stream_to is not None:
                             stream_to.write(text)
                             stream_to.flush()
+                        if on_delta is not None:
+                            on_delta(text)
                 # thinking_delta intentionally ignored (model internal reasoning)
             elif etype == "result":
                 if evt.get("is_error"):
@@ -1298,6 +1317,9 @@ def _handle_history(chat_jsonl_path: str, report_language: str,
     Content is truncated at 90 chars (no wrap) so each turn stays on a
     single row for scrollable review."""
     entries = _read_chat_jsonl(chat_jsonl_path)
+    if _RICH:
+        _rich_history(entries, report_language, persona_name)
+        return
     if not entries:
         print(_c(_COL_DIM, "(boş)" if report_language == "tr" else "(empty)"))
         return
@@ -1387,7 +1409,7 @@ def _start_fresh_call(ctx: "_SubprocessCtx", run_dir: str,
 
     print()
     try:
-        opening_raw = _send_with_spinner(
+        opening_raw = _stream_reply(
             ctx,
             f"[SYSTEM: call connected — caller is {session['caller_name']}]",
             None,
@@ -1406,7 +1428,6 @@ def _start_fresh_call(ctx: "_SubprocessCtx", run_dir: str,
     _append_chat_entry(chat_jsonl_path, "assistant", opening)
     session["turns"] = 1
     _atomic_write_json(session_path, session)
-    _render_bot_reply(opening, session.get("persona_name"))
 
     if opening_ended:
         return archive_name, True
@@ -1667,7 +1688,7 @@ def _exchange_turn(ctx: "_SubprocessCtx", user_msg: str,
     """
     _append_chat_entry(chat_jsonl_path, "user", user_msg)
     try:
-        reply_raw = _send_with_spinner(
+        reply_raw = _stream_reply(
             ctx, (system_prefix + user_msg) if system_prefix else user_msg,
             session.get("persona_name"), report_language,
         )
@@ -1682,7 +1703,6 @@ def _exchange_turn(ctx: "_SubprocessCtx", user_msg: str,
     _append_chat_entry(chat_jsonl_path, "assistant", reply)
     session["turns"] = session.get("turns", 0) + 1
     _atomic_write_json(session_path, session)
-    _render_bot_reply(reply, session.get("persona_name"))
     return ended
 
 
@@ -1708,7 +1728,10 @@ def _rerender_user_oneliner(text: str, report_language: str,
         if has_footer:
             sys.stdout.write("\033[1A\r\033[2K")      # clear footer line above
         sys.stdout.flush()
-    _render_message(speaker, ts, text, is_user=True)
+    if _RICH:
+        _rich_render_user(ts, text, report_language)
+    else:
+        _render_message(speaker, ts, text, is_user=True)
 
 
 # v0.5.13: animated "..." spinner shown on its own line while the bare
@@ -1807,6 +1830,10 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
     the _render_box helper with the end-call banner and final summary card.
     Returns the banner's row count (non-TTY logging only; v0.6.0 no longer
     uses it for layout)."""
+    if _RICH:
+        _rich_welcome(run_dir, abs_prompt, chat_model, report_language,
+                      caller_name, session, var_state)
+        return 0
     basename = os.path.basename(abs_prompt).rsplit(".", 1)[0]
     line_count = sum(1 for _ in open(os.path.join(run_dir, "body.txt"), encoding="utf-8"))
     silence_hint_tr = "Sessizlik testi için /silence <N> kullan."
@@ -1824,7 +1851,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                     f"/set name=value to change") if detected else None
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.6.0"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.8.0"))
     print()
     if report_language == "tr":
         lines = [
@@ -1871,6 +1898,9 @@ def _render_end_call_box(report_language: str) -> None:
     explains what just happened and surfaces the post-call options so the
     user has time to /save the last turn or /commit staged anchors before
     closing the session manually."""
+    if _RICH:
+        _rich_endcall(report_language)
+        return
     title = _c(_COL_BOLD, _c(_COL_ENDCALL,
         "ARAMA SONA ERDİ" if report_language == "tr" else "CALL ENDED"))
     if report_language == "tr":
@@ -1926,6 +1956,9 @@ def _render_summary_card(run_dir: str, report_language: str, turns: int,
     """v0.5.19: replaces the four plain print lines at the end of
     _exit_cleanly with a single bordered card that visually parallels the
     welcome banner. Same fields plus an added wall-clock duration."""
+    if _RICH:
+        _rich_summary(run_dir, report_language, turns, total_committed, started_at)
+        return
     run_name = os.path.basename(run_dir)
     duration = _format_duration(started_at)
     title = _c(_COL_BOLD, _c(_COL_OK,
@@ -1955,6 +1988,217 @@ def _render_summary_card(run_dir: str, report_language: str, turns: int,
     print()
     _render_box(title, lines)
     print()
+
+
+# ====================================================================== #
+# v0.7.0 — Rich renderer (the modern default). Every helper below is only
+# reached when `_RICH` is True; the stdlib functions above stay as the
+# zero-dependency fallback. Rich submodules are imported lazily so module
+# import stays cheap (and never fails) when Rich is absent.
+# ====================================================================== #
+
+_RICH_BOT = "green"
+_RICH_USER = "dark_orange"
+_RICH_DIM = "grey50"
+_RICH_ACCENT = "cyan"
+
+
+def _rich_width() -> int:
+    """Responsive panel width — fills the terminal but caps so long lines stay
+    readable, and never overflows a narrow window."""
+    return max(24, min(_term_size()[0] - 2, 84))
+
+
+def _clean_stream_view(raw: str) -> "tuple[str, str | None]":
+    """Turn a raw (possibly partial) reply into text that is safe to show
+    mid-stream: strip a leading `[PERSONA_NAME: X]` line and any trailing run
+    that is the `<<END_CALL>>` marker — or a >= 2-char prefix of it — so the
+    marker never flashes on screen. Returns (display_text, persona_name)."""
+    text, name = _strip_persona_name_marker(raw)
+    text = text.replace(END_CALL_MARKER, "")
+    stripped = text.rstrip()
+    # Hide a still-forming end-call marker (>= 2 chars, so a lone '<' survives).
+    for n in range(len(END_CALL_MARKER), 1, -1):
+        if stripped.endswith(END_CALL_MARKER[:n]):
+            text = stripped[:-n]
+            break
+    return text, name
+
+
+def _rich_bot_renderable(name: str, ts: str, view: str, streaming: bool):
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.markdown import Markdown
+
+    title = Text(f"● {name}", style=f"bold {_RICH_BOT}")
+    title.append(f"  {ts}", style=_RICH_DIM)
+    if streaming:
+        body = Text(view or "")
+        body.append(" ▌", style=f"bold {_RICH_BOT}")
+    else:
+        body = Markdown(view or "")
+    return Panel(body, title=title, title_align="left", border_style=_RICH_BOT,
+                 padding=(0, 1), width=_rich_width())
+
+
+def _rich_render_user(ts: str, text: str, report_language: str) -> None:
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich.align import Align
+
+    label = "sen" if report_language == "tr" else "you"
+    title = Text(f"{label}  {ts}", style=f"bold {_RICH_USER}")
+    width = max(24, min(_rich_width(), 64))
+    panel = Panel(Text(text), title=title, title_align="right",
+                  border_style=_RICH_USER, padding=(0, 1), width=width)
+    _console.print(Align.right(panel))
+
+
+def _rich_stream_reply(ctx, msg, persona_name, report_language) -> str:
+    """Stream a bot reply into a Rich Live panel — true token streaming with
+    marker-safe cleaning — then leave the finished Markdown-rendered panel in
+    the scrollback. Returns the raw (uncleaned) reply for the caller to persist
+    and to detect end-of-call. RuntimeError from the subprocess propagates."""
+    from rich.live import Live
+    from rich.spinner import Spinner
+    from rich.text import Text
+
+    ts = datetime.datetime.now().strftime("%H:%M")
+    buf: list = []
+    state = {"name": persona_name}
+    thinking = Spinner("dots", text=Text(
+        (f"{persona_name or 'Bot'} düşünüyor…" if report_language == "tr"
+         else f"{persona_name or 'Bot'} is thinking…"), style=_RICH_DIM))
+
+    with Live(thinking, console=_console, refresh_per_second=16,
+              transient=False) as live:
+        def on_delta(chunk: str) -> None:
+            buf.append(chunk)
+            view, nm = _clean_stream_view("".join(buf))
+            if nm:
+                state["name"] = nm
+            live.update(_rich_bot_renderable(state["name"] or "Bot", ts, view, True))
+
+        raw = ctx.send(msg, on_delta=on_delta)
+        view, nm = _clean_stream_view(raw)
+        if nm:
+            state["name"] = nm
+        live.update(_rich_bot_renderable(state["name"] or "Bot", ts, view.strip(), False))
+    return raw
+
+
+def _stream_reply(ctx, msg, persona_name, report_language) -> str:
+    """Send one message, RENDER the bot reply (Rich Live stream when available,
+    otherwise the stdlib spinner + buffered render), and return the raw reply.
+    Callers must NOT render separately — this owns the bot-turn output."""
+    if _RICH:
+        return _rich_stream_reply(ctx, msg, persona_name, report_language)
+    raw = _send_with_spinner(ctx, msg, persona_name, report_language)
+    clean, _ended = _strip_end_call_marker(raw)
+    clean, name = _strip_persona_name_marker(clean)
+    _render_bot_reply(clean.strip(), persona_name or name)
+    return raw
+
+
+def _rich_welcome(run_dir, abs_prompt, chat_model, report_language,
+                  caller_name, session, var_state) -> None:
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    tr = report_language == "tr"
+    basename = os.path.basename(abs_prompt).rsplit(".", 1)[0]
+    line_count = sum(1 for _ in open(os.path.join(run_dir, "body.txt"), encoding="utf-8"))
+    detected = (var_state or {}).get("detected") or []
+    values = (var_state or {}).get("values") or {}
+    bound_n = sum(1 for d in detected if values.get(d["name"]))
+
+    meta = Table.grid(padding=(0, 2))
+    meta.add_column(style=_RICH_DIM, justify="right")
+    meta.add_column(style="bold")
+    meta.add_row("prompt", f"{basename}  ({line_count} {'satır' if tr else 'lines'} · {chat_model})")
+    meta.add_row("arayan" if tr else "caller", caller_name)
+    if detected:
+        meta.add_row("değişken" if tr else "variables",
+                     f"{bound_n}/{len(detected)} {'bağlı · /vars' if tr else 'bound · /vars'}")
+    hint = ("Bot birazdan kendisi selamlayacak — sen arayansın.  Komutlar için /help."
+            if tr else
+            "The bot greets you first — you're the caller.  Type /help for commands.")
+    body = Table.grid()
+    body.add_row(meta)
+    body.add_row("")
+    body.add_row(Text(hint, style=_RICH_DIM))
+    title = Text("VoicePromptKit", style=f"bold {_RICH_ACCENT}")
+    title.append("  ·  persona chat simulator", style=_RICH_DIM)
+    _console.print()
+    _console.print(Panel(body, title=title, title_align="left",
+                         border_style=_RICH_ACCENT, padding=(1, 2), width=_rich_width()))
+
+
+def _rich_endcall(report_language) -> None:
+    from rich.panel import Panel
+    from rich.text import Text
+
+    tr = report_language == "tr"
+    body = Text()
+    body.append(("Persona aramayı kapattı.\n\n" if tr
+                 else "The persona ended the call.\n\n"))
+    steps = ([("/save", "son turu anchor yap"), ("/history", "konuşmayı gör"),
+              ("/commit", "anchorları yaz"), ("/quit", "kapat")] if tr else
+             [("/save", "anchor the last turn"), ("/history", "review the chat"),
+              ("/commit", "write staged anchors"), ("/quit", "close the session")])
+    for cmd, desc in steps:
+        body.append(f"{cmd:<9}", style=f"bold {_RICH_USER}")
+        body.append(f" {desc}\n", style=_RICH_DIM)
+    body.append(("\nYeni mesaj yazarsan yeni bir arama başlar."
+                 if tr else "\nType a new message to start a fresh call."), style=_RICH_DIM)
+    title = Text("ARAMA SONA ERDİ" if tr else "CALL ENDED", style="bold dark_orange")
+    _console.print()
+    _console.print(Panel(body, title=title, title_align="left",
+                         border_style="dark_orange", padding=(1, 2), width=_rich_width()))
+
+
+def _rich_summary(run_dir, report_language, turns, total_committed, started_at) -> None:
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    tr = report_language == "tr"
+    rows = [
+        ("Run", os.path.basename(run_dir)),
+        ("Tur" if tr else "Turns", str(turns)),
+        ("Anchor" if tr else "Anchors", str(total_committed)),
+        ("Süre" if tr else "Duration", _format_duration(started_at)),
+        ("Dizin" if tr else "Run dir", os.path.relpath(run_dir)),
+    ]
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style=_RICH_DIM, justify="right")
+    grid.add_column(style="bold")
+    for k, v in rows:
+        grid.add_row(k, v)
+    title = Text("oturum özeti" if tr else "session summary", style="bold green")
+    _console.print()
+    _console.print(Panel(grid, title=title, title_align="left",
+                         border_style="green", padding=(1, 2), width=_rich_width()))
+    _console.print()
+
+
+def _rich_history(entries, report_language, persona_name) -> None:
+    if not entries:
+        _console.print("(boş)" if report_language == "tr" else "(empty)", style=_RICH_DIM)
+        return
+    _console.print()
+    for e in entries:
+        try:
+            hhmm = datetime.datetime.fromisoformat(e.get("ts", "")).astimezone().strftime("%H:%M")
+        except (ValueError, TypeError):
+            hhmm = "--:--"
+        if e.get("role") == "assistant":
+            _console.print(_rich_bot_renderable(persona_name or "Bot", hhmm,
+                                                e.get("content", ""), False))
+        else:
+            _rich_render_user(hhmm, e.get("content", ""), report_language)
+    _console.print()
 
 
 def _read_chat_jsonl(path: str) -> list:

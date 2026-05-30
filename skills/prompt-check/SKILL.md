@@ -1,6 +1,6 @@
 ---
 name: prompt-check
-description: Audit a prompt file (system prompt, agent definition, voice script, chained workflow) across four lenses — conflict, dominance, gap, drift — plus an optional Turkish phonetic lens for voice agents. Use when the user invokes /prompt-check, asks to "audit a prompt", "check this prompt for contradictions / silent overrides / gaps / drift / voice readability", or passes a path to a prompt file for review. On first run in a repo, walks the user through a 5-question wizard and saves repo defaults to `.promptchecker.json`. Produces line-anchored findings as `report.md` + `findings.json` in an isolated run directory. Never modifies the original prompt file.
+description: Audit a prompt file (system prompt, agent definition, voice script, chained workflow) across six lenses — conflict, dominance, gap, drift, schema — plus an optional Turkish phonetic lens for voice agents. Use when the user invokes /prompt-check, asks to "audit a prompt", "check this prompt for contradictions / silent overrides / gaps / drift / voice readability", or passes a path to a prompt file for review. On first run in a repo, walks the user through a 7-question wizard and saves repo defaults to `.voicepromptkit.json`. Produces line-anchored findings as `report.md` + `findings.json` in an isolated run directory. Only modifies the original prompt file when you explicitly apply a fix in the interactive review.
 ---
 
 # prompt-check
@@ -20,13 +20,13 @@ The skill itself does not need to read the three lens reference files (`lens-rul
 
 ## Phase 0 — Project config (wizard on first run)
 
-Project config lives at `<repo-root>/.promptchecker.json`. It captures repo-level defaults so the user does not write the same frontmatter on every prompt.
+Project config lives at `<repo-root>/.voicepromptkit.json`. It captures repo-level defaults so the user does not write the same frontmatter on every prompt.
 
 Locate the config path:
 
 ```bash
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-CONFIG_PATH="$REPO_ROOT/.promptchecker.json"
+CONFIG_PATH="$REPO_ROOT/.voicepromptkit.json"
 if [ -f "$CONFIG_PATH" ]; then
   CONFIG_EXISTS=true
 else
@@ -39,7 +39,7 @@ echo "CONFIG_EXISTS=$CONFIG_EXISTS"
 
 **Branch on the `CONFIG_EXISTS` line the bash block just echoed — do not infer from the path string alone.**
 
-- **If `CONFIG_EXISTS=true` (the bash block printed this line):** STOP — skip the wizard, do not write `.promptchecker.json`, do not ask any questions. Continue to Phase 1. The pre-existing file is the source of truth and will be read in Phase 2 during the frontmatter merge.
+- **If `CONFIG_EXISTS=true` (the bash block printed this line):** STOP — skip the wizard, do not write `.voicepromptkit.json`, do not ask any questions. Continue to Phase 1. The pre-existing file is the source of truth and will be read in Phase 2 during the frontmatter merge.
 - **Only if `CONFIG_EXISTS=false`:** run the first-run wizard before continuing. Ask the user the seven questions below (prefer `AskUserQuestion` if available, otherwise plain conversational prompts; either way wait for all seven answers before writing the file).
 
 **Sanity check before asking the wizard questions:** read the last echoed `CONFIG_EXISTS=` line from the bash output. If it is `true`, the wizard MUST NOT run regardless of any other reasoning. Overwriting an existing config is a silent data-loss bug.
@@ -80,7 +80,7 @@ Confirm to the user: `Saved repo defaults to <relative path>. Edit it any time o
 
 **Invariants:**
 - Never run the wizard if `$CONFIG_PATH` already exists. The user owns that file.
-- **Never run the wizard when `CONFIG_EXISTS=true`.** This is a hard rule — no edge case justifies overwriting a populated `.promptchecker.json`. If something seems off (corrupt file, unknown keys), warn the user and continue to Phase 1; do NOT run the wizard.
+- **Never run the wizard when `CONFIG_EXISTS=true`.** This is a hard rule — no edge case justifies overwriting a populated `.voicepromptkit.json`. If something seems off (corrupt file, unknown keys), warn the user and continue to Phase 1; do NOT run the wizard.
 - If `git rev-parse` fails (not a git repo), use the current working directory as the repo root and warn the user that the config lives in cwd, not a tracked repo.
 
 ## Phase 1 — Working directory + versioning
@@ -90,7 +90,7 @@ Run this Bash block once. It computes `$RUN_DIR` and updates the `latest` symlin
 ```bash
 ABS_PROMPT=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 BASENAME=$(basename "$1" | sed 's/\.[^.]*$//')
-PROMPT_DIR=".promptcheck/$BASENAME"
+PROMPT_DIR=".voicepromptkit/$BASENAME"
 mkdir -p "$PROMPT_DIR"
 
 # Atomic run-NNN allocation. mkdir without -p fails if the directory exists,
@@ -113,9 +113,9 @@ fi
 # A run that fails mid-way leaves `latest` pointing at the previous good run.
 
 # Timing instrumentation — env-gated, zero overhead when off.
-# When PROMPTCHECKER_TIMING=true, every phase boundary appends a
+# When VOICEPROMPTKIT_TIMING=true, every phase boundary appends a
 # millisecond-precision line to $RUN_DIR/timing.log.
-if [ "$PROMPTCHECKER_TIMING" = "true" ]; then
+if [ "$VOICEPROMPTKIT_TIMING" = "true" ]; then
   TIMING_LOG="$RUN_DIR/timing.log"
   : > "$TIMING_LOG"
   date_ms() { date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))'; }
@@ -137,7 +137,7 @@ echo "ABS_PROMPT=$ABS_PROMPT"
 ```
 
 **Invariants for the entire run:**
-- All artefacts go under `$RUN_DIR/`. Never `.promptcheck/.tmp/`.
+- All artefacts go under `$RUN_DIR/`. Never `.voicepromptkit/.tmp/`.
 - Original prompt file is read-only EXCEPT in Phase 10's `applied` step (governed by SHA256 guard + explicit user decision). No inline annotation, no `.bak`, no edits in any other phase.
 - Previous run directories are left intact (versioning).
 - `session.json` and `decisions.jsonl` are bootstrapped here so Phase 9/10 never have to test for existence.
@@ -148,12 +148,12 @@ Extract YAML frontmatter and merge it against env vars + project config + built-
 
 **Override hierarchy (most specific wins):**
 1. Per-prompt frontmatter (in the prompt file itself)
-2. Env var (`PROMPTCHECKER_*`)
-3. Project config (`.promptchecker.json`)
+2. Env var (`VOICEPROMPTKIT_*`)
+3. Project config (`.voicepromptkit.json`)
 4. Built-in defaults
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_2_start" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_2_start" >> "$TIMING_LOG"
 python3 - "$ABS_PROMPT" "$RUN_DIR" "$CONFIG_PATH" "$REPO_ROOT" <<'PY'
 import sys, re, json, os, hashlib, subprocess
 prompt_path, run_dir, config_path, repo_root = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
@@ -205,7 +205,7 @@ resolved['type'] = fm.get('type') or project.get('default_type') or None
 
 resolved['target_model'] = (
     fm.get('target_model')
-    or env('PROMPTCHECKER_TARGET_MODEL')
+    or env('VOICEPROMPTKIT_TARGET_MODEL')
     or project.get('target_model')
     or 'claude-opus-4-7'
 )
@@ -216,7 +216,7 @@ resolved['target_model'] = (
 # while Opus per-token cost on Step 3 was the largest single drift-runner expense.
 resolved['judge_model'] = (
     fm.get('judge_model')
-    or env('PROMPTCHECKER_JUDGE_MODEL')
+    or env('VOICEPROMPTKIT_JUDGE_MODEL')
     or project.get('judge_model')
     or 'claude-haiku-4-5-20251001'
 )
@@ -232,7 +232,7 @@ resolved['judge_model'] = (
 # simulation and chat-simulator persona. Everything else uses worker_model.
 resolved['worker_model'] = (
     fm.get('worker_model')
-    or env('PROMPTCHECKER_WORKER_MODEL')
+    or env('VOICEPROMPTKIT_WORKER_MODEL')
     or project.get('worker_model')
     or 'claude-haiku-4-5-20251001'
 )
@@ -261,7 +261,7 @@ resolved['judge_model_alias']  = _model_alias(resolved['judge_model'])  or 'haik
 
 out = fm.get('output')
 if out is None:
-    env_out = env('PROMPTCHECKER_OUTPUT')
+    env_out = env('VOICEPROMPTKIT_OUTPUT')
     if env_out:
         out = [s.strip() for s in env_out.split(',')]
     elif project.get('output'):
@@ -273,7 +273,7 @@ resolved['output'] = [str(o).strip() for o in (out if isinstance(out, list) else
 # F2: expand_count must preserve 0 (zero explicitly disables drift); avoid `or 3` truthy trap
 ec = fm.get('expand_count')
 if ec is None:
-    ec = env('PROMPTCHECKER_EXPAND_COUNT')
+    ec = env('VOICEPROMPTKIT_EXPAND_COUNT')
     if ec is None or str(ec).strip() == '':
         ec = project.get('expand_count')
         if ec is None:
@@ -311,7 +311,7 @@ except Exception as _e:
 
 tr = fm.get('tr_phonetic')
 if tr is None:
-    env_tr = env('PROMPTCHECKER_TR_PHONETIC')
+    env_tr = env('VOICEPROMPTKIT_TR_PHONETIC')
     if env_tr is not None and env_tr != '':
         tr = truthy(env_tr)
     elif 'tr_phonetic' in project:
@@ -324,10 +324,10 @@ resolved['tr_phonetic'] = bool(tr)
 resolved['body_line_offset'] = body_line_offset
 resolved['prompt_sha256'] = prompt_sha256
 
-# Resolve max_char_limit: frontmatter > env (PROMPTCHECKER_MAX_CHAR_LIMIT) > project config > default 50000
+# Resolve max_char_limit: frontmatter > env (VOICEPROMPTKIT_MAX_CHAR_LIMIT) > project config > default 50000
 mcl = fm.get('max_char_limit')
 if mcl is None:
-    mcl_env = env('PROMPTCHECKER_MAX_CHAR_LIMIT')
+    mcl_env = env('VOICEPROMPTKIT_MAX_CHAR_LIMIT')
     if mcl_env is not None and str(mcl_env).strip() != '':
         try:
             mcl = int(mcl_env)
@@ -347,10 +347,10 @@ resolved['compact_mode'] = (
     resolved['max_char_limit'] > 0 and body_char_count > resolved['max_char_limit']
 )
 
-# Resolve report_language: frontmatter > env (PROMPTCHECKER_REPORT_LANGUAGE) > project config > default 'tr'
+# Resolve report_language: frontmatter > env (VOICEPROMPTKIT_REPORT_LANGUAGE) > project config > default 'tr'
 rlang = fm.get('report_language')
 if rlang is None:
-    rlang_env = env('PROMPTCHECKER_REPORT_LANGUAGE')
+    rlang_env = env('VOICEPROMPTKIT_REPORT_LANGUAGE')
     if rlang_env is not None and str(rlang_env).strip() != '':
         rlang = str(rlang_env).strip().lower()
     if rlang is None:
@@ -405,7 +405,7 @@ with open(os.path.join(run_dir, 'frontmatter.json'), 'w', encoding='utf-8') as f
 with open(os.path.join(run_dir, 'body.txt'), 'w', encoding='utf-8') as f:
     f.write(body)
 PY
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_2_end" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_2_end" >> "$TIMING_LOG"
 ```
 
 If `python3` is unavailable, fall back to reading the file yourself, splitting on the first two `---` lines, and applying the same merge logic by reasoning. State the fallback in the terminal summary.
@@ -413,7 +413,7 @@ If `python3` is unavailable, fall back to reading the file yourself, splitting o
 ## Phase 3 — Rule extraction (inline) + section_index build
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_start" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_start" >> "$TIMING_LOG"
 ```
 
 **Phase 3 also produces `section_index.json` — a deterministic line-to-section map.**
@@ -526,16 +526,16 @@ Hold the rules in memory as JSON. Also write `$RUN_DIR/rules.json` with shape:
 If you extract zero rules, abort with an error written to `$RUN_DIR/error.txt` and surface that to the user.
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_end" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_end" >> "$TIMING_LOG"
 ```
 
 ## Phase 3.5 — Lens-selection wizard (per-run)
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_5_start" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_5_start" >> "$TIMING_LOG"
 ```
 
-This wizard runs **once per `/prompt-check` invocation**, after rule extraction and before lens dispatch. It is separate from the Phase 0 repo-level wizard (which governs `.promptchecker.json` defaults). Phase 3.5 captures per-run intent.
+This wizard runs **once per `/prompt-check` invocation**, after rule extraction and before lens dispatch. It is separate from the Phase 0 repo-level wizard (which governs `.voicepromptkit.json` defaults). Phase 3.5 captures per-run intent.
 
 **CRITICAL — AskUserQuestion is MANDATORY here.**
 
@@ -548,7 +548,7 @@ respond to the multi-select widget.
 Failure modes that bypass this rule:
 - Emitting a free-text "Which lenses do you want? (list them)" prose
   question instead of AskUserQuestion → WRONG. Always use the tool.
-- Inferring lens selection from `.promptchecker.json` repo defaults
+- Inferring lens selection from `.voicepromptkit.json` repo defaults
   without asking → WRONG. Repo defaults SEED the AskUserQuestion option
   states (pre-checked), they don't replace the question.
 - Proceeding silently when "all defaults are obvious" → WRONG. The user
@@ -568,7 +568,7 @@ The AskUserQuestion shape:
   (when `report_language == "en"`)
 - `multiSelect: true`
 - Options: the six lenses (conflict, dominance, gap, drift, tr_phonetic, schema)
-- Each option's selected state seeds from `.promptchecker.json` /
+- Each option's selected state seeds from `.voicepromptkit.json` /
   user_intent computed defaults.
 
 After the user submits, IF `expand_count` needs adjusting (drift selected)
@@ -635,7 +635,7 @@ Phase 9 writes this `user_intent` block into `session.json` at interactive entry
 Phase 7 already handles missing per-lens JSON files as "lens disabled" — no change there.
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_5_end" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_5_end" >> "$TIMING_LOG"
 ```
 
 ## Phase 3.6 — Cache key compute (skip when bodies + config + refs are unchanged)
@@ -644,12 +644,12 @@ Same prompt body + same wizard config + same reference docs ⇒ same lens output
 
 **Cache scope:** four static lenses + tr_phonetic are cached unconditionally. Drift is cached but reused ONLY when `user_intent.drift_reuse == true` (LLM-nondeterministic; default off).
 
-**Cache directory:** `.promptcheck/_cache/<cache_key>/{lens}.json`. Repo-scoped (under `$REPO_ROOT`), not run-scoped. Run dirs (`run-NNN`) keep their full artefacts — cache hits copy from `_cache/` into `$RUN_DIR/` so the run dir remains self-contained.
+**Cache directory:** `.voicepromptkit/_cache/<cache_key>/{lens}.json`. Repo-scoped (under `$REPO_ROOT`), not run-scoped. Run dirs (`run-NNN`) keep their full artefacts — cache hits copy from `_cache/` into `$RUN_DIR/` so the run dir remains self-contained.
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_6_start" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_6_start" >> "$TIMING_LOG"
 
-CACHE_ROOT="$REPO_ROOT/.promptcheck/_cache"
+CACHE_ROOT="$REPO_ROOT/.voicepromptkit/_cache"
 mkdir -p "$CACHE_ROOT"
 
 # Inputs to the cache key — change any one and the key changes, forcing a miss.
@@ -743,7 +743,7 @@ PY
 # Source the printed CACHE_KEY / CACHE_DIR for use in Phase 4 / 5 / 6 / 8.
 eval $(python3 -c "import json,os; m=json.load(open('$RUN_DIR/cache_meta.json'));print(f\"CACHE_KEY={m['cache_key']}\\nCACHE_DIR={m['cache_dir']}\")")
 
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_6_end (cache_key=$CACHE_KEY)" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_3_6_end (cache_key=$CACHE_KEY)" >> "$TIMING_LOG"
 ```
 
 **Persistence contract:** before Phase 3.6 runs, the skill writes `user_intent.json` to `$RUN_DIR` (the in-memory `user_intent` block from Phase 3.5). This file is the deterministic input to the user_intent portion of the cache key. The same file is read by Phase 9 when it bootstraps `session.json`, so the write is reused — no extra IO.
@@ -752,7 +752,7 @@ eval $(python3 -c "import json,os; m=json.load(open('$RUN_DIR/cache_meta.json'))
 
 - Body change ⇒ `body_sha` changes ⇒ miss.
 - Wizard answers change (lens selection, expand_count, drift_reuse, tr_phonetic) ⇒ `ui_canonical` changes ⇒ miss.
-- Frontmatter / `.promptchecker.json` resolved values change (target_model, report_language, compact_mode, etc.) ⇒ `fm_canonical` changes ⇒ miss.
+- Frontmatter / `.voicepromptkit.json` resolved values change (target_model, report_language, compact_mode, etc.) ⇒ `fm_canonical` changes ⇒ miss.
 - Any reference doc or runner spec edited ⇒ `ref_canonical` changes ⇒ miss.
 - SKILL.md itself edited ⇒ included in `ref_canonical` ⇒ miss. No manual version-bump discipline required.
 
@@ -787,8 +787,8 @@ dispatch list and runs normally. Cache hits also apply to `tr_phonetic` (when
 the lens is selected via `user_intent.tr_phonetic_enabled == true`).
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_4_dispatch_start" >> "$TIMING_LOG"
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_6_dispatch_start" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_4_dispatch_start" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_6_dispatch_start" >> "$TIMING_LOG"
 
 # Cache lookup: for each selected static lens, copy cached artefact into $RUN_DIR if present.
 # CACHE_DIR is exported by Phase 3.6. SELECTED_LENSES comes from user_intent.selected_lenses.
@@ -806,9 +806,9 @@ for lens_file in conflicts dominances gaps schema tr_phonetic; do
     # Validate JSON before trusting the cache entry.
     if python3 -c "import json; json.load(open('$CACHE_DIR/$lens_file.json'))" 2>/dev/null; then
       cp "$CACHE_DIR/$lens_file.json" "$RUN_DIR/$lens_file.json"
-      [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] cache_hit: $lens_file" >> "$TIMING_LOG"
+      [ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] cache_hit: $lens_file" >> "$TIMING_LOG"
     else
-      [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] cache_corrupt: $lens_file (will re-dispatch)" >> "$TIMING_LOG"
+      [ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] cache_corrupt: $lens_file (will re-dispatch)" >> "$TIMING_LOG"
     fi
   fi
 done
@@ -960,7 +960,7 @@ If ALL four static lenses are deselected, no static-lens-runner dispatches happe
 `static-lens-runner` writes `$RUN_DIR/conflicts.json`, `$RUN_DIR/dominances.json`, `$RUN_DIR/gaps.json`, or `$RUN_DIR/schema.json` depending on which singleton call dispatched it. `tr-phonetic-runner` writes `$RUN_DIR/tr_phonetic.json`. The skill reads them in Phase 7 after awaiting ALL pending dispatches (the five lens runs plus drift, if drift was triggered).
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_4_dispatch_end" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_4_dispatch_end" >> "$TIMING_LOG"
 ```
 
 ## Phase 5 — Drift (conditional)
@@ -981,7 +981,7 @@ Write `$RUN_DIR/drift.json` with `skipped_reason: "no anchors, conflicts, or rol
 In either skip case the file shape is `{"scenarios": [], "runs": [], "verdicts": [], "skipped_reason": "..."}`. Move on to Phase 6.
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_5_skip" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_5_skip" >> "$TIMING_LOG"
 ```
 
 **Drift cache opt-in (Phase 3.6 cache key).** Drift output depends on LLM
@@ -995,7 +995,7 @@ if grep -q '"drift_reuse": *true' "$RUN_DIR/user_intent.json" 2>/dev/null \
    && [ -f "$CACHE_DIR/drift.json" ] \
    && python3 -c "import json; json.load(open('$CACHE_DIR/drift.json'))" 2>/dev/null; then
   cp "$CACHE_DIR/drift.json" "$RUN_DIR/drift.json"
-  [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] cache_hit: drift (opt-in)" >> "$TIMING_LOG"
+  [ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] cache_hit: drift (opt-in)" >> "$TIMING_LOG"
   # Skip the drift-runner dispatch below.
 fi
 ```
@@ -1006,7 +1006,7 @@ call. Otherwise dispatch as documented below.
 Otherwise dispatch the `drift-runner` subagent (it is the only subagent this skill uses). Pass inputs and the output path as **separate** top-level fields so the subagent does not accidentally read its own future output:
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_5_start" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_5_start" >> "$TIMING_LOG"
 ```
 
 ```
@@ -1044,7 +1044,7 @@ Populate `expand_count_override` with `user_intent.expand_count` from Phase 3.5 
 `drift-runner` generates scenarios, simulates the model on each, judges outputs, and writes `$RUN_DIR/drift.json` with shape `{scenarios, runs, verdicts}`. The skill never decomposes drift inline because it is the only step whose token cost scales with prompt length.
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_5_end" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_5_end" >> "$TIMING_LOG"
 ```
 
 ## Phase 6 — Turkish phonetic lens (conditional — dispatched in the same turn as Phase 4)
@@ -1054,7 +1054,7 @@ Populate `expand_count_override` with `user_intent.expand_count` from Phase 3.5 
 **Dispatch ordering:** Phase 6's `tr-phonetic-runner` call is the FIFTH parallel Agent call emitted in the same assistant turn as the four Phase 4 static lens dispatches (see "Phases 4 + 6 — Parallel lens dispatch" above). The Phase 6 detail below documents the per-runner contract; the dispatch shape (along with `isolation: "worktree"`) is part of the combined Phase 4+6 fan-out.
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_6_skip" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_6_skip" >> "$TIMING_LOG"
 ```
 
 When the gate passes, `tr-phonetic-runner` seeds `pronunciation_map` from any existing pronunciation guide block in the body, scans for new findings, dedupes against the seed, and writes a single `$RUN_DIR/tr_phonetic.json`. Every rule (skip rules, whitelist, strategy semantics, the "no semantic translation" hard rule, the three `fix_kind` values, the seed block formats and line-range tracking) lives in `references/tr-phonetic.md` — the subagent reads that document; the skill does not repeat the criteria here.
@@ -1100,13 +1100,13 @@ TR phonetic is already line-level / cheap; `compact_mode` has no effect on its a
 `tr-phonetic-runner` writes `$RUN_DIR/tr_phonetic.json` with shape `{ findings[], seed_entries[], warnings[] }`. The skill reads it in Phase 7.
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_6_dispatch_end" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_6_dispatch_end" >> "$TIMING_LOG"
 ```
 
 ## Phase 7 — Render outputs
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_7_start" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_7_start" >> "$TIMING_LOG"
 ```
 
 **Await all pending dispatches first.** Before reading any per-lens output, block until ALL in-flight Agent calls have returned: the four Phase 4 static-lens-runner singletons (conflict / dominance / gap / schema), the Phase 6 tr-phonetic-runner (if its gate passed), and the Phase 5 drift-runner (if its gate passed). Phase 7 is the synchronisation barrier — do not start reading per-lens JSONs until every dispatched runner has signalled completion (its output file is written).
@@ -1399,8 +1399,8 @@ def render_findings_table(findings, lang):
       "section_ref": {
         "section": "7",
         "subsection": "7.2",
-        "section_title": "VALUE FRAMING AXES",
-        "subsection_title": "MÜBADELE VALUE HIERARCHY"
+        "section_title": "RESPONSE GUIDELINES",
+        "subsection_title": "TONE & STYLE"
       },
       "related_lines": [42, 47],
       "current_excerpt": "<verbatim from body.txt>",
@@ -1421,10 +1421,10 @@ def render_findings_table(findings, lang):
       "source_finding_ids": ["T3"]
     },
     {
-      "term": "Konstantinopolis",
+      "term": "Versailles",
       "strategy": "pronounce",
       "phonetic": null,
-      "alt_translation": "Bizans başkenti",
+      "alt_translation": "Versay Sarayı",
       "note": "...",
       "source": "seed",
       "source_finding_ids": []
@@ -1524,7 +1524,7 @@ Each row is built by `render_finding_row` (see "Table-format finding render" abo
 **Removed output modes:** `inline` (v0.2) and `html` (v0.3.1) are no longer supported. Phase 2 strips them with a warning; this phase need not handle them.
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_7_end" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_7_end" >> "$TIMING_LOG"
 ```
 
 ## Phase 8 — Terminal summary
@@ -1532,7 +1532,7 @@ Each row is built by `render_finding_row` (see "Table-format finding render" abo
 After all writes succeed, **mirror per-lens artefacts into the content-addressable cache, then update the `latest` symlink** so it points at this run (the run is now durable), then print the summary:
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_8_start" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_8_start" >> "$TIMING_LOG"
 
 # Cache write: mirror this run's per-lens artefacts into the content-addressable cache.
 # Atomic via temp-then-rename. Idempotent — overwriting an existing entry is fine
@@ -1550,7 +1550,7 @@ if [ -n "$CACHE_DIR" ] && [ -d "$CACHE_DIR" ]; then
       cp "$src" "$tmp" && mv "$tmp" "$CACHE_DIR/$lens_file.json"
     fi
   done
-  [ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] cache_write_complete (key=$CACHE_KEY)" >> "$TIMING_LOG"
+  [ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] cache_write_complete (key=$CACHE_KEY)" >> "$TIMING_LOG"
 fi
 
 ln -sfn "$RUN_NAME" "$PROMPT_DIR/latest"
@@ -1582,9 +1582,9 @@ Findings:        <relative path to $RUN_DIR/findings.json>
 Session:         <relative path to $RUN_DIR/session.json>
 Decisions log:   <relative path to $RUN_DIR/decisions.jsonl>
 Overlay:         <relative path to $RUN_DIR/inline-suggestions.md>
-Pronunciations:  .promptcheck/<basename>/pronunciations.md (<M> unique terms across <N> runs)
-Previous runs: .promptcheck/<basename>/ (run-001 … run-NNN)
-Repo defaults: <relative path to .promptchecker.json>
+Pronunciations:  .voicepromptkit/<basename>/pronunciations.md (<M> unique terms across <N> runs)
+Previous runs: .voicepromptkit/<basename>/ (run-001 … run-NNN)
+Repo defaults: <relative path to .voicepromptkit.json>
 Body size: <body_char_count> chars [compact mode <ACTIVE | inactive — under <max_char_limit> char threshold | DISABLED via max_char_limit=0>]
 
 Entering interactive review (Phase 9). Use a compact decision string such as
@@ -1608,9 +1608,9 @@ Bulgular:        <relative path to $RUN_DIR/findings.json>
 Oturum:          <relative path to $RUN_DIR/session.json>
 Karar günlüğü:   <relative path to $RUN_DIR/decisions.jsonl>
 Overlay:         <relative path to $RUN_DIR/inline-suggestions.md>
-Telaffuz ana:    .promptcheck/<basename>/pronunciations.md (<M> benzersiz terim, <N> koşu boyunca)
-Önceki koşular: .promptcheck/<basename>/ (run-001 … run-NNN)
-Repo varsayılan: <relative path to .promptchecker.json>
+Telaffuz ana:    .voicepromptkit/<basename>/pronunciations.md (<M> benzersiz terim, <N> koşu boyunca)
+Önceki koşular: .voicepromptkit/<basename>/ (run-001 … run-NNN)
+Repo varsayılan: <relative path to .voicepromptkit.json>
 Body boyutu: <body_char_count> chars [compact mode <AKTİF | inaktif — <max_char_limit> char eşiğin altında | DEVRE DIŞI (max_char_limit=0)>]
 
 Etkileşimli incelemeye geçiyorum (Faz 9). Karar dizesi olarak şu örneği kullanabilirsin:
@@ -1630,7 +1630,7 @@ The auto-filed line is shown ONLY when the count is non-zero. It sits alongside 
 
 `<M>` is `summary.schema.high` when applicable, otherwise omit the `(<M> high)` parenthetical. The applicability marker mirrors what `static-lens-runner` reported in `schema.json` — the skill does not recompute it.
 
-The `Pronunciations master:` line surfaces `.promptcheck/<basename>/pronunciations.md` — the cross-version aggregate file rebuilt by Phase 10.2.1. `<M>` is the number of unique terms in that file, `<N>` is the count of `run-NNN/` directories under the prompt that have ever contributed at least one `pronunciation_map` entry. **Omit this line entirely** when `pronunciations.md` has zero entries (i.e. no run under this prompt has produced a non-empty `pronunciation_map` yet). The line is informational and only appears when there is something for the user to read.
+The `Pronunciations master:` line surfaces `.voicepromptkit/<basename>/pronunciations.md` — the cross-version aggregate file rebuilt by Phase 10.2.1. `<M>` is the number of unique terms in that file, `<N>` is the count of `run-NNN/` directories under the prompt that have ever contributed at least one `pronunciation_map` entry. **Omit this line entirely** when `pronunciations.md` has zero entries (i.e. no run under this prompt has produced a non-empty `pronunciation_map` yet). The line is informational and only appears when there is something for the user to read.
 
 **Body size / compact mode line — render rules** (pull values from `frontmatter.body_char_count`, `frontmatter.max_char_limit`, `frontmatter.compact_mode`):
 
@@ -1638,9 +1638,9 @@ The `Pronunciations master:` line surfaces `.promptcheck/<basename>/pronunciatio
 - If `compact_mode == false AND max_char_limit > 0`: `Body size: 32100 chars [compact mode inactive — under 50000 char threshold]`
 - If `max_char_limit == 0`: `Body size: 87432 chars [compact mode DISABLED via max_char_limit=0]`
 
-When compact mode is active, downstream lenses apply cheaper analysis policies — low-severity findings may be skipped, drift simulation halves its scenario budget, and rule extraction trims verbose explanations. To audit at full depth, set `max_char_limit: 0` in `.promptchecker.json` or pass `PROMPTCHECKER_MAX_CHAR_LIMIT=0`.
+When compact mode is active, downstream lenses apply cheaper analysis policies — low-severity findings may be skipped, drift simulation halves its scenario budget, and rule extraction trims verbose explanations. To audit at full depth, set `max_char_limit: 0` in `.voicepromptkit.json` or pass `VOICEPROMPTKIT_MAX_CHAR_LIMIT=0`.
 
-When `PROMPTCHECKER_TIMING=true`, append one extra line to the summary block above (after the `Body size:` line and before the blank line preceding "Entering interactive review"):
+When `VOICEPROMPTKIT_TIMING=true`, append one extra line to the summary block above (after the `Body size:` line and before the blank line preceding "Entering interactive review"):
 
 ```
 Timing log: <relative path to $RUN_DIR/timing.log>
@@ -1649,7 +1649,7 @@ Timing log: <relative path to $RUN_DIR/timing.log>
 Otherwise omit — users without timing enabled see no change.
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_8_end" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_8_end" >> "$TIMING_LOG"
 ```
 
 After printing this block, **do not stop** — automatically transition to Phase 9 in the same turn. Phase 9 + Phase 10 are part of the default `/prompt-check` flow; the audit is not finished until the user either resolves every finding or explicitly cancels with "iptal".
@@ -1657,7 +1657,7 @@ After printing this block, **do not stop** — automatically transition to Phase
 ## Phase 9 — Interactive selection
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_9_start" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_9_start" >> "$TIMING_LOG"
 ```
 
 Triggered automatically once Phase 8 has printed its summary. There is no separate trigger phrase — the audit flow always passes through Phase 9. (The `/prompt-check-resume` slash command re-enters Phase 9 for a pending run from a previous session.)
@@ -1746,7 +1746,7 @@ The detailed grammar (id-lists, ranges with `..`, wildcards like `gerisini` / `r
 python3 - "$RUN_DIR" <<'PY'
 import sys, json, os, datetime, re
 run_dir = sys.argv[1]
-user_input = os.environ.get('PROMPTCHECKER_DECISION_INPUT', '')
+user_input = os.environ.get('VOICEPROMPTKIT_DECISION_INPUT', '')
 
 session = json.load(open(os.path.join(run_dir, 'session.json'), encoding='utf-8'))
 findings_state = session['findings_state']
@@ -1915,7 +1915,7 @@ These do NOT count toward the parse error / unrecognised segment counts.
 They are not user decisions; they are background routing.
 ```
 
-Pass the user's reply as `PROMPTCHECKER_DECISION_INPUT` (or stdin — whichever is cleaner in the harness). The block above is illustrative; trust `references/dialog-flow.md` as the source of truth for the verb table and grammar edge cases.
+Pass the user's reply as `VOICEPROMPTKIT_DECISION_INPUT` (or stdin — whichever is cleaner in the harness). The block above is illustrative; trust `references/dialog-flow.md` as the source of truth for the verb table and grammar edge cases.
 
 ### 9.5 — Surface the plan and request confirmation (Stage 1.5)
 
@@ -1957,7 +1957,7 @@ Branching on the reply:
 python3 - "$RUN_DIR" <<'PY'
 import sys, json, os, datetime
 run_dir = sys.argv[1]
-plan = json.loads(os.environ.get('PROMPTCHECKER_DECISION_PLAN', '{}'))
+plan = json.loads(os.environ.get('VOICEPROMPTKIT_DECISION_PLAN', '{}'))
 
 session = json.load(open(os.path.join(run_dir, 'session.json'), encoding='utf-8'))
 findings_state = session['findings_state']
@@ -2040,7 +2040,7 @@ json.dump(session, open(os.path.join(run_dir, 'session.json'), 'w', encoding='ut
 PY
 ```
 
-Pass the in-memory plan from 9.4 as `PROMPTCHECKER_DECISION_PLAN` (JSON-encoded). The self-check refuses to write any record missing `ts`, `finding`, `lens`, or `action` — these are the spec minimum from `references/overlay-format.md` Section 2.
+Pass the in-memory plan from 9.4 as `VOICEPROMPTKIT_DECISION_PLAN` (JSON-encoded). The self-check refuses to write any record missing `ts`, `finding`, `lens`, or `action` — these are the spec minimum from `references/overlay-format.md` Section 2.
 
 **Auto-filed contract (commit block above, summarising the JSONL writes):**
 
@@ -2063,13 +2063,13 @@ Parsed N decisions: A applied, B overlay, C dismissed, D discussed, E TR-routed 
 The `F auto-filed` segment is appended only when `plan.auto_filed > 0`. Then hand off to Phase 10 in the same turn. Do not wait for further confirmation — the user already confirmed at Stage 1.5.
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_9_end" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_9_end" >> "$TIMING_LOG"
 ```
 
 ## Phase 10 — Action dispatch
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_10_start" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_10_start" >> "$TIMING_LOG"
 ```
 
 Phase 10 reads `session.json` and `decisions.jsonl` from Phase 9 and executes each decided action. The order below is fixed — see `references/overlay-format.md` Section 4 for the rationale.
@@ -2113,7 +2113,7 @@ Do not append per-finding entries to `decisions.jsonl` for this step — the `ov
 ### 10.2.1 — Cross-version pronunciations.md rebuild
 
 After writing this run's `inline-suggestions.md`, rebuild the prompt-scoped
-master file `.promptcheck/<basename>/pronunciations.md` so it reflects every
+master file `.voicepromptkit/<basename>/pronunciations.md` so it reflects every
 audit run that has ever produced a `pronunciation_map` under this prompt.
 The file sits ONE level above the per-run `run-NNN/` directories and is the
 single source of truth for the TTS provider config (Vapi / ElevenLabs /
@@ -2122,7 +2122,7 @@ Section 5.
 
 Procedure:
 
-1. Scan `.promptcheck/<basename>/` for every `run-NNN/` directory that
+1. Scan `.voicepromptkit/<basename>/` for every `run-NNN/` directory that
    contains a `findings.json` with a non-empty `pronunciation_map` array.
    Order them by run number ascending (run-001, run-002, …).
 
@@ -2164,8 +2164,8 @@ Procedure:
    ```
 
 3. Preserve any `## Custom additions` block from an existing
-   `pronunciations.md` (between the `<!-- promptchecker:custom-additions:start -->`
-   and `<!-- promptchecker:custom-additions:end -->` markers). Read the file
+   `pronunciations.md` (between the `<!-- voicepromptkit:custom-additions:start -->`
+   and `<!-- voicepromptkit:custom-additions:end -->` markers). Read the file
    if it exists, extract everything between those markers, and re-emit it
    verbatim in the rewritten file. If the file does not exist or the markers
    are absent, emit an empty managed block.
@@ -2348,7 +2348,7 @@ Session state: <relative path to $RUN_DIR/session.json>
 Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. If any findings remain `pending` at this point (user did not address them and did not type `gerisini atla`), set `session.json.phase = "paused"` instead and remind the user they can resume with `/prompt-check-resume <run-NNN>`.
 
 ```bash
-[ "$PROMPTCHECKER_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_10_end" >> "$TIMING_LOG"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))')] phase_10_end" >> "$TIMING_LOG"
 ```
 
 ## Don'ts
@@ -2356,9 +2356,9 @@ Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. 
 - Don't extract frontmatter with an LLM pass; use Bash/Python — it's deterministic and free.
 - Don't read the original prompt more than once per phase; pass `body.txt` between steps.
 - Don't run lens analysis inline in the skill. Each lens family has a dedicated subagent (`static-lens-runner`, `drift-runner`, `tr-phonetic-runner`); the skill only dispatches and reads outputs.
-- Don't write outside `$RUN_DIR/` (except for `.promptchecker.json` in Phase 0 with explicit wizard consent, and the original prompt file in Phase 10's applied step under SHA guard + user decision).
+- Don't write outside `$RUN_DIR/` (except for `.voicepromptkit.json` in Phase 0 with explicit wizard consent, and the original prompt file in Phase 10's applied step under SHA guard + user decision).
 - Don't modify the original prompt file in any phase other than Phase 10's applied step — and even there, only when the SHA matches and the user explicitly decided `applied`.
-- Don't run the Phase 0 wizard if `.promptchecker.json` already exists. The user owns that file.
+- Don't run the Phase 0 wizard if `.voicepromptkit.json` already exists. The user owns that file.
 - Don't reintroduce batch / apply-mode. There is no `/prompt-check-apply` anymore — its semantics are folded into Phase 10. Resume uses `/prompt-check-resume`.
 - Don't define `inline-suggestions.md` format, `decisions.jsonl` shape, or the decision grammar inline in this skill — they live in `references/overlay-format.md` and `references/dialog-flow.md`.
 - Don't read `decisions.jsonl` or `session.json` in the same sub-step that writes to them — finish the write, then move on.
@@ -2370,14 +2370,14 @@ Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. 
 - Don't wait for schema or tr_phonetic to finish before starting drift. Drift only needs conflict + dominance + gap outputs; schema and tr are independent.
 - Don't write an `applied` line to `decisions.jsonl` for a finding that didn't actually modify the prompt file. The feasibility check must precede the log write — single event per finding outcome. A failed-feasibility finding produces exactly one `routed_to_overlay` line followed by exactly one `overlay` line; an applicable finding produces exactly one `applied` line. Never two events that imply a prompt-file mutation when none occurred.
 - Don't sort findings by line number alone — severity-first grouping is mandatory for both findings.json and report.md.
-- Don't enable PROMPTCHECKER_TIMING in production runs unless debugging. The overhead is small but the timing.log file grows on every run and clutters the run dir.
+- Don't enable VOICEPROMPTKIT_TIMING in production runs unless debugging. The overhead is small but the timing.log file grows on every run and clutters the run dir.
 - Don't re-compare the prompt file's SHA to `findings.json.prompt_sha256` after the first apply in a Phase 10 pass. The stale-audit guard is computed ONCE in Phase 10's Pre-flight and checks for *pre-audit* drift; intra-pass mutations from successful applies are intended and must not feed back into the comparison. The `new_sha256` field in `decisions.jsonl` is archival only.
 - Don't write to `decisions.jsonl` or `session.json` during Phase 9.4 parsing — those writes are gated on explicit user confirmation in Phase 9.6 (Stage 2). The parser emits an in-memory plan only; the commit block runs after `evet`/`yes`/`onayla`/`ok`/`tamam`/`confirm`.
 - Don't emit JSONL decision records missing the spec-required keys `ts`, `finding`, `lens`, `action`. The commit block self-checks every record and refuses to write incomplete lines (see `references/overlay-format.md` Section 2).
 - Don't force-route every TR finding to overlay. Only TR findings with `fix_kind: "advisory"` (categories `foreign_word` and `abbreviation`) bypass the prompt file. TR findings with `fix_kind: "replace"` (categories `number_readability` and `punctuation`) follow the normal apply flow in Phase 10.3.
 - Don't ask the user about TR pronunciation findings (foreign_word + abbreviation) in Phase 9. They auto-file to the overlay's Pronunciation map. Showing them in the summary table or decision prompt is a UX regression — the pronunciation hint is never going to be applied (advisory rule), so surfacing it as a decision wastes the user's attention. They appear ONLY in Phase 8's auto-filed count line and in `inline-suggestions.md`'s bottom Pronunciation map section.
 - Don't apply a TODO/Intentional sentinel as if it were a regular structural fix. The sentinel guard in Phase 10.3 (step 4) intercepts them: `TODO:` routes to overlay (`sentinel_todo`), `Intentional —` is dismissed (`sentinel_intentional`). Neither ever reaches the Edit tool.
-- Don't overwrite the `## Custom additions` block in `pronunciations.md`. The author owns content between the `<!-- promptchecker:custom-additions:start -->` and `<!-- promptchecker:custom-additions:end -->` markers; the rebuild MUST preserve that block verbatim.
+- Don't overwrite the `## Custom additions` block in `pronunciations.md`. The author owns content between the `<!-- voicepromptkit:custom-additions:start -->` and `<!-- voicepromptkit:custom-additions:end -->` markers; the rebuild MUST preserve that block verbatim.
 - Don't merge schema findings into findings.json when `schema.json.applicable == false`. Auto-skipped lenses contribute zero findings — the summary just notes the reason. Adding a phantom `Schema: 0` row without applicability context is misleading on flat prompts.
 - Don't apply compact mode when `max_char_limit == 0`. Zero explicitly disables the threshold; the body can be arbitrarily large without triggering cheaper policies.
 - Don't treat compact mode as a hard abort. The audit STILL runs — it just runs with cheaper-per-lens policies. Severity floors, pair budgets, and drift halving are the contract; never use compact mode as an excuse to skip a lens entirely.

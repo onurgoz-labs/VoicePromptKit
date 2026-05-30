@@ -74,7 +74,7 @@ Apply the **Conflict lens** section of `lens_rules_ref` against the rule list in
 Write the result to `output_paths.conflicts` using the schema from `lens_rules_ref`. Every finding MUST carry a `section_ref` field per the "Section reference (mandatory for every finding)" section below:
 
 ```json
-{ "conflicts": [{ "id": "C1", "rule_ids": ["R3","R8"], "severity": "low|medium|high", "reasoning": "<≤ 400 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "VALUE FRAMING AXES", "subsection_title": "MÜBADELE VALUE HIERARCHY" } }] }
+{ "conflicts": [{ "id": "C1", "rule_ids": ["R3","R8"], "severity": "low|medium|high", "reasoning": "<≤ 400 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "RESPONSE GUIDELINES", "subsection_title": "TONE & STYLE" } }] }
 ```
 
 When the finding's `line` has no section context, emit explicit `section_ref: null` (not absent).
@@ -101,7 +101,7 @@ Use `body.txt` to confirm position/length/recency claims when needed — e.g. to
 Write the result to `output_paths.dominances`. Every finding MUST carry a `section_ref` field per the "Section reference (mandatory for every finding)" section below:
 
 ```json
-{ "dominances": [{ "id": "D1", "dominant_rule_id": "R12", "dominated_rule_id": "R3", "mechanism": "position|length|specificity|recency|role-override", "severity": "low|medium|high", "reasoning": "<≤ 300 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural", "current_excerpt": "<5-line body excerpt centred on the dominated rule's line, optional for structural fixes>", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "VALUE FRAMING AXES", "subsection_title": "MÜBADELE VALUE HIERARCHY" } }] }
+{ "dominances": [{ "id": "D1", "dominant_rule_id": "R12", "dominated_rule_id": "R3", "mechanism": "position|length|specificity|recency|role-override", "severity": "low|medium|high", "reasoning": "<≤ 300 chars>", "suggested_fix": "<concrete one-sentence rewrite or structural action>", "fix_strategy": "substring | structural", "current_excerpt": "<5-line body excerpt centred on the dominated rule's line, optional for structural fixes>", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "RESPONSE GUIDELINES", "subsection_title": "TONE & STYLE" } }] }
 ```
 
 When the finding's `line` has no section context, emit explicit `section_ref: null` (not absent).
@@ -122,7 +122,7 @@ Apply the **Gap lens (strict scope)** section of `lens_rules_ref`.
 Write the result to `output_paths.gaps`. Every finding MUST carry a `section_ref` field per the "Section reference (mandatory for every finding)" section below:
 
 ```json
-{ "gaps": [{ "id": "G1", "kind": "undefined_edge_case|ambiguous_term", "description": "<one sentence>", "related_rule_ids": ["R5"], "severity": "low|medium|high", "suggested_fix": "<concrete one-sentence resolution or structural action>", "fix_strategy": "substring | structural", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "VALUE FRAMING AXES", "subsection_title": "MÜBADELE VALUE HIERARCHY" } }] }
+{ "gaps": [{ "id": "G1", "kind": "undefined_edge_case|ambiguous_term", "description": "<one sentence>", "related_rule_ids": ["R5"], "severity": "low|medium|high", "suggested_fix": "<concrete one-sentence resolution or structural action>", "fix_strategy": "substring | structural", "section_ref": { "section": "7", "subsection": "7.2", "section_title": "RESPONSE GUIDELINES", "subsection_title": "TONE & STYLE" } }] }
 ```
 
 When the finding's `line` has no section context, emit explicit `section_ref: null` (not absent).

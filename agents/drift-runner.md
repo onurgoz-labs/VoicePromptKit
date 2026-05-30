@@ -78,7 +78,7 @@ After producing the regression scenario list, jump directly to Step 2 (skip the 
   "name": "happy path booking",
   "turns": [
     {"kind": "user_input",        "content": "Merhaba"},
-    {"kind": "assistant_expect",  "expect_contains": ["Merve","Millenicom"], "rubric": "..."},
+    {"kind": "assistant_expect",  "expect_contains": ["Alex","City Dental"], "rubric": "..."},
     {"kind": "user_input",        "content": "[silence for 6 seconds]"},
     {"kind": "assistant_expect",  "rubric": "..."},
     {"kind": "end_call_expect",   "rubric": "polite close + end-call-tool"}
@@ -168,7 +168,7 @@ A flow scenario is a scripted multi-turn conversation. The `turns[]` array speci
    - **`user_input`** — append `{role: "user", content: <step.content>}` to the in-memory conversation. Then produce the next assistant turn AS the simulated persona would, given the conversation so far. Append that assistant turn to the conversation. The assistant's content is what the next `assistant_expect` step will be evaluated against.
      - **Silence convention:** when `content == "[silence for N seconds]"` (the expanded form of the authored `silence_input` sugar), the user has said nothing — the persona should apply whatever silence policy the prompt defines (e.g. confirm caller is still there, re-ask the open question, escalate to handoff after K silences). Treat it as a meaningful conversational event, not as user speech.
    - **`assistant_expect`** — do NOT call the model again. The LAST entry in the conversation is the assistant turn produced by the immediately preceding `user_input` step. Evaluate THAT turn against `expect_contains` / `expect_not_contains` / `rubric` from this step. Record a per-step verdict.
-   - **`end_call_expect`** — produce the next assistant turn as you would for a `user_input`, but the persona is expected to close the call here. Evaluate the closing turn against the step's assertions (rubric optional). The implicit "session is closed by the assistant" check applies — if the persona produces further dialogue beyond the closing line, that's a soft fail. No turns are processed after `end_call_expect`; this is the terminal step.
+   - **`end_call_expect`** — a terminal assertion on the assistant's closing turn; it never invents a second assistant turn out of nowhere. If the immediately preceding step was a `user_input` / `silence_input` (no `assistant_expect` in between), produce the assistant's response to it and evaluate THAT turn as the closing turn. If the preceding step was an `assistant_expect` (the assistant turn was already produced and asserted there), do NOT call the model again — evaluate whether that same assistant turn closed the call. Either way, check the step's assertions (rubric optional) plus the implicit "session is closed by the assistant" rubric — if the persona produces further dialogue beyond the closing line, that's a soft fail. No turns are processed after `end_call_expect`; this is the terminal step.
 3. Hold the full conversation transcript in memory. It goes into the run's `turns[]` field (see Output format below) for debugging the failure mode.
 4. Continue to the next scenario (back to the simulation loop or to Step 3 judging when all scenarios are done).
 
@@ -192,7 +192,7 @@ Produce a single JSON object holding every Run, in `scenario_id` order:
       "kind": "flow_regression",
       "turns": [
         {"role": "user",      "content": "Merhaba"},
-        {"role": "assistant", "content": "Merhaba, ben Merve..."},
+        {"role": "assistant", "content": "Merhaba, ben Alex..."},
         {"role": "user",      "content": "[silence for 6 seconds]"},
         {"role": "assistant", "content": "Hâlâ orada mısınız?"},
         {"role": "assistant", "content": "...", "end_call": true}

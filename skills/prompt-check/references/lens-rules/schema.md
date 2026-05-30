@@ -74,13 +74,13 @@ For `step_gap`:
       "kind": "section_gap | subsection_gap | out_of_order | subsection_orphan | heading_style_inconsistent | missing_parent | step_gap",
       "severity": "low | medium | high",
       "line": 280,
-      "current_excerpt": "## SECTION 7 — VALUE FRAMING AXES",
+      "current_excerpt": "## SECTION 7 — RESPONSE GUIDELINES",
       "related_lines": [220, 280],
       "rationale": "Section 5 (line 220) is directly followed by Section 7 (line 280). Section 6 is missing.",
       "suggested_fix": "Insert a 'Section 6 — <Placeholder Title>' heading between line 220 and line 280, OR renumber Section 7 → Section 6 and shift subsequent sections down by 1.",
       "fix_strategy": "structural",
       "rule_ids": [],
-      "section_ref": { "section": "7", "subsection": null, "section_title": "VALUE FRAMING AXES", "subsection_title": null }
+      "section_ref": { "section": "7", "subsection": null, "section_title": "RESPONSE GUIDELINES", "subsection_title": null }
     }
   ]
 }

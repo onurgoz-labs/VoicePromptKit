@@ -1,13 +1,13 @@
 ---
 name: prompt-test
-description: Runs the test anchors stored in a prompt file's frontmatter as regression scenarios and reports pass/fail per anchor. Use when the user runs /prompt-test, asks to "test the prompt against saved scenarios", "run anchor regression", or wants to verify that a prompt edit hasn't broken expected behaviour. Reuses the drift-runner subagent in regression_only mode — no scenario generation, no LLM analysis, just anchors → assistant turns → assertions.
+description: Runs the test anchors stored in a prompt's `<prompt>.anchors.yaml` sidecar (or its frontmatter, legacy) as regression scenarios and reports pass/fail per anchor. Use when the user runs /prompt-test, asks to "test the prompt against saved scenarios", "run anchor regression", or wants to verify that a prompt edit hasn't broken expected behaviour. Reuses the drift-runner subagent in regression_only mode — no scenario generation, no LLM analysis, just anchors → assistant turns → assertions.
 ---
 
 # prompt-test
 
-You take a prompt file `$1`, read its `frontmatter.anchors[]`, and run each anchor as a regression test scenario via the existing `drift-runner` subagent (in `regression_only: true` mode). The output is a pass/fail table — one row per anchor — and a `drift.json` artefact under `.promptcheck/<basename>/test-NNN/`.
+You take a prompt file `$1`, read its `<prompt>.anchors.yaml` sidecar (falling back to `frontmatter.anchors[]` only as a legacy path), and run each anchor as a regression test scenario via the existing `drift-runner` subagent (in `regression_only: true` mode). The output is a pass/fail table — one row per anchor — and a `drift.json` artefact under `.voicepromptkit/<basename>/test-NNN/`.
 
-Anchors are created by `/prompt-chat` (interactive simulator with `/save` + `/commit`) or by manual YAML editing of the prompt file's frontmatter. `/prompt-test` only **runs** them; it never creates or modifies them.
+Anchors are created by `/prompt-chat` (interactive simulator with `/save` + `/commit`) or by manually editing the `<prompt>.anchors.yaml` sidecar. `/prompt-test` only **runs** them; it never creates or modifies them.
 
 ## Inputs you have
 
@@ -17,13 +17,13 @@ Anchors are created by `/prompt-chat` (interactive simulator with `/save` + `/co
 
 ## Phase 0 — Bootstrap
 
-Read `$1`, parse its frontmatter (re-use the exact Python heredoc pattern from `skills/prompt-check/SKILL.md` Phase 2), write a run directory under `.promptcheck/<basename>/test-NNN/`.
+Read `$1`, parse its frontmatter (re-use the exact Python heredoc pattern from `skills/prompt-check/SKILL.md` Phase 2), write a run directory under `.voicepromptkit/<basename>/test-NNN/`.
 
 ```bash
 ABS_PROMPT=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 BASENAME=$(basename "$1" | sed 's/\.[^.]*$//')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-PROMPT_DIR="$REPO_ROOT/.promptcheck/$BASENAME"
+PROMPT_DIR="$REPO_ROOT/.voicepromptkit/$BASENAME"
 mkdir -p "$PROMPT_DIR"
 
 # Atomic test-NNN allocation (same pattern as /prompt-chat and /prompt-check).
@@ -342,7 +342,7 @@ Dispatch per answer:
 VoicePromptKit test tamamlandı — test-NNN
 
 - Anchor: <N> (<passed> geçti, <failed> kaldı)
-- Run dir: .promptcheck/<basename>/test-NNN/
+- Run dir: .voicepromptkit/<basename>/test-NNN/
 - Detay: <run-dir>/drift.json
 ```
 
@@ -363,7 +363,7 @@ If `failed > 0`, append:
 - **Read-only on the prompt file.** `/prompt-test` never writes to `$1` or its frontmatter. To modify anchors, use `/prompt-chat /save` + `/commit` or manual YAML edit.
 - **drift-runner is reused, not replaced.** All assertion semantics, rubric judging, and output shape (drift.json) are identical to what `/prompt-check` produces — the only difference is `regression_only: true` skips the non-regression probes.
 - **Run dir is durable.** Even if drift-runner fails mid-way, `body.txt` and `frontmatter.json` remain in `test-NNN/` for debugging.
-- **No latest symlink.** Unlike `/prompt-check`, `/prompt-test` does NOT create `.promptcheck/<basename>/latest` pointing at test-NNN — that symlink is reserved for the most recent successful audit, not test run. Test runs are listed by directory name (`test-001`, `test-002`, …).
+- **No latest symlink.** Unlike `/prompt-check`, `/prompt-test` does NOT create `.voicepromptkit/<basename>/latest` pointing at test-NNN — that symlink is reserved for the most recent successful audit, not test run. Test runs are listed by directory name (`test-001`, `test-002`, …).
 
 ## Failure modes
 

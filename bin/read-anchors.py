@@ -122,6 +122,9 @@ def _read_sidecar(sidecar_path, yaml):
     except yaml.YAMLError as e:
         warnings.append(f"sidecar parse error in {os.path.basename(sidecar_path)}: {e}")
         return [], warnings, False
+    except OSError as e:
+        warnings.append(f"sidecar read error in {os.path.basename(sidecar_path)}: {e}")
+        return [], warnings, False
 
     if sidecar.get('schema_version') != 1:
         warnings.append(
@@ -237,6 +240,14 @@ def _validate_and_expand_flow(anchor, anchor_label, warnings):
             warnings.append(f"{turn_label}: unknown turn kind {tk!r} — anchor skipped")
             return None
 
+        # Opening enforcement: a flow must start with a user/silence turn —
+        # there is nothing for the assistant to respond to otherwise.
+        if tidx == 0 and role != 'user':
+            warnings.append(
+                f"{turn_label}: flow must start with user_input / silence_input — anchor skipped"
+            )
+            return None
+
         # Alternation enforcement: user → assistant → user → … → end
         if prev_role == 'user' and role == 'user':
             warnings.append(
@@ -254,6 +265,14 @@ def _validate_and_expand_flow(anchor, anchor_label, warnings):
             )
             return None
         prev_role = role
+
+    # Closing enforcement: a flow must end on an assertion of the assistant's
+    # turn — ending on a user turn leaves the final assistant response untested.
+    if prev_role not in ('assistant', 'end'):
+        warnings.append(
+            f"{anchor_label}: flow must end with assistant_expect / end_call_expect — anchor skipped"
+        )
+        return None
 
     new = dict(anchor)
     new['turns'] = expanded_turns

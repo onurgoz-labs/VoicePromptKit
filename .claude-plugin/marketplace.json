@@ -13,7 +13,7 @@
         "url": "https://github.com/onurgoz-labs/VoicePromptKit.git"
       },
       "description": "A Turkish-first toolkit for Vapi voice-agent prompts. Audit across six lenses (/prompt-check), converse with the prompt's persona in a live call simulator (/prompt-chat) — with variable binding, silence handling, and call closure — and replay saved scenarios as regression tests (/prompt-test). Scenarios and variables live in <prompt>.anchors.yaml / <prompt>.vars.yaml sidecars; the prompt file is never modified. Cost-tuned via target_model / worker_model / judge_model split.",
-      "version": "0.6.0",
+      "version": "0.8.0",
       "license": "MIT",
       "author": {
         "name": "Onur GOZ",

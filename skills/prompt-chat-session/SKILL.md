@@ -15,7 +15,7 @@ You are entering an **in-progress** `/prompt-chat` session that was bootstrapped
 
 ## Phase 0 — Argument parse and state-file validation
 
-Parse `$1`. Expected shape: absolute path to a directory like `<repo>/.promptcheck/<basename>/chat-NNN/`.
+Parse `$1`. Expected shape: absolute path to a directory like `<repo>/.voicepromptkit/<basename>/chat-NNN/`.
 
 ```bash
 RUN_DIR="$1"
@@ -27,7 +27,7 @@ fi
 
 BASENAME=$(basename "$(dirname "$RUN_DIR")")     # the prompt basename (parent dir name)
 RUN_NAME=$(basename "$RUN_DIR")                  # chat-NNN
-REPO_ROOT=$(cd "$RUN_DIR/../../.." && pwd)       # strip .promptcheck/<basename>/chat-NNN to get repo root
+REPO_ROOT=$(cd "$RUN_DIR/../../.." && pwd)       # strip .voicepromptkit/<basename>/chat-NNN to get repo root
 
 # Sanity checks — bootstrap state files.
 for f in body.txt frontmatter.json chat.jsonl saved_anchors.json session.json; do
@@ -42,7 +42,10 @@ done
 RUNNER="$REPO_ROOT/bin/prompt-chat-runner.py"
 if [ ! -f "$RUNNER" ]; then
   # Fall back to the plugin's installed location if the dev repo isn't here.
+  # The marketplace install lands under the versioned cache path; the glob
+  # matches any installed version (first match wins — good enough for a fallback).
   for guess in \
+    "$HOME/.claude/plugins/cache/onurgoz-labs/VoicePromptKit"/*/bin/prompt-chat-runner.py \
     "$HOME/.claude/plugins/VoicePromptKit/bin/prompt-chat-runner.py" \
     "/usr/local/share/claude/plugins/VoicePromptKit/bin/prompt-chat-runner.py"; do
     if [ -f "$guess" ]; then RUNNER="$guess"; break; fi

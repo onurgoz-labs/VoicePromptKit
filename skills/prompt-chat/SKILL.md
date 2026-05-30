@@ -20,7 +20,7 @@ You give a prompt file `$1`. The skill bootstraps state, binds any prompt variab
 
 The flow:
 
-1. **Phase 0** — read `$1`, parse frontmatter, allocate `.promptcheck/<basename>/chat-NNN/`, write `frontmatter.json` / `body.txt` / empty `chat.jsonl` / empty `saved_anchors.json` / initial `session.json`; then **detect variables** (`{{...}}` + `[BÜYÜK_HARF]`), merge known values from the `<prompt>.vars.yaml` sidecar + `chat_variables` frontmatter seed, and emit the `UNBOUND_JSON` set.
+1. **Phase 0** — read `$1`, parse frontmatter, allocate `.voicepromptkit/<basename>/chat-NNN/`, write `frontmatter.json` / `body.txt` / empty `chat.jsonl` / empty `saved_anchors.json` / initial `session.json`; then **detect variables** (`{{...}}` + `[BÜYÜK_HARF]`), merge known values from the `<prompt>.vars.yaml` sidecar + `chat_variables` frontmatter seed, and emit the `UNBOUND_JSON` set.
 2. **Phase 0.5** — for each unbound variable, `AskUserQuestion` for a value (or leave random). Assemble the final `{name: value}` map.
 3. **Phase 1** — persist the bindings (`variables.json` in the run dir + `<prompt>.vars.yaml` sidecar), detect platform + window-spawn capability + Python interpreter, resolve the runner script (dev-repo `bin/` first, plugin cache fallback), spawn the orchestrator in a fresh Terminal / tmux / Windows Terminal session, then exit this skill. The chat session always opens in a new window (v0.5.11 simplification — no in-session / setup-only alternatives).
 
@@ -35,7 +35,7 @@ v0.5.7 — spawn the Python orchestrator DIRECTLY in the new Terminal/tmux windo
 ABS_PROMPT=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 BASENAME=$(basename "$1" | sed 's/\.[^.]*$//')
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-PROMPT_DIR="$REPO_ROOT/.promptcheck/$BASENAME"
+PROMPT_DIR="$REPO_ROOT/.voicepromptkit/$BASENAME"
 mkdir -p "$PROMPT_DIR"
 
 # mkdir without -p fails if the dir exists, so a concurrent run claiming the
@@ -338,12 +338,12 @@ fi
 # <glob>` loop relied on bash's alphabetic glob expansion, which made
 # "0.5.11" sort BEFORE "0.5.18" (and "0.5.19") — so the oldest cached
 # version always won. `ls ... | sort -V | tail -1` picks the highest
-# semver instead. Dev override env var PROMPTCHECKER_RUNNER short-
+# semver instead. Dev override env var VOICEPROMPTKIT_RUNNER short-
 # circuits both lookups so a contributor can point at an in-tree file
 # regardless of cwd.
 RUNNER=""
-if [ -n "$PROMPTCHECKER_RUNNER" ] && [ -f "$PROMPTCHECKER_RUNNER" ]; then
-  RUNNER="$PROMPTCHECKER_RUNNER"
+if [ -n "$VOICEPROMPTKIT_RUNNER" ] && [ -f "$VOICEPROMPTKIT_RUNNER" ]; then
+  RUNNER="$VOICEPROMPTKIT_RUNNER"
 elif [ -f "$REPO_ROOT/bin/prompt-chat-runner.py" ]; then
   RUNNER="$REPO_ROOT/bin/prompt-chat-runner.py"
 else
@@ -482,7 +482,11 @@ These commands are implemented in the Python runner (`bin/prompt-chat-runner.py`
 
 User typed `/save`. Capture either (a) the most recent user → assistant exchange as a single-turn anchor, OR (b) the entire chat conversation as a flow anchor. The user picks the kind via AskUserQuestion; the per-kind sub-flows differ but both end with staging in `saved_anchors.json` (never touching the sidecar — sidecar write only happens in Phase 7 / `/commit`).
 
-### Step 5.0 — Anchor kind selector (v0.5.1)
+> **Implementation note (v0.7.0).** The canonical Python runner (`bin/prompt-chat-runner.py`, `_handle_save`) currently stages **single-turn anchors only** — it captures the last user → assistant exchange and prompts for `expect_contains` / `expect_not_contains` / `rubric`. The flow-anchor sub-flow described below (Steps 5.0 / 5.F*) is the planned design; until it lands, author multi-turn flow anchors by hand in `<prompt>.anchors.yaml`.
+
+### Step 5.0 — Anchor kind selector (v0.5.1) — planned, not yet in the Python runner
+
+> Per the implementation note above, `bin/prompt-chat-runner.py` does not yet present this selector; it stages single-turn anchors directly. The selector + flow sub-flow below describe the planned design.
 
 Before collecting assertions, ask the user which kind of anchor they want to save:
 
@@ -830,36 +834,38 @@ Return to chat loop.
 
 ## Phase 6 — Chat loop runtime (v0.5.6 — Python orchestrator + bare claude subprocess)
 
-**v0.5.4'ün persistent-subagent yaklaşımı başarısız oldu** çünkü Claude Code Agent tool'unun SendMessage mekanizması transcript replay yapıyor — her turn body + chat.jsonl yeniden işleniyor, sonuç: ~32k token / ~50s per turn. v0.5.5'in tahmini iyileşmesi (~%50, skill-as-persona) hedefin altında kaldı çünkü skill'in kendi SKILL.md + tool definitions + CLAUDE.md overhead'i kaçınılmaz baseline ekliyor.
+**v0.5.4's persistent-subagent approach failed** because Claude Code's Agent-tool `SendMessage` mechanism triggers transcript replay — every turn re-processes the body + chat.jsonl, costing ~32k tokens / ~50s per turn. v0.5.5's projected improvement (~50%, skill-as-persona) fell short of the target because the skill's own SKILL.md + tool definitions + CLAUDE.md overhead adds an unavoidable baseline.
 
-**v0.5.6 mimari pivot:** chat loop'u tamamen Claude Code skill / subagent dünyasından çıkar. Bunun yerine `bin/prompt-chat-runner.py` (saf Python, stdlib + PyYAML) şu desene göre çalışır:
+**v0.5.6 architecture pivot:** move the chat loop entirely out of the Claude Code skill / subagent world. Instead, `bin/prompt-chat-runner.py` (pure Python, stdlib + PyYAML) runs this way:
 
-1. Python script BİR KEZ spawn edilir (`/prompt-chat-session` skill'inin `exec python3 ...` çağrısı ile).
-2. Script de BİR KEZ `claude --bare-mode-equivalent` subprocess'i spawn eder — `--input-format stream-json --output-format stream-json --include-partial-messages --system-prompt-file <body> --session-id <uuid> --disable-slash-commands --allowedTools "" --permission-mode bypassPermissions`. Subprocess'in cwd'si `/tmp` (neutral) — proje CLAUDE.md'si auto-discover edilmez.
-3. Her user turn için Python script stdin'e tek bir `{"type":"user","message":{...}}` JSON line yazar, stdout'tan event'leri parse eder, `text_delta` event'lerini gerçek zamanlı kullanıcıya yazdırır (TTFT düşer), `result` event'inde dönüş tamamlanır.
-4. Subprocess konuşma boyunca canlı kalır — her turn yeniden spawn etmek YOK, izin prompt'u YOK, body re-read YOK.
+1. The Python script is spawned ONCE (via the `/prompt-chat-session` skill's `exec python3 ...` call).
+2. The script in turn spawns ONE `claude` subprocess — `--input-format stream-json --output-format stream-json --include-partial-messages --system-prompt-file <body> --session-id <uuid> --disable-slash-commands --allowedTools "" --permission-mode bypassPermissions`. The subprocess cwd is `/tmp` (neutral) — the project CLAUDE.md is not auto-discovered.
+3. For each user turn the Python script writes a single `{"type":"user","message":{...}}` JSON line to stdin, parses events from stdout, streams `text_delta` events to the user in real time (lower TTFT), and completes on the `result` event.
+4. The subprocess stays alive for the whole conversation — NO re-spawn per turn, NO permission prompt, NO body re-read.
 
-**Per turn token / latency (gerçek ölçüm, edevletprompt benzeri 5-satır test body'si):**
+**Per-turn token / latency (measured on a short 5-line test body):**
 
 | Metric | v0.5.4 (broken) | v0.5.6 (this) |
 |---|---|---|
 | Turn cost (cache hit) | ~32k | **~3-5k** (input 9 + cache_read body) |
 | Turn latency | ~50s | **~3-5s** (Haiku, streaming output) |
 | Subprocess per turn | New Agent + SendMessage | Same long-lived process |
-| Permission prompts per turn | Var (Bash tool izinleri) | Yok (--permission-mode bypassPermissions) |
-| Body load count | Her turn (transcript replay) | Bir kez (subprocess startup) |
+| Permission prompts per turn | Varies (Bash tool permissions) | None (--permission-mode bypassPermissions) |
+| Body load count | Every turn (transcript replay) | Once (subprocess startup) |
 
-**Skill-level dispatch (Step 3'ten gelen) burada gerçekleşmez.** Skill yalnızca Phase 0 (bootstrap) ve Phase 1 (run mode selection) ile sınırlıdır. "Open new window" mode'u `claude '/prompt-chat-session <run-dir>'` ile yeni Terminal başlatır; o skill de hemen `exec python3 bin/prompt-chat-runner.py <run-dir>` ile Python'a teslim olur. Bu noktadan sonra chat akışı tamamen Python orchestrator'da:
+**Skill-level dispatch does NOT happen here.** The skill is limited to Phase 0 (bootstrap) and Phase 1 (run-mode selection). The "Open new window" mode starts a new Terminal via `claude '/prompt-chat-session <run-dir>'`; that skill immediately hands off to Python with `exec python3 bin/prompt-chat-runner.py <run-dir>`. From that point the chat flow lives entirely in the Python orchestrator:
 
 - **Welcome screen** — Python `_print_welcome()`.
-- **Slash command handling** — Python `_dispatch_slash()`. /save / /history / /reset / /commit / /quit hepsi Python tarafında, file-system mutations + AskUserQuestion benzeri `input()` prompts. Phase 5 / 7 / 8 prose'u bu file'da kalır ama **canonical implementation Python script'tir**; bu spec metni Python kodunun davranışını dokümante eder.
-- **Non-slash user turn** — Python `_SubprocessCtx.send()` claude subprocess'ine JSON line yazar, text_delta event'lerini streaming ile stdout'a yazdırır, result event'i geldiğinde reply'ı chat.jsonl'a atomic append eder, session.turns incrementer.
+- **Slash command handling** — Python `_dispatch_slash()`. /save / /history / /reset / /commit / /quit are all Python-side, doing file-system mutations + `input()` prompts (an AskUserQuestion-like flow). The Phase 5 / 7 / 8 prose stays in this file, but **the canonical implementation is the Python script** — this spec text documents the Python code's behaviour.
+- **Non-slash user turn** — Python `_SubprocessCtx.send()` writes a JSON line to the claude subprocess, streams `text_delta` events to stdout, and on the `result` event atomically appends the reply to chat.jsonl and increments session.turns.
+
+**Rendering (v0.8.0+).** The runner renders behind a thin boundary. When `rich` is importable AND stdout is a terminal AND `VOICEPROMPTKIT_NO_RICH` is unset, it uses the Rich renderer — Markdown bot replies in bordered panels, right-aligned user bubbles, a `Live` region fed by `_SubprocessCtx.send(on_delta=...)` for true token streaming, and responsive panels for the welcome / end-call / summary cards. Otherwise it falls back to the stdlib ANSI one-liner renderer (spinner + buffered reply). Either way `_clean_stream_view` strips the `[PERSONA_NAME: …]` and `<<END_CALL>>` markers mid-stream so they never flash on screen. `NO_COLOR` / `TERM=dumb` force plain output for both paths.
 
 ### What this changes for downstream phases
 
-- **session.json schema:** `chat_simulator_agent_id` field'ı kaldırıldı. Yerine `chat_session_uuid` — claude CLI subprocess'inin --session-id ile başlattığı conversation'ın id'si. Phase 0 bootstrap bu field'ı null olarak yazar; Python script ilk turn'de UUID üretir + persist eder; /reset onu yeni UUID ile değiştirir (eski subprocess kill edilir, fresh subprocess spawn olur).
+- **session.json schema:** the `chat_simulator_agent_id` field was removed. It is replaced by `chat_session_uuid` — the id of the conversation the claude CLI subprocess started via `--session-id`. Phase 0 bootstrap writes this field as null; the Python script generates a UUID on the first turn and persists it; /reset replaces it with a new UUID (the old subprocess is killed and a fresh one is spawned).
 - **`agents/chat-simulator.md` removed.** The per-turn subagent is gone (deprecated v0.5.6, deleted in v0.6.0); the long-lived bare-Claude subprocess in `bin/prompt-chat-runner.py` replaced it.
-- **`/prompt-test` ve `drift-runner` etkilenmedi.** Drift simulation yine target_model (Opus) ile çalışır — chat exploration ile regression simulation farklı modeller, farklı runtime'lar.
+- **`/prompt-test` and `drift-runner` are unaffected.** Drift simulation still runs with target_model (Opus) — chat exploration and regression simulation use different models and different runtimes.
 
 ### Failure modes for Phase 6 runtime
 
@@ -1044,7 +1050,7 @@ Read `session.json` for stats. Compute totals and print (in `report_language`):
 
 - Konuşma turu: <N>
 - Kaydedilen anchor: <M staged + K committed = total>
-- Run dir: .promptcheck/<basename>/<chat-NNN>/
+- Run dir: .voicepromptkit/<basename>/<chat-NNN>/
 
 Sonraki adım: <one of>
   - /prompt-test <prompt> ile committed anchor'ları çalıştır (M > 0 ise)
