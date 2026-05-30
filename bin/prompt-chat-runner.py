@@ -152,7 +152,7 @@ def _render_box(title: str, lines: list[str], width: int | None = None) -> int:
 # name so the bot doesn't have to ask the user.
 _TR_FIRST_NAMES = [
     "Ahmet", "Mehmet", "Mustafa", "Ali", "Hüseyin", "Hasan", "İbrahim",
-    "Ayşe", "Fatma", "Emine", "Hatice", "Zeynep", "Elif", "Merve",
+    "Ayşe", "Fatma", "Emine", "Hatice", "Zeynep", "Elif", "Büşra",
     "Onur", "Burak", "Emre", "Can", "Selin", "Deniz", "Ece",
 ]
 _TR_LAST_NAMES = [
@@ -163,7 +163,7 @@ _TR_LAST_NAMES = [
 
 
 NEUTRAL_CWD = "/tmp"  # subprocess cwd — no CLAUDE.md auto-discovery here
-CLAUDE_CLI = shutil.which("claude") or "/Users/onur/.local/bin/claude"
+CLAUDE_CLI = os.environ.get("VOICEPROMPTKIT_CLAUDE_CLI") or shutil.which("claude") or "claude"
 
 # v0.5.9 — text-based stand-in for production Vapi's `end-call-tool`. The bare
 # claude subprocess has no tools available (--allowedTools ""), so when the
@@ -514,7 +514,7 @@ def _write_wrapped_body(body_path: str, detected: "list | None" = None,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("run_dir", help="Absolute path to .promptcheck/<basename>/chat-NNN/")
+    parser.add_argument("run_dir", help="Absolute path to .voicepromptkit/<basename>/chat-NNN/")
     args = parser.parse_args()
 
     run_dir = os.path.abspath(args.run_dir)

@@ -78,7 +78,7 @@ After producing the regression scenario list, jump directly to Step 2 (skip the 
   "name": "happy path booking",
   "turns": [
     {"kind": "user_input",        "content": "Merhaba"},
-    {"kind": "assistant_expect",  "expect_contains": ["Merve","Millenicom"], "rubric": "..."},
+    {"kind": "assistant_expect",  "expect_contains": ["Alex","City Dental"], "rubric": "..."},
     {"kind": "user_input",        "content": "[silence for 6 seconds]"},
     {"kind": "assistant_expect",  "rubric": "..."},
     {"kind": "end_call_expect",   "rubric": "polite close + end-call-tool"}
@@ -192,7 +192,7 @@ Produce a single JSON object holding every Run, in `scenario_id` order:
       "kind": "flow_regression",
       "turns": [
         {"role": "user",      "content": "Merhaba"},
-        {"role": "assistant", "content": "Merhaba, ben Merve..."},
+        {"role": "assistant", "content": "Merhaba, ben Alex..."},
         {"role": "user",      "content": "[silence for 6 seconds]"},
         {"role": "assistant", "content": "Hâlâ orada mısınız?"},
         {"role": "assistant", "content": "...", "end_call": true}

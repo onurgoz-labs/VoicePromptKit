@@ -6,7 +6,7 @@
 
 You run it on any prompt file (system prompt, Claude Code subagent definition, Vapi voice script, chained workflow) and step through an interactive session: pick the lenses you want, review the findings in one summary table, then decide finding-by-finding which to apply, route to an overlay, dismiss, or discuss. Each run leaves behind a human-readable `report.md`, a structured `findings.json`, and a per-decision audit trail.
 
-The original prompt file is **never modified**. Every run lives in its own numbered directory so you can compare audits across edits.
+The original prompt file is **only modified when you explicitly apply a fix** (`düzelt`) — audits otherwise leave it untouched. Every run lives in its own numbered directory so you can compare audits across edits.
 
 ## Install
 
@@ -23,7 +23,7 @@ The plugin auto-loads in every Claude Code session after that. No API keys, no S
 /prompt-check path/to/your/prompt.md
 ```
 
-VoicePromptKit opens an interactive session. First it asks which lenses you want to apply (multi-select: conflict, dominance, gap, drift, TR phonetic — pre-checked based on your repo defaults). For `drift`, it asks `expand_count`. Then it dispatches the selected lenses as parallel subagents. After parallel lens dispatch completes, you see a summary table:
+VoicePromptKit opens an interactive session. First it asks which lenses you want to apply (multi-select: conflict, dominance, gap, drift, TR phonetic, schema — pre-checked based on your repo defaults). For `drift`, it asks `expand_count`. Then it dispatches the selected lenses as parallel subagents. After parallel lens dispatch completes, you see a summary table:
 
 | id | mercek | önem | bölüm / satır | açıklama | düzeltme |
 |---|---|---|---|---|---|
@@ -31,15 +31,25 @@ VoicePromptKit opens an interactive session. First it asks which lenses you want
 | G5 | boşluk | orta | Bölüm 0.1 / Satır 7 | R4 "step instructions require it" tanımsız | R4'ü "verbatim scripts muaftır" diye netleştir |
 | drift-S1 | davranışsal sapma | düşük | — / — | regression senaryosu geçti (0.93) | (geçti — düzeltme yok) |
 
-Set `report_language: "en"` in `.promptchecker.json` for English columns (`lens | sev | section / line | rationale | fix`).
+_The same table with `report_language: "en"`:_
+
+| id | lens | sev | section / line | rationale | fix |
+|---|---|---|---|---|---|
+| C2 | conflict | high | Section 5 / L326 | R78 and R80 disagree on sms_retry_count | Set R80 max=1 OR R78 max=2 |
+| G5 | gap | medium | Section 0.1 / L7 | R4 "step instructions require it" is undefined | Clarify R4: "verbatim scripts are exempt" |
+| drift-S1 | drift | low | — / — | regression scenario passed (0.93) | (passed — no fix) |
+
+Set `report_language: "en"` in `.voicepromptkit.json` for English columns (`lens | sev | section / line | rationale | fix`).
 
 The table is the primary output — both in `report.md` and Phase 9. Runners write rationale + fix directly in your chosen language (≤200 chars rationale, ≤150 chars fix — compact by design). No truncation; what you see is what the lens wrote.
 
-Then it asks: **"Hangilerini ne yapayım?"** You answer free-form:
+Then it asks: **"Hangilerini ne yapayım?"** (English: *"What should I do with each?"*) You answer free-form:
 
 ```
 C1, C3 düzelt; G2 yorum bırak; T1..T5 konuşalım; gerisini atla
 ```
+
+_(English: "apply C1 and C3; overlay G2; let's discuss T1 through T5; skip the rest.")_
 
 The grammar accepts Turkish and English keywords:
 
@@ -56,12 +66,12 @@ For findings you say "konuşalım" to, VoicePromptKit enters a per-finding dialo
 
 **TR phonetic — split by category.** For `foreign_word` and `abbreviation` findings, `düzelt` is auto-routed to the overlay (pronunciation hints are voice-design decisions the author owns — a silent prompt edit can poison a Vapi / ElevenLabs script). For `number_readability` and `punctuation` findings, `düzelt` follows the normal apply flow and modifies the prompt — these are textual corrections like missing commas or malformed Turkish numbers.
 
-Every decision lands in three places under `.promptcheck/<basename>/run-NNN/`:
+Every decision lands in three places under `.voicepromptkit/<basename>/run-NNN/`:
 - `session.json` — current snapshot (what's pending, what's applied, what's overlay, what's dismissed)
 - `decisions.jsonl` — append-only audit log (every action ever taken, with timestamps)
 - `inline-suggestions.md` — human-readable overlay of every finding routed to overlay
 
-The original prompt file is **only** modified when you explicitly say `düzelt` on a non-TR finding. Even then, a SHA256 stale-audit guard refuses to apply if the prompt was edited between audit and decision — re-run `/prompt-check <prompt>` to refresh.
+The original prompt file is **only** modified when you explicitly say `düzelt` on an apply-eligible finding — any non-TR finding, plus TR `number_readability` / `punctuation`. TR `foreign_word` / `abbreviation` always route to the overlay instead. Even then, a SHA256 stale-audit guard refuses to apply if the prompt was edited between audit and decision — re-run `/prompt-check <prompt>` to refresh.
 
 Mid-session interruption is fine. Run `/prompt-check-resume` later and it re-enters the summary view filtered to findings with status: pending.
 
@@ -80,7 +90,7 @@ Mid-session interruption is fine. Run `/prompt-check-resume` later and it re-ent
 
 The TR lens splits its four detection categories into two routing buckets, so voice-design decisions stay overlay-only while textual corrections follow the normal apply flow.
 
-- **`foreign_word` + `abbreviation`: advisory-only.** Pronunciation hints for `Gaggia → "gacca"` or `DHL → "de-ha-el"` carry `fix_kind: "advisory"` and always land in the overlay file (`inline-suggestions.md`); the prompt text is never auto-edited, even on `düzelt`. The author hand-merges these into a TTS pronunciation guide block or the voice provider's config. A silent prompt edit (`DHL` becoming `de-ha-el` in the visible script) would corrupt the meaning, so this routing is non-negotiable.
+- **`foreign_word` + `abbreviation`: advisory-only.** Pronunciation hints for `Peugeot → "pöjo"` or `DHL → "de-ha-el"` carry `fix_kind: "advisory"` and always land in the overlay file (`inline-suggestions.md`); the prompt text is never auto-edited, even on `düzelt`. The author hand-merges these into a TTS pronunciation guide block or the voice provider's config. A silent prompt edit (`DHL` becoming `de-ha-el` in the visible script) would corrupt the meaning, so this routing is non-negotiable.
 - **`number_readability` + `punctuation`: normal apply flow.** Missing commas, malformed Turkish numbers, monetary spelling (`100 TL → yüz lira`) — these ARE textual fixes. They carry `fix_kind: "replace"`. When the user picks `düzelt` in the Phase 9 dialogue, Phase 10 modifies the prompt file just like a `conflict` or `gap` finding. The user can still route them to overlay via `yorum bırak` per-finding when they want to review by hand.
 - **Migration note:** the TR routing rule from earlier versions was over-strict — it forced every TR finding to overlay regardless of category, even when the user explicitly said `düzelt` on a textual fix like a missing comma. v0.4.2 fixes this: only the voice-design categories (`foreign_word`, `abbreviation`) stay advisory.
 
@@ -97,7 +107,7 @@ When a prompt body exceeds `max_char_limit` (default `50000` chars; configurable
 - **Rule extraction (Phase 3):** rule `text` ≤ 100 chars, `source_excerpt` ≤ 120 chars. Trims the payload downstream lenses load.
 - **Schema and TR phonetic lenses:** unchanged. Both are heading-level / line-level and cheap regardless of size.
 
-To **disable compact mode entirely**, set `max_char_limit: 0` in your `.promptchecker.json` (or per-prompt frontmatter, or env var). The audit runs at full depth regardless of body size — useful for forensic audits where you want every finding.
+To **disable compact mode entirely**, set `max_char_limit: 0` in your `.voicepromptkit.json` (or per-prompt frontmatter, or env var). The audit runs at full depth regardless of body size — useful for forensic audits where you want every finding.
 
 To **lower the threshold** (e.g. 25000 chars so compact mode kicks in sooner), set `max_char_limit: 25000` at any layer.
 
@@ -117,7 +127,7 @@ For prompts that use numbered section headings (`## SECTION N` + `### N.M`), eve
 ### Section 7.2 — L284 [C1 conflict severity=high, R3↔R8] — Tone contradiction...
 ```
 
-Useful for long prompts (1758 lines like `boyutyayin/mainprompt.md`) where the user otherwise has to map line numbers to sections mentally. Findings outside any numbered section (preambles, flat prompts) show the bare line number with no section prefix.
+Useful for long prompts (1500+ lines) where the user otherwise has to map line numbers to sections mentally. Findings outside any numbered section (preambles, flat prompts) show the bare line number with no section prefix.
 
 The section index is built deterministically in Phase 3 of the audit (no LLM cost) and propagated to every lens runner via `inputs.section_index`. Schema lens, conflict, dominance, gap, and TR phonetic findings all attach `section_ref` automatically. Drift findings are behavioural and always carry `section_ref: null`.
 
@@ -140,7 +150,7 @@ They share one contract: a sidecar file `<prompt>.anchors.yaml` next to the prom
 /prompt-chat path/to/prompt.md
 ```
 
-Phase 0 sets up `.promptcheck/<basename>/chat-NNN/` and detects prompt variables; Phase 0.5 binds any unbound ones; Phase 1 spawns `bin/prompt-chat-runner.py` in a fresh terminal window (`osascript` on macOS, `tmux` / `gnome-terminal` / `xterm` / `konsole` on Linux, `wt.exe` / `cmd` on Windows) and the skill exits. From there the runner owns the welcome screen and the chat loop.
+Phase 0 sets up `.voicepromptkit/<basename>/chat-NNN/` and detects prompt variables; Phase 0.5 binds any unbound ones; Phase 1 spawns `bin/prompt-chat-runner.py` in a fresh terminal window (`osascript` on macOS, `tmux` / `gnome-terminal` / `xterm` / `konsole` on Linux, `wt.exe` / `cmd` on Windows) and the skill exits. From there the runner owns the welcome screen and the chat loop.
 
 Every user message goes to the long-lived bare-Claude subprocess, which produces one assistant turn faithful to the prompt's persona. The exchange is appended to `chat.jsonl` (append-only, atomic per turn). Slash commands while you chat:
 
@@ -163,18 +173,20 @@ Every user message goes to the long-lived bare-Claude subprocess, which produces
 
 Reads `<prompt>.anchors.yaml` (falls back to `frontmatter.anchors[]` with a deprecation warning if the sidecar is missing). Dispatches `drift-runner` with `regression_only: true`. The runner skips every probe template except regression, ignores `expand_count`, accepts null static-lens inputs. Each anchor becomes one scenario; flow anchors expand into multi-turn `flow_regression` scenarios with per-step assertions.
 
-Output goes to `.promptcheck/<basename>/test-NNN/drift.json`. The skill renders a markdown table:
+Output goes to `.voicepromptkit/<basename>/test-NNN/drift.json`. The skill renders a markdown table:
 
 ```
 VoicePromptKit test — test-001
 
 | id | tür  | input / name                | geçti | puan | sebepler |
 |----|------|-----------------------------|-------|------|----------|
-| S1 | tek  | Merhaba                     | ✅    | 1.00 | mekanik contains 'Merve' geçti; ... |
+| S1 | tek  | Merhaba                     | ✅    | 1.00 | mekanik contains 'Alex' geçti; ... |
 | S2 | akış | silence + recovery + booking| ❌    | 0.67 | step 4 (end_call_expect): assistant did not close politely |
 
 Toplam: 2 anchor, 1 geçti, 1 kaldı.
 ```
+
+_Column legend (TR → EN): `tür` → kind, `geçti` → passed, `puan` → score, `sebepler` → reasons, `Toplam` → Total. Set `report_language: "en"` for an English table._
 
 If any anchor fails, the skill offers a follow-up: see verdict details (full `step_verdicts[]` for flow scenarios), investigate the failing turn in `/prompt-chat`, audit with `/prompt-check`, or close. Commands are printed but not auto-dispatched — you run them yourself.
 
@@ -188,7 +200,7 @@ schema_version: 1
 anchors:
   # Single-turn anchor — direct user input, no prior conversation.
   - input: "Merhaba"
-    expect_contains: ["Merve", "Millenicom"]
+    expect_contains: ["Alex", "City Dental"]
     expect_not_contains: ["tekrar bağlanacağım"]
     rubric: "Bot identifies itself and states the call's purpose"
 
@@ -198,7 +210,7 @@ anchors:
   - input: "İptal etmek istiyorum"
     context:
       - role: assistant
-        content: "Merhaba, ben Merve. e-Devlet onayınız için arıyorum..."
+        content: "Merhaba, ben Alex. City Dental randevunuzu teyit etmek için arıyorum..."
       - role: user
         content: "Tamam dinliyorum"
     expect_not_contains: ["tekrar bağlanacağım"]
@@ -231,7 +243,7 @@ anchors:
 
 Turns must alternate `user_input` (or `silence_input`) → `assistant_expect` → … → `end_call_expect`. The reader drops any anchor that violates alternation, with a warning.
 
-**Backward compatibility.** If `<prompt>.anchors.yaml` is missing but the prompt's frontmatter has an `anchors:` block, the legacy v0.5.0 path is used with a `"frontmatter.anchors is deprecated — migrate to <prompt>.anchors.yaml"` warning. Move the block over by hand or wait for the upcoming `/prompt-anchors-migrate` helper.
+**Backward compatibility.** If `<prompt>.anchors.yaml` is missing but the prompt's frontmatter has an `anchors:` block, the legacy v0.5.0 path is used with a `"frontmatter.anchors is deprecated — migrate to <prompt>.anchors.yaml"` warning. Move the block over by hand — the sidecar is the supported location going forward.
 
 ### Variables (v0.6.0)
 
@@ -273,11 +285,11 @@ The bridge is `<prompt>.anchors.yaml`. Stay on text, iterate fast, only call Vap
 
 Six additive cost reductions kick in automatically — most users never need to think about them, but they're documented here for tuning:
 
-- **Prompt caching.** The simulated system prompt (the prompt body) is identical across every scenario in a batch and across every turn within a flow scenario. When the underlying provider supports it (Anthropic API: `cache_control: {type: "ephemeral"}`; OpenAI: automatic), drift-runner and chat-simulator attach the directive to the system block. First call populates the cache; later calls in the same batch / flow hit it. Saves ~50-60% on simulation tokens for long-body prompts.
+- **Prompt caching.** The simulated system prompt (the prompt body) is identical across every scenario in a batch and across every turn within a flow scenario. When the underlying provider supports it (Anthropic API: `cache_control: {type: "ephemeral"}`; OpenAI: automatic), drift-runner and the chat runner (`bin/prompt-chat-runner.py`) attach the directive to the system block. First call populates the cache; later calls in the same batch / flow hit it. Saves ~50-60% on simulation tokens for long-body prompts.
 - **Judge model swap.** Rubric evaluation in drift-runner's Step 3 ("did the output behave like X?") is a yes/no judgement task that doesn't need a frontier model. v0.5.2 adds a `judge_model` frontmatter field (and matching env var / project-config keys) defaulting to `claude-haiku-4-5-20251001`. `target_model` still drives simulation — that's where persona faithfulness matters. Override per prompt: `judge_model: claude-opus-4-7` in frontmatter if you want Opus rubric eval for tricky cases.
 - **Batched flow rubric eval.** A flow anchor with K assertion steps previously cost K judge LLM calls (one per `assistant_expect` / `end_call_expect`). v0.5.2 collapses these into ONE batched judge call: the judge sees the full transcript + a numbered list of (step, rubric) pairs and returns all per-step verdicts in one JSON document. Simulation stays sequential (multi-turn state matters); judging batches safely because rubric eval is independent per step.
-- **`worker_model` for infrastructure subagents (v0.5.3).** Static-lens-runner (conflict, dominance, gap, schema pair comparison) and tr-phonetic-runner (line-level pattern matching) are structured tasks that don't need a frontier model. v0.5.3 adds `worker_model` frontmatter field (default `claude-haiku-4-5-20251001`) which the skill passes to subagent dispatches via the Agent tool's `model` parameter. `target_model` semantics narrows to "model under test" — drift Step 2 simulation and chat-simulator persona dispatches still use it (Opus by default, since those simulate the production model). The three knobs:
-  - `target_model` (default `claude-opus-4-7`) — production model your prompt will run on. drift Step 2 + chat-simulator.
+- **`worker_model` for infrastructure subagents (v0.5.3).** Static-lens-runner (conflict, dominance, gap, schema pair comparison) and tr-phonetic-runner (line-level pattern matching) are structured tasks that don't need a frontier model. v0.5.3 adds `worker_model` frontmatter field (default `claude-haiku-4-5-20251001`) which the skill passes to subagent dispatches via the Agent tool's `model` parameter. `target_model` semantics narrows to "model under test" — drift Step 2 simulation uses it (Opus by default, since it simulates the production model). The three knobs:
+  - `target_model` (default `claude-opus-4-7`) — production model your prompt will run on. drift Step 2 simulation. (Chat simulation moved to its own `chat_model` knob in v0.5.6 — see below.)
   - `worker_model` (default `claude-haiku-4-5-20251001`) — VoicePromptKit's own LLM workers. static-lens + tr-phonetic + drift Step 1.
   - `judge_model` (default `claude-haiku-4-5-20251001`) — drift Step 3 rubric eval. Tunable separately for tricky judging.
 
@@ -306,14 +318,14 @@ Net effect on the canonical sample-vapi flow anchor (4 turns):
   | `target_model` | `claude-opus-4-7` | drift Step 2 simulation (regression — production fidelity) |
   | `worker_model` | `claude-haiku-4-5-20251001` | static-lens × 4, tr-phonetic, drift Step 1 + 3 |
   | `judge_model` | `claude-haiku-4-5-20251001` | drift Step 3 rubric eval (separately tunable, cross-provider OK) |
-  | `chat_model` | `claude-haiku-4-5-20251001` | chat-simulator persona dispatches (exploration — fast + cheap) |
+  | `chat_model` | `claude-haiku-4-5-20251001` | `prompt-chat-runner` persona dispatches (exploration — fast + cheap) |
 
 ## Output layout
 
 Every run gets its own directory. Older runs are preserved so you can diff audits across prompt edits.
 
 ```
-.promptcheck/
+.voicepromptkit/
 └── <prompt-basename>/
     ├── run-001/
     │   ├── frontmatter.json
@@ -338,9 +350,9 @@ Every run gets its own directory. Older runs are preserved so you can diff audit
 ### `report.md` — what humans read
 
 ```markdown
-# VoicePromptKit Report — mainprompt
+# VoicePromptKit Report — your-prompt
 
-- **Prompt:** `/Users/onur/repos/.../mainprompt.md`
+- **Prompt:** `/abs/path/your-prompt.md`
 - **Run:** `run-003`
 - **Generated:** 2026-05-17T19:42:00Z
 - **Target model:** claude-opus-4-7
@@ -368,7 +380,7 @@ Every run gets its own directory. Older runs are preserved so you can diff audit
 
 ```json
 {
-  "prompt_path": "/abs/path/mainprompt.md",
+  "prompt_path": "/abs/path/your-prompt.md",
   "prompt_sha256": "a3f1...c7",
   "run_id": "run-003",
   "generated_at": "2026-05-17T19:42:00Z",
@@ -425,13 +437,13 @@ After the summary, you make per-finding decisions in free-form text (see Usage a
 The plugin's behaviour is layered, highest priority first:
 
 1. **Per-prompt frontmatter** — overrides everything for one prompt.
-2. **Environment variables** (`PROMPTCHECKER_*`) — change defaults for every prompt in your shell / Claude Code session.
-3. **Project config** (`.promptchecker.json` at repo root) — repo-level defaults shared with your team.
+2. **Environment variables** (`VOICEPROMPTKIT_*`) — change defaults for every prompt in your shell / Claude Code session.
+3. **Project config** (`.voicepromptkit.json` at repo root) — repo-level defaults shared with your team.
 4. **Built-in defaults** — applied when none of the above is set.
 
 ### First-run wizard
 
-The first time you run `/prompt-check` in a repo, the skill walks you through a 7-question wizard and saves the answers to `<repo-root>/.promptchecker.json`. Subsequent runs read that file silently. Edit it by hand to change defaults, or delete it to rerun the wizard.
+The first time you run `/prompt-check` in a repo, the skill walks you through a 7-question wizard and saves the answers to `<repo-root>/.voicepromptkit.json`. Subsequent runs read that file silently. Edit it by hand to change defaults, or delete it to rerun the wizard.
 
 The wizard asks:
 
@@ -443,7 +455,7 @@ The wizard asks:
 6. **Max prompt character limit** — repo-level threshold for triggering compact mode. Default `50000`. `0` disables compact mode entirely. Useful when your prompts routinely exceed 50K chars and you want every audit to run at full depth regardless of size.
 7. **Report language** — controls the language of report.md, terminal summary, and Phase 9 dialog prompts. Options: `tr` (Türkçe, default) or `en` (English). Lens-generated content (rationale, suggested_fix, current_excerpt) stays in whatever language the runner produced; only skill-side templates translate.
 
-### Project config (`.promptchecker.json`)
+### Project config (`.voicepromptkit.json`)
 
 Example for a Turkish VAPI repo:
 
@@ -465,23 +477,25 @@ Commit this file so your team gets the same defaults. Unknown keys are ignored (
 
 | Variable | Effect | Falls back to |
 |---|---|---|
-| `PROMPTCHECKER_TARGET_MODEL` | Model name written into reports | project config → `claude-opus-4-7` |
-| `PROMPTCHECKER_OUTPUT` | Comma-separated subset of `markdown,findings_json,json` | project config → `markdown,findings_json` |
-| `PROMPTCHECKER_EXPAND_COUNT` | Drift scenarios beyond anchor + conflict budget; `0` disables drift entirely | project config → `3` |
-| `PROMPTCHECKER_TR_PHONETIC` | Truthy (`1/true/yes/on`) enables the Turkish phonetic lens | project config → `false` |
-| `PROMPTCHECKER_MAX_CHAR_LIMIT` | Positive integer triggers compact mode when body exceeds this many chars. `0` disables compact mode. | project config → `50000` |
-| `PROMPTCHECKER_REPORT_LANGUAGE` | `tr` or `en`. Sets skill-render language. | project config → `tr` |
-| `PROMPTCHECKER_TIMING` | Truthy (`true`) writes a millisecond-precision phase-boundary log to `$RUN_DIR/timing.log`. Diagnostic only — leave off in normal use. | off |
+| `VOICEPROMPTKIT_TARGET_MODEL` | Model name written into reports + drift Step 2 simulation | project config → `claude-opus-4-7` |
+| `VOICEPROMPTKIT_WORKER_MODEL` | Model for VoicePromptKit's own LLM workers (static-lens, tr-phonetic, drift Step 1) | project config → `claude-haiku-4-5-20251001` |
+| `VOICEPROMPTKIT_JUDGE_MODEL` | Model for drift Step 3 rubric eval | project config → `claude-haiku-4-5-20251001` |
+| `VOICEPROMPTKIT_OUTPUT` | Comma-separated subset of `markdown,findings_json,json` | project config → `markdown,findings_json` |
+| `VOICEPROMPTKIT_EXPAND_COUNT` | Drift scenarios beyond anchor + conflict budget; `0` disables drift entirely | project config → `3` |
+| `VOICEPROMPTKIT_TR_PHONETIC` | Truthy (`1/true/yes/on`) enables the Turkish phonetic lens | project config → `false` |
+| `VOICEPROMPTKIT_MAX_CHAR_LIMIT` | Positive integer triggers compact mode when body exceeds this many chars. `0` disables compact mode. | project config → `50000` |
+| `VOICEPROMPTKIT_REPORT_LANGUAGE` | `tr` or `en`. Sets skill-render language. | project config → `tr` |
+| `VOICEPROMPTKIT_TIMING` | Truthy (`true`) writes a millisecond-precision phase-boundary log to `$RUN_DIR/timing.log`. Diagnostic only — leave off in normal use. | off |
 
-**Timing logs (diagnostic):** when `PROMPTCHECKER_TIMING=true`, the skill writes `timing.log` to the run directory with one line per phase boundary (`phase_2_start`, `phase_2_end`, etc., in milliseconds since the Unix epoch). Use this when a run feels slow — `awk -F'[][]' '{print $2}' timing.log | sort -n` gives you the ordered timestamps; diffing adjacent timestamps surfaces the slowest phase. Drift simulation and subagent dispatch are common hotspots. Leave the env var off in everyday use — the log grows on every run.
+**Timing logs (diagnostic):** when `VOICEPROMPTKIT_TIMING=true`, the skill writes `timing.log` to the run directory with one line per phase boundary (`phase_2_start`, `phase_2_end`, etc., in milliseconds since the Unix epoch). Use this when a run feels slow — `awk -F'[][]' '{print $2}' timing.log | sort -n` gives you the ordered timestamps; diffing adjacent timestamps surfaces the slowest phase. Drift simulation and subagent dispatch are common hotspots. Leave the env var off in everyday use — the log grows on every run.
 
 Set them in Claude Code's `settings.json` so they apply session-wide without touching your shell rc:
 
 ```json
 {
   "env": {
-    "PROMPTCHECKER_TR_PHONETIC": "true",
-    "PROMPTCHECKER_EXPAND_COUNT": "5"
+    "VOICEPROMPTKIT_TR_PHONETIC": "true",
+    "VOICEPROMPTKIT_EXPAND_COUNT": "5"
   }
 }
 ```
@@ -517,11 +531,11 @@ The plugin runs one orchestrating skill that fans out to three subagents for the
 
 Phase 9 and Phase 10 are the interactive layer — they run automatically after Phase 8 in `/prompt-check` and re-enter from `/prompt-check-resume`.
 
-1. **Phase 0** — First-run wizard or load existing `.promptchecker.json`.
+1. **Phase 0** — First-run wizard or load existing `.voicepromptkit.json`.
 2. **Phase 1** — Allocate a fresh `run-NNN` directory (atomic; `latest` symlink is updated only on success).
 3. **Phase 2** — Parse frontmatter deterministically and split body. Stores `body_line_offset`, `prompt_sha256`, `body_char_count`, and `compact_mode` (true when body_char_count > max_char_limit AND max_char_limit > 0). Phase 4-6 dispatches propagate these to each runner.
 4. **Phase 3** — Extract atomic, line-anchored rules from `body.txt`.
-   - **Phase 3.5 — Per-run lens-selection wizard.** VoicePromptKit emits an `AskUserQuestion` widget asking which of the six lenses to apply. Repo defaults from `.promptchecker.json` seed which options are pre-checked, but the question itself is MANDATORY — prose substitutes are a contract violation. If the user is in a headless context where AskUserQuestion is unavailable, the audit aborts with a clear error rather than proceeding silently.
+   - **Phase 3.5 — Per-run lens-selection wizard.** VoicePromptKit emits an `AskUserQuestion` widget asking which of the six lenses to apply. Repo defaults from `.voicepromptkit.json` seed which options are pre-checked, but the question itself is MANDATORY — prose substitutes are a contract violation. If the user is in a headless context where AskUserQuestion is unavailable, the audit aborts with a clear error rather than proceeding silently.
 5. **Phase 4 — Parallel lens dispatch (5 concurrent Agent calls).** Emits five Agent calls in one turn:
    - `static-lens-runner` × 4 (conflict / dominance / gap / schema, each with singleton `selected_lenses`)
    - `tr-phonetic-runner` × 1 (conditional on user_intent.tr_phonetic_enabled)
@@ -534,35 +548,53 @@ Phase 9 and Phase 10 are the interactive layer — they run automatically after 
 
 ## Architecture
 
-The plugin is pure Claude Code skill orchestration. No Node, no TypeScript, no `npm install`, no `node_modules`, no `package.json` — one skill file, five references, two commands, and three subagent definitions (one always dispatched, two conditional).
+The plugin is pure Claude Code skill orchestration. No Node, no TypeScript, no `npm install`, no `node_modules`, no `package.json` — four skill files, a handful of references, two commands, three subagent definitions (one always dispatched, two conditional), and two Python helper scripts.
 
 ```
 .claude-plugin/
 ├── plugin.json
 └── marketplace.json
 skills/
-└── prompt-check/
-    ├── SKILL.md
-    └── references/
-        ├── lens-rules.md       (conflict/dominance/gap/drift criteria)
-        ├── tr-phonetic.md      (Turkish TTS rules)
-        ├── probes.md           (drift probe templates)
-        ├── dialog-flow.md      (NEW — Phase 9 templates + decision grammar)
-        └── overlay-format.md   (NEW — inline-suggestions.md + decisions.jsonl spec)
+├── prompt-check/
+│   ├── SKILL.md
+│   └── references/
+│       ├── lens-rules.md        (entry point for the static-lens criteria)
+│       ├── lens-rules/          (per-lens criteria: _shared, conflict, dominance, gap, schema)
+│       ├── tr-phonetic.md       (Turkish TTS rules)
+│       ├── probes.md            (drift probe templates)
+│       ├── dialog-flow.md       (Phase 9 templates + decision grammar)
+│       └── overlay-format.md    (inline-suggestions.md + decisions.jsonl spec)
+├── prompt-chat/SKILL.md         (live call simulator — bootstrap)
+├── prompt-chat-session/SKILL.md (chat session entry — execs the Python runner)
+└── prompt-test/SKILL.md         (anchor regression runner)
 commands/
 ├── prompt-check.md
-└── prompt-check-resume.md      (NEW — `/prompt-check-apply` retired)
+└── prompt-check-resume.md
 agents/
-├── drift-runner.md             (conditional — adversarial scenarios + judging)
-├── static-lens-runner.md       (always dispatched — conflict + dominance + gap + schema)
-└── tr-phonetic-runner.md       (conditional — advisory-only TR lens)
+├── drift-runner.md              (conditional — adversarial scenarios + judging)
+├── static-lens-runner.md        (always dispatched — conflict + dominance + gap + schema)
+└── tr-phonetic-runner.md        (conditional — advisory-only TR lens)
+bin/
+├── prompt-chat-runner.py        (long-lived chat REPL orchestrator)
+└── read-anchors.py              (anchor sidecar reader / validator)
 examples/
 ├── sample-system.md
 ├── sample-agent.md
-└── sample-vapi.md              (dogfeeds tr_phonetic: true)
+└── sample-vapi.md               (sets tr_phonetic: true)
 ```
 
-All cross-phase state is exchanged via JSON files under `.promptcheck/<basename>/run-NNN/`. The orchestrating skill reads its own writes; each subagent reads paths it is given and writes only the JSON artefacts assigned to it.
+All cross-phase state is exchanged via JSON files under `.voicepromptkit/<basename>/run-NNN/`. The orchestrating skill reads its own writes; each subagent reads paths it is given and writes only the JSON artefacts assigned to it.
+
+## Upgrading from earlier versions
+
+v0.7.0 finishes the rename from the old `PromptChecker` identifiers to `VoicePromptKit`. If you used an earlier version, update these by hand — there is no automatic migration:
+
+- Project config: `.promptchecker.json` → `.voicepromptkit.json`
+- Environment variables: `PROMPTCHECKER_*` → `VOICEPROMPTKIT_*`
+- Output / cache directory: `.promptcheck/` → `.voicepromptkit/` (old run history is left in place but no longer surfaced)
+- Pronunciation-guide markers in your own prompt files: `<!-- promptchecker:... -->` → `<!-- voicepromptkit:... -->`
+
+The command names (`/prompt-check`, `/prompt-chat`, `/prompt-test`) are unchanged.
 
 ## License
 

@@ -21,7 +21,7 @@ Cap the total scenario count at `frontmatter.expand_count + anchors.length + min
 
 ## 1. Regression probe (`kind: "regression"`)
 
-**Use when:** the user supplied anchors in frontmatter.
+**Use when:** the user supplied anchors (in the `<prompt>.anchors.yaml` sidecar, or in frontmatter as a legacy fallback).
 
 Each anchor becomes exactly one scenario, verbatim. No re-interpretation.
 

@@ -12,8 +12,8 @@ Procedure:
 
 1. **Resolve the run directory from `$1`.**
    - If `$1` is an absolute or relative path to a run directory, use it as-is.
-   - If `$1` is a `run-NNN` name, resolve it under `.promptcheck/<basename>/<run-NNN>` (the `<basename>` matches the parent directory containing that run).
-   - If `$1` is empty, auto-pick the most recent unfinished session: walk `.promptcheck/*/latest/session.json`, pick the entry whose file mtime is newest **and** still has at least one `findings_state[*].status == "pending"`. If none qualify, surface verbatim and exit:
+   - If `$1` is a `run-NNN` name, resolve it under `.voicepromptkit/<basename>/<run-NNN>` (the `<basename>` matches the parent directory containing that run).
+   - If `$1` is empty, auto-pick the most recent unfinished session: walk `.voicepromptkit/*/latest/session.json`, pick the entry whose file mtime is newest **and** still has at least one `findings_state[*].status == "pending"`. If none qualify, surface verbatim and exit:
 
      ```
      No unfinished sessions. Run /prompt-check <path> to start a new audit.

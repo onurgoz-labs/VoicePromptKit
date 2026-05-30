@@ -42,8 +42,8 @@ Only one of `suggested_fix` / `pronunciation_entry` is populated per finding. Fo
 | strategy | Meaning | `phonetic` | `alt_translation` |
 |---|---|---|---|
 | `pronounce` | TTS should read the term with the given phonetic spelling (`pound → paund`) | **required** | optional |
-| `rephrase` | The author should avoid the term and substitute the alternative when speaking (`Palaeologlar → son Bizans hanedanı`) | optional / null | optional |
-| `follow_with_translation` | Speak the term but always follow with a Turkish gloss (`La Turquie Kemaliste → "yani Kemal'in Türkiye'si dergisi"`) | optional | **required** (the gloss) |
+| `rephrase` | The author should avoid the term and substitute the alternative when speaking (`Worcestershire → İngiliz sosu`) | optional / null | optional |
+| `follow_with_translation` | Speak the term but always follow with a Turkish gloss (`The Economist → "yani İngiliz ekonomi dergisi"`) | optional | **required** (the gloss) |
 
 If `phonetic` is null, `strategy` must be `rephrase` or `follow_with_translation`. Default strategy when omitted is `pronounce`.
 
@@ -54,7 +54,7 @@ Severity guide:
 
 ## Why the split — voice-design vs textual correction
 
-`foreign_word` and `abbreviation` findings emit `pronunciation_entry` payloads (DHL → "de-ha-el", Gaggia → "gacca"). These describe HOW the TTS should speak the term, not WHAT text should appear in the prompt. Auto-editing the prompt to insert phonetic spellings would corrupt the visible script (`DHL` becoming `de-ha-el` breaks the meaning). These stay advisory — the author hand-merges them into a pronunciation guide block or the TTS provider's config.
+`foreign_word` and `abbreviation` findings emit `pronunciation_entry` payloads (DHL → "de-ha-el", Peugeot → "pöjo"). These describe HOW the TTS should speak the term, not WHAT text should appear in the prompt. Auto-editing the prompt to insert phonetic spellings would corrupt the visible script (`DHL` becoming `de-ha-el` breaks the meaning). These stay advisory — the author hand-merges them into a pronunciation guide block or the TTS provider's config.
 
 `number_readability` and `punctuation` findings emit `suggested_fix` payloads with concrete textual corrections (100 TL → yüz lira; missing comma added). These ARE textual edits — the visible script should change. They emit `fix_kind: "replace"` and follow the normal apply flow when the user picks `düzelt`. The author can still route them to overlay via `yorum bırak`.
 
@@ -76,9 +76,9 @@ Run this **before** body-scan detection in Phase 6. Look for any of these patter
 
 1. **Managed marker block:**
    ```
-   <!-- promptchecker:pronunciation-guide:start -->
+   <!-- voicepromptkit:pronunciation-guide:start -->
    ... bullet entries ...
-   <!-- promptchecker:pronunciation-guide:end -->
+   <!-- voicepromptkit:pronunciation-guide:end -->
    ```
 2. **Legacy heading prose blocks** (ALL-CAPS or markdown heading variants):
    - `TTS PRONUNCIATION NOTES`
@@ -165,9 +165,9 @@ Surface as an advisory finding with `pronunciation_entry` populated. Default `st
 | `Google` | `gugıl` | pronounce | null |
 | `Hebrew` | `hebru` | follow_with_translation | `İbrani` |
 
-**Latin/Greek/French proper nouns near historical/cultural context** (e.g. `Nea Roma`, `Palaeologlar`, `Iustinianus`, `La Turquie Kemaliste`):
+**Foreign (Latin / Greek / French) proper nouns near historical or cultural context** (e.g. `Versailles`, `Reykjavík`, `Tchaikovsky`, `The Economist`):
 
-These are hard to phonetic-guess confidently. Leave `pronunciation_entry` either empty or populated with `strategy: "rephrase"` and no `phonetic` — the author knows the intended reading. Heuristic for detection: repeated proper noun across multiple lines, non-Turkish morphology (consonant clusters like `Pala-`, `Ius-`, `Nea`, or prefixes like `La `), in historical / cultural text.
+These are hard to phonetic-guess confidently. Leave `pronunciation_entry` either empty or populated with `strategy: "rephrase"` and no `phonetic` — the author knows the intended reading. Heuristic for detection: repeated proper noun across multiple lines, non-Turkish morphology (accented vowels like `é` / `ï`, foreign digraphs like `ch` / `eau`, or articles like `La ` / `The `), in historical / cultural text.
 
 ## 4. Punctuation & pacing (`kind: "punctuation"`)
 

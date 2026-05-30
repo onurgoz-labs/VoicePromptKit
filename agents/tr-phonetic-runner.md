@@ -46,9 +46,9 @@ Before scanning the body for new findings, parse any existing pronunciation guid
 
 1. **Managed marker block:**
    ```
-   <!-- promptchecker:pronunciation-guide:start -->
+   <!-- voicepromptkit:pronunciation-guide:start -->
    ... bullet entries ...
-   <!-- promptchecker:pronunciation-guide:end -->
+   <!-- voicepromptkit:pronunciation-guide:end -->
    ```
 2. **Legacy heading block:** a line containing `TTS PRONUNCIATION NOTES`, `Pronunciation guide`, `Okunuş rehberi`, `Telaffuz`, or `Telaffuz notları`, followed by a bullet list (`- term → ...`) within the next ~20 lines.
 
@@ -62,10 +62,10 @@ Build the in-memory `pronunciation_map` keyed by `term`, and accumulate a parall
 
 ```json
 {
-  "term": "Konstantinopolis",
+  "term": "Versailles",
   "strategy": "pronounce | rephrase | follow_with_translation",
   "phonetic": null,
-  "alt_translation": "Bizans başkenti",
+  "alt_translation": "Versay Sarayı",
   "note": "Author marked this as high risk; rephrase when possible.",
   "source": "seed"
 }
@@ -153,8 +153,8 @@ Write a single JSON file at `output_path` with shape:
       "section_ref": {
         "section": "1",
         "subsection": "1.3",
-        "section_title": "IDENTITY: WHO IS DEFNE",
-        "subsection_title": "About Boyut Yayın Grubu"
+        "section_title": "IDENTITY: WHO IS ALEX",
+        "subsection_title": "About the Company"
       },
       "current_excerpt": "...",
       "suggested_fix": "...",
@@ -170,10 +170,10 @@ Write a single JSON file at `output_path` with shape:
   ],
   "seed_entries": [
     {
-      "term": "Konstantinopolis",
+      "term": "Versailles",
       "strategy": "pronounce",
       "phonetic": null,
-      "alt_translation": "Bizans başkenti",
+      "alt_translation": "Versay Sarayı",
       "note": "Author marked this as high risk; rephrase when possible.",
       "source": "seed"
     }
@@ -217,7 +217,7 @@ def section_ref_for_line(line, ranges):
     return None
 ```
 
-Auto-filed findings (foreign_word + abbreviation) still carry `section_ref` — the pronunciations master file may use it to provide section context per term (e.g. "Gaggia Milano (Section 1.3 — About Boyut Yayın Grubu)").
+Auto-filed findings (foreign_word + abbreviation) still carry `section_ref` — the pronunciations master file may use it to provide section context per term (e.g. "Peugeot (Section 1.3 — About the Company)").
 
 If `section_index.applicable == false` (no numbered headings in the body) or the line falls outside every range, emit explicit `section_ref: null` (not absent).
 
@@ -241,8 +241,8 @@ Examples in TR mode:
 ✅ suggested_fix (punctuation, 78 chars):
    "Sebebiyle'den sonra virgül ekle: 'Kurban Bayramı tatili sebebiyle, yirmi altı...'"
 
-✅ pronunciation_entry.note for Gaggia (148 chars TR):
-   "İtalyan marka. TR TTS 'Gaggia'yı harf-harf 'gag-gia' okuyabilir; doğru telaffuz 'gacca' (gg+i → /dʒː/). 'Milano' doğal okunur."
+✅ pronunciation_entry.note for Peugeot (80 chars TR):
+   "Fransızca marka. TR TTS 'Peugeot'yu harf-harf okuyabilir; doğru telaffuz 'pöjo'."
 
 EN equivalents stay under the same caps.
 

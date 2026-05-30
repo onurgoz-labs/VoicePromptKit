@@ -82,8 +82,8 @@ Every static-lens output file (`conflicts.json`, `dominances.json`, `gaps.json`,
 
 Same priority chain as other repo defaults (most specific wins):
 1. Per-prompt frontmatter (`max_char_limit: 100000` in the YAML header)
-2. Env var (`PROMPTCHECKER_MAX_CHAR_LIMIT=0` in Claude Code settings)
-3. Project config (`.promptchecker.json` `max_char_limit`)
+2. Env var (`VOICEPROMPTKIT_MAX_CHAR_LIMIT=0` in Claude Code settings)
+3. Project config (`.voicepromptkit.json` `max_char_limit`)
 4. Built-in default: `50000`
 
 Set `max_char_limit: 0` at any layer to disable compact mode entirely — the audit runs at full depth regardless of body size.
@@ -102,8 +102,8 @@ Every finding emitted by every lens (conflict, dominance, gap, schema, drift, tr
 "section_ref": {
   "section": "7",
   "subsection": "7.2",
-  "section_title": "VALUE FRAMING AXES",
-  "subsection_title": "MÜBADELE VALUE HIERARCHY"
+  "section_title": "RESPONSE GUIDELINES",
+  "subsection_title": "TONE & STYLE"
 }
 ```
 

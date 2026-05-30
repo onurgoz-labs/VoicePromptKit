@@ -122,6 +122,9 @@ def _read_sidecar(sidecar_path, yaml):
     except yaml.YAMLError as e:
         warnings.append(f"sidecar parse error in {os.path.basename(sidecar_path)}: {e}")
         return [], warnings, False
+    except OSError as e:
+        warnings.append(f"sidecar read error in {os.path.basename(sidecar_path)}: {e}")
+        return [], warnings, False
 
     if sidecar.get('schema_version') != 1:
         warnings.append(
