@@ -156,7 +156,7 @@ Every user message goes to the long-lived bare-Claude subprocess, which produces
 
 | Command | Action |
 |---|---|
-| `/save` | Capture either the last user→assistant turn OR the whole conversation as a flow anchor. An AskUserQuestion picks the kind (single vs flow); the per-kind sub-flow then collects `expect_contains` / `expect_not_contains` / `rubric` per assertion turn. Auto-detects `[silence for N seconds]` user content and suggests the `silence_input` sugar. Staged in `saved_anchors.json` — never on disk yet. |
+| `/save` | Capture the last user→assistant turn as a single-turn anchor: prompts for `expect_contains` / `expect_not_contains` / `rubric`, then stages it in `saved_anchors.json` (nothing written to the sidecar until `/commit`). _Flow-anchor capture — saving a whole multi-turn conversation — is planned; today `/save` stages single-turn anchors only. Author multi-turn flow anchors by hand in `<prompt>.anchors.yaml`._ |
 | `/history` | Pretty-print the conversation so far. |
 | `/reset` | Move `chat.jsonl` aside and start fresh. `saved_anchors.json` is untouched. |
 | `/vars` | **(v0.6.0)** List detected variables with their current bound value (or `(random)` when unbound). |

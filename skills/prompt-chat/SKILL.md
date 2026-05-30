@@ -482,6 +482,8 @@ These commands are implemented in the Python runner (`bin/prompt-chat-runner.py`
 
 User typed `/save`. Capture either (a) the most recent user → assistant exchange as a single-turn anchor, OR (b) the entire chat conversation as a flow anchor. The user picks the kind via AskUserQuestion; the per-kind sub-flows differ but both end with staging in `saved_anchors.json` (never touching the sidecar — sidecar write only happens in Phase 7 / `/commit`).
 
+> **Implementation note (v0.7.0).** The canonical Python runner (`bin/prompt-chat-runner.py`, `_handle_save`) currently stages **single-turn anchors only** — it captures the last user → assistant exchange and prompts for `expect_contains` / `expect_not_contains` / `rubric`. The flow-anchor sub-flow described below (Steps 5.0 / 5.F*) is the planned design; until it lands, author multi-turn flow anchors by hand in `<prompt>.anchors.yaml`.
+
 ### Step 5.0 — Anchor kind selector (v0.5.1)
 
 Before collecting assertions, ask the user which kind of anchor they want to save:
