@@ -749,24 +749,44 @@ class _SubprocessCtx:
             cwd=NEUTRAL_CWD,
         )
 
-        self._reader_thread = threading.Thread(target=self._read_stdout, daemon=True)
+        # v0.9.1: bind a FRESH queue + stderr buffer per spawn and hand each one
+        # to its reader thread. On a respawn (/reset, or a post-call restart),
+        # the OLD reader thread keeps writing its EOF sentinel to the OLD queue
+        # object — which send() no longer reads — instead of leaking a stale
+        # `None` into the new queue. That stale sentinel was the intermittent
+        # "claude subprocess EOF before result" seen right after a respawn.
+        q: Queue = Queue()
+        buf: list[str] = []
+        self.stdout_queue = q
+        self.stderr_buf = buf
+        self._reader_thread = threading.Thread(
+            target=self._read_stdout, args=(q,), daemon=True)
         self._reader_thread.start()
-        self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
+        self._stderr_thread = threading.Thread(
+            target=self._read_stderr, args=(buf,), daemon=True)
         self._stderr_thread.start()
 
-    def _read_stdout(self) -> None:
-        assert self.proc is not None and self.proc.stdout is not None
-        for line in self.proc.stdout:
+    def _read_stdout(self, q: "Queue") -> None:
+        # Bind this spawn's proc + queue locally: a later respawn reassigns
+        # self.proc / self.stdout_queue, but this thread must stay attached to
+        # ITS subprocess and ITS queue.
+        proc = self.proc
+        if proc is None or proc.stdout is None:
+            q.put(None)
+            return
+        for line in proc.stdout:
             line = line.strip()
             if not line:
                 continue
-            self.stdout_queue.put(line)
-        self.stdout_queue.put(None)  # sentinel: eof
+            q.put(line)
+        q.put(None)  # sentinel: eof
 
-    def _read_stderr(self) -> None:
-        assert self.proc is not None and self.proc.stderr is not None
-        for line in self.proc.stderr:
-            self.stderr_buf.append(line.rstrip())
+    def _read_stderr(self, buf: list) -> None:
+        proc = self.proc
+        if proc is None or proc.stderr is None:
+            return
+        for line in proc.stderr:
+            buf.append(line.rstrip())
 
     def send(self, user_input: str, timeout: int = 180,
              stream_to: "io.TextIOBase | None" = None, on_delta=None) -> str:
@@ -1817,7 +1837,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                     f"/set name=value to change") if detected else None
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.9.0"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.9.1"))
     print()
     if report_language == "tr":
         lines = [
