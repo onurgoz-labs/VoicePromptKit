@@ -930,12 +930,26 @@ def _repl(ctx: "_SubprocessCtx", run_dir: str, body_path: str, session_path: str
             continue
 
         if in_post_call:
-            # v0.5.19: non-slash text after the previous call ended ==
-            # "start a new call, and this is what I want to say first".
-            # _start_fresh_call archives history, mints a new caller,
-            # renders the persona's opening, then sends `user_input` as
-            # the first user turn — preserving whatever the user typed
-            # instead of discarding it.
+            # v0.9.3: the call has ended. A stray non-slash message no longer
+            # silently starts a brand-new call (that surprised users and quietly
+            # archived their history). Confirm first; on yes, the typed text
+            # becomes the first turn of the fresh call; on no, stay post-call.
+            prompt = ("\nArama bitti. Yeni arama başlatayım mı? (geçmiş arşivlenir) [e/H]: "
+                      if report_language == "tr"
+                      else "\nCall ended. Start a new call? (history is archived) [y/N]: ")
+            try:
+                confirm = input(prompt).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                _exit_cleanly(run_dir, session_path, chat_jsonl_path, staged_path,
+                              abs_prompt, report_language, "eof", session)
+                return 0
+            if confirm not in ("e", "evet", "y", "yes"):
+                print(_c(_COL_DIM,
+                      "Yeni arama başlatılmadı. /save · /commit · /quit kullanabilirsin."
+                      if report_language == "tr"
+                      else "No new call started. Use /save · /commit · /quit."))
+                continue
             _archive, ended_again = _start_fresh_call(
                 ctx, run_dir, chat_jsonl_path, session_path, session,
                 report_language, pending_user_msg=user_input,
@@ -1145,7 +1159,7 @@ def _handle_help(report_language: str) -> None:
     if report_language == "tr":
         print()
         print(_c(_COL_BOLD, "Komutlar:"))
-        print(f"  {_c(_COL_USER, '/save')}                 — son turu anchor olarak kaydet (staging)")
+        print(f"  {_c(_COL_USER, '/save')}                 — son turu VEYA tüm akışı anchor kaydet (staging)")
         print(f"  {_c(_COL_USER, '/history')}              — bu oturumdaki turları göster")
         print(f"  {_c(_COL_USER, '/reset')}                — geçmişi sil, baştan başla (fresh persona + arayan)")
         print(f"  {_c(_COL_USER, '/silence <N>')}          — N saniye sessizlik simüle et (manuel)")
@@ -1159,7 +1173,7 @@ def _handle_help(report_language: str) -> None:
     else:
         print()
         print(_c(_COL_BOLD, "Commands:"))
-        print(f"  {_c(_COL_USER, '/save')}                 — capture last turn as a test anchor (staging)")
+        print(f"  {_c(_COL_USER, '/save')}                 — capture the last turn OR the whole flow as an anchor")
         print(f"  {_c(_COL_USER, '/history')}              — show this session's turns")
         print(f"  {_c(_COL_USER, '/reset')}                — discard history, fresh persona + caller")
         print(f"  {_c(_COL_USER, '/silence <N>')}          — simulate N seconds of caller silence (manual)")
@@ -1212,57 +1226,28 @@ def _handle_silence(arg: str, ctx: "_SubprocessCtx", chat_jsonl_path: str,
 
 def _handle_save(chat_jsonl_path: str, staged_path: str, report_language: str,
                  session_path: str, session: dict) -> None:
+    """Stage a test anchor. Asks which kind to capture:
+    [1] single — the last user → assistant turn;
+    [2] flow   — the WHOLE conversation as a multi-turn flow anchor
+                 (v0.9.3: build it here instead of by-hand YAML editing).
+    """
     entries = _read_chat_jsonl(chat_jsonl_path)
-    last_user_idx = last_assistant_idx = None
-    for i in range(len(entries) - 1, -1, -1):
-        if (entries[i].get("role") == "assistant" and i > 0
-                and entries[i - 1].get("role") == "user"):
-            last_assistant_idx = i
-            last_user_idx = i - 1
-            break
-    if last_user_idx is None:
-        msg = ("No complete user→assistant turn yet. Chat first, then /save."
-               if report_language == "en"
-               else "Henüz tam bir tur yok. Önce yaz, bot cevap versin, sonra /save.")
-        print(msg)
+    if not entries:
+        print("Henüz konuşma yok. Önce konuş, sonra /save." if report_language == "tr"
+              else "No conversation yet. Chat first, then /save.")
         return
 
-    user_turn = entries[last_user_idx]["content"]
-    assistant_turn = entries[last_assistant_idx]["content"]
-
-    print()
-    if report_language == "tr":
-        print("Anchor kaydet — son tur:")
-        print(f"  user:      {_truncate(user_turn, 80)}")
-        print(f"  assistant: {_truncate(assistant_turn, 80)}\n")
+    kind = input(
+        "Ne kaydedeyim? [1] son tur  [2] tüm akış (flow)  (Enter=1): "
+        if report_language == "tr"
+        else "Save what? [1] last turn  [2] whole flow  (Enter=1): "
+    ).strip().lower()
+    if kind in ("2", "akış", "akis", "flow", "f"):
+        anchor = _build_flow_anchor(entries, report_language)
     else:
-        print("Save anchor — last turn:")
-        print(f"  user:      {_truncate(user_turn, 80)}")
-        print(f"  assistant: {_truncate(assistant_turn, 80)}\n")
-
-    expect_contains = _prompt_list(
-        "Yanıtta hangi sözcükler bulunmalı? (virgülle ayır, boş için Enter): "
-        if report_language == "tr"
-        else "What words should be in the reply? (comma-separated, Enter for none): "
-    )
-    expect_not_contains = _prompt_list(
-        "Yanıtta hangi sözcükler bulunmamalı? (virgülle ayır, boş için Enter): "
-        if report_language == "tr"
-        else "What words should NOT be in the reply? (comma-separated, Enter for none): "
-    )
-    rubric = input(
-        "Rubric (opsiyonel, Enter geç): "
-        if report_language == "tr"
-        else "Rubric (optional, Enter to skip): "
-    ).strip()
-
-    anchor = {"input": user_turn}
-    if expect_contains:
-        anchor["expect_contains"] = expect_contains
-    if expect_not_contains:
-        anchor["expect_not_contains"] = expect_not_contains
-    if rubric:
-        anchor["rubric"] = rubric
+        anchor = _build_single_anchor(entries, report_language)
+    if anchor is None:
+        return
 
     confirm = input(
         "\nKaydedeyim mi? [E/h]: " if report_language == "tr" else "\nSave? [Y/n]: "
@@ -1277,10 +1262,125 @@ def _handle_save(chat_jsonl_path: str, staged_path: str, report_language: str,
     session["saved_anchors"] = len(staged)
     _atomic_write_json(session_path, session)
 
-    msg = (f"Anchor #{len(staged)} kaydedildi (staging). Toplam: {len(staged)}. /commit ile sidecar'a yazılır."
+    kind_label = ("flow" if anchor.get("kind") == "flow"
+                  else ("tek tur" if report_language == "tr" else "single turn"))
+    msg = (f"Anchor #{len(staged)} ({kind_label}) kaydedildi (staging). "
+           f"/commit ile sidecar'a yazılır."
            if report_language == "tr"
-           else f"Anchor #{len(staged)} staged. Total: {len(staged)}. Use /commit to write.")
+           else f"Anchor #{len(staged)} ({kind_label}) staged. Use /commit to write.")
     print(msg)
+
+
+def _build_single_anchor(entries: list, report_language: str) -> "dict | None":
+    """Build a single-turn anchor from the last complete user → assistant turn."""
+    last_user_idx = last_assistant_idx = None
+    for i in range(len(entries) - 1, -1, -1):
+        if (entries[i].get("role") == "assistant" and i > 0
+                and entries[i - 1].get("role") == "user"):
+            last_assistant_idx = i
+            last_user_idx = i - 1
+            break
+    if last_user_idx is None:
+        print("Henüz tam bir user→assistant turu yok." if report_language == "tr"
+              else "No complete user→assistant turn yet.")
+        return None
+
+    user_turn = entries[last_user_idx]["content"]
+    assistant_turn = entries[last_assistant_idx]["content"]
+    print()
+    print("Anchor — son tur:" if report_language == "tr" else "Anchor — last turn:")
+    print(f"  user:      {_truncate(user_turn, 80)}")
+    print(f"  assistant: {_truncate(assistant_turn, 80)}\n")
+
+    expect_contains = _prompt_list(
+        "Yanıtta hangi sözcükler bulunmalı? (virgülle ayır, boş için Enter): "
+        if report_language == "tr"
+        else "What words should be in the reply? (comma-separated, Enter for none): ")
+    expect_not_contains = _prompt_list(
+        "Yanıtta hangi sözcükler bulunmamalı? (virgülle ayır, boş için Enter): "
+        if report_language == "tr"
+        else "What words should NOT be in the reply? (comma-separated, Enter for none): ")
+    rubric = input(
+        "Rubric (opsiyonel, Enter geç): " if report_language == "tr"
+        else "Rubric (optional, Enter to skip): ").strip()
+
+    anchor = {"input": user_turn}
+    if expect_contains:
+        anchor["expect_contains"] = expect_contains
+    if expect_not_contains:
+        anchor["expect_not_contains"] = expect_not_contains
+    if rubric:
+        anchor["rubric"] = rubric
+    return anchor
+
+
+def _build_flow_anchor(entries: list, report_language: str) -> "dict | None":
+    """Build a flow anchor from the WHOLE conversation. The leading assistant
+    opening (greeting from the call-connected cue, which has no preceding user
+    turn) is dropped so the flow starts at the first user turn — matching the
+    sidecar schema (user_input → assistant_expect → … → end_call_expect)."""
+    tr = report_language == "tr"
+    seq = [e for e in entries if e.get("role") in ("user", "assistant")]
+    while seq and seq[0].get("role") == "assistant":
+        seq.pop(0)
+
+    pairs = []  # (user_content, assistant_content)
+    i = 0
+    while i < len(seq):
+        if seq[i].get("role") == "user" and i + 1 < len(seq) \
+                and seq[i + 1].get("role") == "assistant":
+            pairs.append((seq[i].get("content", ""), seq[i + 1].get("content", "")))
+            i += 2
+        else:
+            i += 1
+    if not pairs:
+        print("Akış için en az bir user→assistant turu gerekli." if tr
+              else "A flow needs at least one user→assistant turn.")
+        return None
+
+    name = input("Akışa ad ver (Enter=boş): " if tr
+                 else "Name this flow (Enter=skip): ").strip()
+    last_is_end = input(
+        "Son tur çağrıyı kapatıyor mu (end_call)? [e/H]: " if tr
+        else "Does the last turn end the call (end_call)? [y/N]: "
+    ).strip().lower() in ("e", "evet", "y", "yes")
+
+    print("\nHer bot turu için iddia gir (boş Enter = genel rubric):" if tr
+          else "\nAssertions per bot turn (Enter = generic rubric):")
+    flow_turns = []
+    for idx, (u, a) in enumerate(pairs):
+        m = re.match(r"^\s*\[silence for (\d+) seconds\]\s*$", u, re.IGNORECASE)
+        if m:
+            flow_turns.append({"kind": "silence_input", "duration_seconds": int(m.group(1))})
+        else:
+            flow_turns.append({"kind": "user_input", "content": u})
+        print(f"\n  [{idx + 1}/{len(pairs)}] {'siz' if tr else 'you'}: {_truncate(u, 70)}")
+        print(f"        bot: {_truncate(a, 70)}")
+        contains = _prompt_list("    contains (Enter=yok): " if tr
+                                else "    contains (Enter=none): ")
+        rubric = input("    rubric (Enter=genel): " if tr
+                       else "    rubric (Enter=generic): ").strip()
+        is_last = idx == len(pairs) - 1
+        step = {"kind": "end_call_expect" if (is_last and last_is_end) else "assistant_expect"}
+        if contains:
+            step["expect_contains"] = contains
+        if rubric:
+            step["rubric"] = rubric
+        # assistant_expect requires >= 1 assertion (read-anchors); end_call_expect
+        # may rely on its implicit "session closed" rubric.
+        if not contains and not rubric and step["kind"] == "assistant_expect":
+            step["rubric"] = ("Yanıt karakterde kalıyor ve akışı uygun şekilde ilerletiyor."
+                              if tr else
+                              "Stays in character and advances the call appropriately.")
+        flow_turns.append(step)
+
+    anchor: dict = {"kind": "flow", "turns": flow_turns}
+    if name:
+        anchor["name"] = name
+    n_assert = sum(1 for t in flow_turns if t["kind"] in ("assistant_expect", "end_call_expect"))
+    print(f"\nFlow: {len(flow_turns)} tur, {n_assert} iddia." if tr
+          else f"\nFlow: {len(flow_turns)} turns, {n_assert} assertions.")
+    return anchor
 
 
 def _handle_history(chat_jsonl_path: str, report_language: str,
@@ -1825,7 +1925,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                     f"/set name=value to change") if detected else None
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.9.2"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.9.3"))
     print()
     if report_language == "tr":
         lines = [
@@ -1887,7 +1987,7 @@ def _render_end_call_box(report_language: str) -> None:
             f"  {_c(_COL_USER, '/commit')}  {_c(_COL_DIM, 'staged anchorları sidecara yaz')}",
             f"  {_c(_COL_USER, '/quit')}    {_c(_COL_DIM, 'oturumu kapat (final özet)')}",
             "",
-            _c(_COL_DIM, "Yeni bir mesaj yazarsan yeni bir arama başlatılır."),
+            _c(_COL_DIM, "Yeni mesaj yazarsan onay sorulup yeni bir arama başlar."),
         ]
     else:
         lines = [
@@ -1899,7 +1999,7 @@ def _render_end_call_box(report_language: str) -> None:
             f"  {_c(_COL_USER, '/commit')}  {_c(_COL_DIM, 'write staged anchors to sidecar')}",
             f"  {_c(_COL_USER, '/quit')}    {_c(_COL_DIM, 'close the session (final summary)')}",
             "",
-            _c(_COL_DIM, "Typing a new message starts a fresh call."),
+            _c(_COL_DIM, "Type a new message and confirm to start a fresh call."),
         ]
     print()
     _render_box(title, lines)
@@ -2124,8 +2224,8 @@ def _rich_endcall(report_language) -> None:
     for cmd, desc in steps:
         body.append(f"{cmd:<9}", style=f"bold {_RICH_USER}")
         body.append(f" {desc}\n", style=_RICH_DIM)
-    body.append(("\nYeni mesaj yazarsan yeni bir arama başlar."
-                 if tr else "\nType a new message to start a fresh call."), style=_RICH_DIM)
+    body.append(("\nYeni mesaj yazarsan onay sorulup yeni bir arama başlar."
+                 if tr else "\nType a new message and confirm to start a fresh call."), style=_RICH_DIM)
     title = Text("ARAMA SONA ERDİ" if tr else "CALL ENDED", style="bold dark_orange")
     _console.print()
     _console.print(Panel(body, title=title, title_align="left",

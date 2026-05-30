@@ -156,13 +156,15 @@ Every user message goes to the long-lived bare-Claude subprocess, which produces
 
 | Command | Action |
 |---|---|
-| `/save` | Capture the last user→assistant turn as a single-turn anchor: prompts for `expect_contains` / `expect_not_contains` / `rubric`, then stages it in `saved_anchors.json` (nothing written to the sidecar until `/commit`). _Flow-anchor capture — saving a whole multi-turn conversation — is planned; today `/save` stages single-turn anchors only. Author multi-turn flow anchors by hand in `<prompt>.anchors.yaml`._ |
+| `/save` | Stage a test anchor. Asks which kind: **single turn** (the last user→assistant exchange) or **flow** (the whole conversation as a multi-turn flow anchor — the opening greeting is dropped, each bot turn gets its own assertions, and the last turn can be marked `end_call_expect`). Collects `expect_contains` / `expect_not_contains` / `rubric`, then stages in `saved_anchors.json` (written to the sidecar on `/commit`). |
 | `/history` | Pretty-print the conversation so far. |
 | `/reset` | Move `chat.jsonl` aside and start fresh. `saved_anchors.json` is untouched. |
+| `/silence <N>` | Simulate the caller saying nothing for N seconds — sends `[silence for N seconds]` so the persona applies the script's silence policy. |
 | `/vars` | **(v0.6.0)** List detected variables with their current bound value (or `(random)` when unbound). |
 | `/set name=value` | **(v0.6.0)** Rebind a variable mid-chat. Persists to `<prompt>.vars.yaml` + applies on the next turn via a `[SYSTEM: variable update]` cue (no respawn → history preserved). |
 | `/unset name` | **(v0.6.0)** Drop a binding so the persona invents the value again. |
 | `/commit` | Atomic-write the staged anchors into `<prompt>.anchors.yaml` (creates the sidecar if missing; refuses if schema_version != 1). Validation re-parses the temp file post-write; rollback on any failure. Archived to `committed-<UTC>.json`. |
+| `/help` | Reprint the command list. |
 | `/quit` | Final summary. Offers to commit, keep, or discard any uncommitted staged anchors before exit. |
 
 **Modern terminal UI.** When [Rich](https://github.com/Textualize/rich) is installed (`pip install rich`), the chat renders as a modern surface: Markdown-formatted bot replies in bordered panels, right-aligned user bubbles, live token-by-token streaming, a responsive layout, and truecolor with automatic terminal detection (including Windows). Without Rich it falls back to a clean stdlib ANSI renderer — no extra dependency required. Set `VOICEPROMPTKIT_NO_RICH=1` to force the fallback, or the standard `NO_COLOR=1` for plain text.
@@ -273,7 +275,7 @@ An author-provided `chat_variables:` block in the prompt's frontmatter is read a
 ```
 1. /prompt-chat your-prompt.md
 2. Converse with the persona until something interesting happens.
-3. /save — stage a single-turn anchor (flow capture is planned; see the `/save` note above).
+3. /save — stage an anchor: a single turn, or the whole conversation as a flow.
 4. (repeat 2-3 for more scenarios)
 5. /commit — write staged anchors to <prompt>.anchors.yaml.
 6. Edit the prompt body. (Prompt SHA stays stable; cached audits stay valid.)
