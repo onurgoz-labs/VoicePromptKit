@@ -585,17 +585,6 @@ examples/
 
 All cross-phase state is exchanged via JSON files under `.voicepromptkit/<basename>/run-NNN/`. The orchestrating skill reads its own writes; each subagent reads paths it is given and writes only the JSON artefacts assigned to it.
 
-## Upgrading from earlier versions
-
-v0.7.0 finishes the rename from the old `PromptChecker` identifiers to `VoicePromptKit`. If you used an earlier version, update these by hand — there is no automatic migration:
-
-- Project config: `.promptchecker.json` → `.voicepromptkit.json`
-- Environment variables: `PROMPTCHECKER_*` → `VOICEPROMPTKIT_*`
-- Output / cache directory: `.promptcheck/` → `.voicepromptkit/` (old run history is left in place but no longer surfaced)
-- Pronunciation-guide markers in your own prompt files: `<!-- promptchecker:... -->` → `<!-- voicepromptkit:... -->`
-
-The command names (`/prompt-check`, `/prompt-chat`, `/prompt-test`) are unchanged.
-
 ## License
 
 MIT — see [LICENSE](./LICENSE) for the full text.
