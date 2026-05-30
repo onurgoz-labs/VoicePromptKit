@@ -202,7 +202,7 @@ END_CALL_MARKER = "<<END_CALL>>"
 # roleplay contract explicit. The full body content follows the framing
 # verbatim — no body modification.
 #
-# v0.8.0 — slimmed: the SCRIPT (body) is the single source of truth for HOW the
+# v0.9.0 — slimmed: the SCRIPT (body) is the single source of truth for HOW the
 # persona behaves (tone, length, pacing, language, format, flow). The wrapper
 # only commits to staying in persona + security, and documents the simulation
 # signalling protocol the SCRIPT cannot know about ([SYSTEM:…] cues, silence,
@@ -1817,7 +1817,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                     f"/set name=value to change") if detected else None
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.8.0"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.9.0"))
     print()
     if report_language == "tr":
         lines = [
