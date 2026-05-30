@@ -859,6 +859,8 @@ Return to chat loop.
 - **Slash command handling** — Python `_dispatch_slash()`. /save / /history / /reset / /commit / /quit are all Python-side, doing file-system mutations + `input()` prompts (an AskUserQuestion-like flow). The Phase 5 / 7 / 8 prose stays in this file, but **the canonical implementation is the Python script** — this spec text documents the Python code's behaviour.
 - **Non-slash user turn** — Python `_SubprocessCtx.send()` writes a JSON line to the claude subprocess, streams `text_delta` events to stdout, and on the `result` event atomically appends the reply to chat.jsonl and increments session.turns.
 
+**Rendering (v0.8.0+).** The runner renders behind a thin boundary. When `rich` is importable AND stdout is a terminal AND `VOICEPROMPTKIT_NO_RICH` is unset, it uses the Rich renderer — Markdown bot replies in bordered panels, right-aligned user bubbles, a `Live` region fed by `_SubprocessCtx.send(on_delta=...)` for true token streaming, and responsive panels for the welcome / end-call / summary cards. Otherwise it falls back to the stdlib ANSI one-liner renderer (spinner + buffered reply). Either way `_clean_stream_view` strips the `[PERSONA_NAME: …]` and `<<END_CALL>>` markers mid-stream so they never flash on screen. `NO_COLOR` / `TERM=dumb` force plain output for both paths.
+
 ### What this changes for downstream phases
 
 - **session.json schema:** the `chat_simulator_agent_id` field was removed. It is replaced by `chat_session_uuid` — the id of the conversation the claude CLI subprocess started via `--session-id`. Phase 0 bootstrap writes this field as null; the Python script generates a UUID on the first turn and persists it; /reset replaces it with a new UUID (the old subprocess is killed and a fresh one is spawned).
