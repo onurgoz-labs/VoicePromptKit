@@ -10,8 +10,15 @@ The original prompt file is **only modified when you explicitly apply a fix** (`
 
 ## Install
 
+Run these two commands in Claude Code, in order. First add the marketplace:
+
 ```
 /plugin marketplace add onurgoz-labs/VoicePromptKit
+```
+
+Then install the plugin:
+
+```
 /plugin install VoicePromptKit@onurgoz-labs
 ```
 
