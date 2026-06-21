@@ -565,6 +565,56 @@ codex_model: gpt-5-codex                { "codex_model": "gpt-5-codex" }      VO
 
 **Escape hatches:** `VOICEPROMPTKIT_CODEX_CLI` points at a non-PATH `codex` binary; `VOICEPROMPTKIT_CODEX_EXEC_FLAGS` appends raw flags to every `codex exec` invocation.
 
+#### Running with Claude vs Codex — side by side
+
+You always invoke the same command — `/prompt-check path/to/prompt.md` — from inside Claude Code. The only thing that changes is which engine runs the lens analysis. Both produce the same `report.md` / `findings.json` and the same interactive review.
+
+**Run with Claude (default — nothing to configure):**
+
+```
+/prompt-check prompts/agent.md
+```
+
+The lenses run as Claude Code subagents (`Agent` tool), fanned out in parallel. This is the zero-setup path; if you never set `backend`, this is what you get.
+
+**Run with Codex (opt in):**
+
+1. Install + authenticate Codex once:
+   ```bash
+   # macOS
+   brew install codex          # or: npm i -g @openai/codex
+   codex login                 # one-time auth
+   codex --version             # sanity check
+   ```
+2. Turn the backend on, in whichever scope fits:
+   ```bash
+   # A) one shell / session — set before launching Claude Code
+   export VOICEPROMPTKIT_BACKEND=codex
+   export VOICEPROMPTKIT_CODEX_MODEL=gpt-5-codex   # optional; omit for Codex's default
+
+   # B) whole repo — commit to .voicepromptkit.json
+   #    { "backend": "codex", "codex_model": "gpt-5-codex" }
+
+   # C) one prompt — add to that prompt's frontmatter
+   #    backend: codex
+   ```
+3. Run the same command:
+   ```
+   /prompt-check prompts/agent.md
+   ```
+   The lenses now run as sequential `codex exec` subprocesses via `bin/codex-lens.py`.
+
+**Switching back to Claude** is just removing the override (unset the env var, delete the config key, or drop the frontmatter line) — or set `backend: claude` explicitly. Because `backend` is part of the cache key, the two engines never serve each other's cached results.
+
+| | Claude backend | Codex backend |
+|---|---|---|
+| Setup | none | install + `codex login`, set `backend: codex` |
+| Engine | Claude Code `Agent` subagents | `codex exec` via `bin/codex-lens.py` |
+| Concurrency | parallel fan-out (one turn) | sequential (one subprocess per lens) |
+| Model under test (drift) | `target_model` (Claude) | Codex's model (`codex_model`) |
+| Artefacts | `report.md` + `findings.json` | identical |
+| Interactive review | in Claude Code | in Claude Code (always) |
+
 ## Pipeline
 
 The plugin runs one orchestrating skill that fans out to three subagents for the lens work. `static-lens-runner` is dispatched on every run; `drift-runner` and `tr-phonetic-runner` are conditional (drift only when anchors / conflicts / role-overrides exist AND `expand_count > 0`; TR only when `tr_phonetic: true`).
