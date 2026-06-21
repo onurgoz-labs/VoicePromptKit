@@ -352,7 +352,7 @@ When the skill records a transient status, it immediately writes the next persis
 
 `/prompt-check-resume [run-id]` (sister command, defined elsewhere) opens an existing `session.json`:
 
-1. Resolve the run directory: explicit `run-id` argument > `latest` symlink.
+1. Resolve the run directory: explicit `run-id` argument > `latest` pointer (`latest.txt`, falling back to the legacy `latest` symlink).
 2. Read `session.json` and `findings.json`.
 3. Filter `findings_state` for entries with `status == "pending"`.
 4. Re-render the summary table from §2, restricted to those rows.

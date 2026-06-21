@@ -13,7 +13,7 @@ Procedure:
 1. **Resolve the run directory from `$1`.**
    - If `$1` is an absolute or relative path to a run directory, use it as-is.
    - If `$1` is a `run-NNN` name, resolve it under `.voicepromptkit/<basename>/<run-NNN>` (the `<basename>` matches the parent directory containing that run).
-   - If `$1` is empty, auto-pick the most recent unfinished session: walk `.voicepromptkit/*/latest/session.json`, pick the entry whose file mtime is newest **and** still has at least one `findings_state[*].status == "pending"`. If none qualify, surface verbatim and exit:
+   - If `$1` is empty, auto-pick the most recent unfinished session. For each prompt directory `.voicepromptkit/<basename>/`, resolve its latest run portably: read the pointer file `<basename>/latest.txt` (it holds the run name → `<basename>/<run-name>/session.json`); if `latest.txt` is absent, fall back to the legacy `<basename>/latest` symlink (`<basename>/latest/session.json`). Among the resolved `session.json` files, pick the one whose mtime is newest **and** still has at least one `findings_state[*].status == "pending"`. If none qualify, surface verbatim and exit:
 
      ```
      No unfinished sessions. Run /prompt-check <path> to start a new audit.

@@ -48,7 +48,8 @@ echo "BASENAME=$BASENAME"
 Parse frontmatter + body. The full pattern is in `/prompt-check` Phase 2; the minimal subset `/prompt-test` needs:
 
 ```bash
-python3 - "$ABS_PROMPT" "$RUN_DIR" "$REPO_ROOT" <<'PY'
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+"$PYTHON_CLI" - "$ABS_PROMPT" "$RUN_DIR" "$REPO_ROOT" <<'PY'
 import sys, re, json, os, hashlib, subprocess
 prompt_path, run_dir, repo_root = sys.argv[1], sys.argv[2], sys.argv[3]
 text = open(prompt_path, encoding='utf-8').read()
@@ -219,7 +220,8 @@ Wait for the subagent to return. Read `$RUN_DIR/drift.json` for the verdicts.
 Read `drift.json` and build a markdown table — one row per anchor.
 
 ```bash
-python3 - "$RUN_DIR" <<'PY'
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+"$PYTHON_CLI" - "$RUN_DIR" <<'PY'
 import sys, json, os
 run_dir = sys.argv[1]
 fm = json.load(open(os.path.join(run_dir, 'frontmatter.json'), encoding='utf-8'))
@@ -363,7 +365,7 @@ If `failed > 0`, append:
 - **Read-only on the prompt file.** `/prompt-test` never writes to `$1` or its frontmatter. To modify anchors, use `/prompt-chat /save` + `/commit` or manual YAML edit.
 - **drift-runner is reused, not replaced.** All assertion semantics, rubric judging, and output shape (drift.json) are identical to what `/prompt-check` produces — the only difference is `regression_only: true` skips the non-regression probes.
 - **Run dir is durable.** Even if drift-runner fails mid-way, `body.txt` and `frontmatter.json` remain in `test-NNN/` for debugging.
-- **No latest symlink.** Unlike `/prompt-check`, `/prompt-test` does NOT create `.voicepromptkit/<basename>/latest` pointing at test-NNN — that symlink is reserved for the most recent successful audit, not test run. Test runs are listed by directory name (`test-001`, `test-002`, …).
+- **No latest pointer.** Unlike `/prompt-check`, `/prompt-test` does NOT create `.voicepromptkit/<basename>/latest.txt` (or the `latest` symlink) pointing at test-NNN — the latest pointer is reserved for the most recent successful audit, not test runs. Test runs are listed by directory name (`test-001`, `test-002`, …).
 
 ## Failure modes
 

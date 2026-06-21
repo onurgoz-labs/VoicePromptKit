@@ -357,8 +357,11 @@ Every run gets its own directory. Older runs are preserved so you can diff audit
     │   └── inline-suggestions.md   ← NEW: overlay (re-rendered each pass)
     ├── run-002/
     ├── run-003/
-    └── latest -> run-003/
+    ├── latest.txt          ← pointer file: holds "run-003" (cross-platform)
+    └── latest -> run-003/  ← symlink, POSIX only (best-effort, back-compat)
 ```
+
+The `latest` pointer is **cross-platform**: `latest.txt` (a one-line file holding the newest successful run's name) works on every OS, including Windows / Git Bash where symlinks need elevated privileges. On POSIX a `latest` symlink is also created best-effort so `latest/<file>` paths keep working. Readers resolve `latest.txt` first, then fall back to the symlink.
 
 ### `report.md` — what humans read
 
@@ -624,7 +627,7 @@ The plugin runs one orchestrating skill that fans out to three subagents for the
 Phase 9 and Phase 10 are the interactive layer — they run automatically after Phase 8 in `/prompt-check` and re-enter from `/prompt-check-resume`.
 
 1. **Phase 0** — First-run wizard or load existing `.voicepromptkit.json`.
-2. **Phase 1** — Allocate a fresh `run-NNN` directory (atomic; `latest` symlink is updated only on success).
+2. **Phase 1** — Allocate a fresh `run-NNN` directory (atomic; the `latest` pointer is updated only on success).
 3. **Phase 2** — Parse frontmatter deterministically and split body. Stores `body_line_offset`, `prompt_sha256`, `body_char_count`, and `compact_mode` (true when body_char_count > max_char_limit AND max_char_limit > 0). Phase 4-6 dispatches propagate these to each runner.
 4. **Phase 3** — Extract atomic, line-anchored rules from `body.txt`.
    - **Phase 3.5 — Per-run lens-selection wizard.** VoicePromptKit emits an `AskUserQuestion` widget asking which of the six lenses to apply. Repo defaults from `.voicepromptkit.json` seed which options are pre-checked, but the question itself is MANDATORY — prose substitutes are a contract violation. If the user is in a headless context where AskUserQuestion is unavailable, the audit aborts with a clear error rather than proceeding silently.
@@ -634,7 +637,7 @@ Phase 9 and Phase 10 are the interactive layer — they run automatically after 
    The skill awaits all five before proceeding. Schema lens auto-skips on flat prompts with no numbered headings.
 6. **Phase 5 — Drift (downstream of static lenses).** Triggered as soon as conflicts.json + gaps.json + dominances.json land. Runs in parallel with schema and tr-phonetic if those are still working. Conditional: skipped when expand_count == 0 or no anchors/conflicts/role-overrides.
 7. **Phase 7 — Render.** Awaits all six lens outputs. Builds findings.json + report.md (line numbers translated back to the original prompt file; `prompt_sha256` carried through). Phase 7 renders findings as a markdown TABLE with columns `id | mercek | önem | bölüm / satır | açıklama | düzeltme` (TR) or `id | lens | sev | section / line | rationale | fix` (EN). Runners self-cap rationale at ≤200 chars and fix at ≤150 chars — render uses full text verbatim, no truncation.
-8. **Phase 8** — Update `latest` symlink (commit point), print terminal summary.
+8. **Phase 8** — Update the `latest` pointer (`latest.txt` + POSIX symlink; commit point), print terminal summary.
 9. **Phase 9** — Render summary table from `findings.json`. Bootstrap `session.json` (all findings start `pending`). Accept free-form decision string from the user, parse it, apply TR routing rule, append each decision to `decisions.jsonl`.
 10. **Phase 10** — Process decisions: dismissed (log only), overlay (rebuild `inline-suggestions.md`), applied (SHA256-guarded prompt edits, with auto-conversion to overlay on stale audit or ambiguous occurrences), discussed (per-finding sub-dialogue with accept / revise / overlay / dismiss). Re-render `session.json` snapshot. Print Phase 10 summary. Phase 10's konuşalım sub-flow (per-finding deep dialogue) MANDATES `AskUserQuestion` for the four-option choice (kabul / revize / overlay / atla). Free-text follow-ups (revised suggestion text) use plain conversational input — that's intentional. The four-option choice itself is always AskUserQuestion.
 
