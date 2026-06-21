@@ -1925,7 +1925,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                     f"/set name=value to change") if detected else None
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.9.4"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.10.0"))
     print()
     if report_language == "tr":
         lines = [

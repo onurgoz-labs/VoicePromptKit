@@ -29,6 +29,7 @@ This is the only entry point for auditing a prompt. The skill drives the whole c
 - **No batch mode.** Batch execution has been retired. There is no flag, no fallback, no shortcut around the interactive flow. If the user asks for non-interactive operation, explain that interactive selection is now mandatory and point at the per-finding `atla` verb for fast dismissal.
 - **Resume.** If the user wants to resume an unfinished session, point them at `/prompt-check-resume [run-id]` (sister command). This command does not resume.
 - **Surface verbatim.** Every `AskUserQuestion` payload, summary table, decision prompt, and "konuşalım" sub-dialogue emitted by the skill MUST reach the user unchanged. Do not summarise, paraphrase, or batch them.
+- **Execution backend.** The lens analysis (Phases 4–6) runs through Claude Code's `Agent` tool by default (`backend: claude`). Set `backend: codex` (frontmatter, `VOICEPROMPTKIT_BACKEND`, or `.voicepromptkit.json`) to drive the same runners through OpenAI's Codex CLI (`codex exec`) via `bin/codex-lens.py` instead — requires `codex` on PATH (`codex login` once). The on-disk artefacts are identical; only the analysis engine differs. The interactive review (Phases 9–10) is unaffected.
 
 ## Argument
 

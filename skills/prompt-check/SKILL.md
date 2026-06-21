@@ -366,13 +366,40 @@ else:
     # silent default-fallback when nothing was set at all.
     _rlang_unknown = rlang if rlang is not None else None
 
+# v0.10.0: execution backend for the lens runners (Phase 4/5/6).
+#   'claude' (default) → dispatch runners via Claude Code's Agent tool.
+#   'codex'            → dispatch runners via OpenAI's Codex CLI
+#                        (`codex exec`) through bin/codex-lens.py.
+# Standard override hierarchy: frontmatter > env > project config > default.
+be = fm.get('backend')
+if be is None:
+    be = env('VOICEPROMPTKIT_BACKEND') or project.get('backend')
+be_norm = str(be).strip().lower() if be is not None and str(be).strip() != '' else None
+if be_norm in ('claude', 'codex'):
+    resolved['backend'] = be_norm
+    _backend_unknown = None
+else:
+    resolved['backend'] = 'claude'
+    _backend_unknown = be if be_norm is not None else None
+
+# v0.10.0: optional Codex model override (only meaningful when backend ==
+# 'codex'). Empty/None ⇒ let Codex use its own configured default model.
+cm = fm.get('codex_model')
+if cm is None:
+    cm = env('VOICEPROMPTKIT_CODEX_MODEL') or project.get('codex_model')
+resolved['codex_model'] = str(cm).strip() if cm is not None and str(cm).strip() != '' else None
+
 # Collect warnings for unknown frontmatter / config keys (surfaced in Phase 8).
-KNOWN_FM = {'type','target_model','worker_model','judge_model','output','expand_count','anchors','tr_phonetic','max_char_limit','report_language'}
-KNOWN_CFG = {'$schema','default_type','target_model','worker_model','judge_model','output','expand_count','tr_phonetic','max_char_limit','report_language'}
+KNOWN_FM = {'type','target_model','worker_model','judge_model','output','expand_count','anchors','tr_phonetic','max_char_limit','report_language','backend','codex_model'}
+KNOWN_CFG = {'$schema','default_type','target_model','worker_model','judge_model','output','expand_count','tr_phonetic','max_char_limit','report_language','backend','codex_model'}
 warnings = []
 if _rlang_unknown is not None:
     warnings.append(
         f"unknown report_language value: {_rlang_unknown!r} — falling back to 'tr'"
+    )
+if _backend_unknown is not None:
+    warnings.append(
+        f"unknown backend value: {_backend_unknown!r} — falling back to 'claude'"
     )
 if resolved['compact_mode']:
     warnings.append(
@@ -713,6 +740,7 @@ ref_files = [
     'agents/static-lens-runner.md',
     'agents/drift-runner.md',
     'agents/tr-phonetic-runner.md',
+    'bin/codex-lens.py',
 ]
 ref_hashes = {f: sha256_file(os.path.join(repo_root, f)) for f in ref_files}
 ref_canonical = json.dumps(ref_hashes, sort_keys=True, ensure_ascii=False)
@@ -759,6 +787,78 @@ eval $(python3 -c "import json,os; m=json.load(open('$RUN_DIR/cache_meta.json'))
 If the cache is corrupt (parse error reading a cached `{lens}.json`), Phase 4 treats it as a miss and dispatches the runner fresh; the corrupt entry is overwritten on Phase 8 cache write.
 
 ## Phases 4 + 6 — Parallel lens dispatch (5 concurrent Agent calls)
+
+### Backend selection (mandatory — read this before dispatching anything)
+
+Read `frontmatter.backend` (resolved in Phase 2; `"claude"` by default). It
+selects HOW the lens runners (Phases 4, 5, 6) are executed. Everything else —
+the cache lookup, the skipped-lens placeholders, the dispatch filter, and the
+Phase 5 drift gate — is **backend-agnostic and runs identically**. Only the
+dispatch mechanism for a lens that is actually about to run changes.
+
+- **`backend == "claude"` (default):** dispatch each runner via the `Agent`
+  tool exactly as documented in the rest of this section. No change.
+
+- **`backend == "codex"`:** dispatch each runner via OpenAI's Codex CLI through
+  the `bin/codex-lens.py` helper instead of the `Agent` tool. For a lens that
+  would otherwise get an `Agent` call:
+  1. Write the **exact same** `{ "inputs": {...}, "output_paths": {...} }`
+     object the `Agent` call's `prompt` would carry (see the per-lens shapes
+     below — they are identical; `output_path` for drift) to
+     `$RUN_DIR/<lens>.payload.json` (Write tool or heredoc).
+  2. Run via Bash:
+     ```bash
+     python3 "$REPO_ROOT/bin/codex-lens.py" \
+       --agent-spec "$REPO_ROOT/agents/<runner>.md" \
+       --payload    "$RUN_DIR/<lens>.payload.json" \
+       --repo-root  "$REPO_ROOT" \
+       --lens       "<lens>" \
+       --model      "$CODEX_MODEL"
+     ```
+     where `<runner>` is `static-lens-runner` (conflict / dominance / gap /
+     schema), `tr-phonetic-runner`, or `drift-runner`, and `$CODEX_MODEL` is
+     `frontmatter.codex_model`. **Always pass `--model "$CODEX_MODEL"`
+     unconditionally** — when it is empty (codex_model null) the helper omits
+     `-m` and Codex uses its own default model. (Do NOT use a
+     `${CODEX_MODEL:+--model ...}` idiom — it word-splits differently across
+     bash/zsh/sh and breaks the call.) The helper assembles the runner spec +
+     payload, drives `codex exec`, and writes the same `$RUN_DIR/<lens>.json`
+     artefact.
+  3. **The `model:` alias on the Agent shapes does NOT apply to Codex** — the
+     Claude model IDs (`worker_model` / `target_model` / `judge_model`) are
+     Claude-specific. On the Codex backend the runner's in-context model (the
+     "model under test" for drift) is Codex's own model. This is intended when
+     the operator opts into `backend: codex`.
+  4. **Execution is sequential** on the Codex backend (one `codex exec`
+     subprocess per lens), NOT a single concurrent fan-out — the five-Agents-
+     in-one-turn rule below applies only to `backend == "claude"`. State this
+     in the Phase 8 summary so the slower wall-clock is not mistaken for a hang.
+  5. **Failure handling:** if `codex-lens.py` exits non-zero (codex missing →
+     exit 2; codex failed/timed out → 3; output missing/invalid → 4), write the
+     lens's empty-placeholder JSON (the same shape as a deselected lens) plus a
+     `warnings: ["codex backend failed for <lens> (exit <n>) — see stderr"]`
+     entry to `$RUN_DIR/<lens>.json`, and continue. Phase 7 must still find
+     valid JSON at every expected path. Surface the failure in Phase 8.
+
+**Codex preflight (run once when `backend == "codex"`):**
+
+```bash
+CODEX_MODEL=$(python3 -c "import json;print(json.load(open('$RUN_DIR/frontmatter.json')).get('codex_model') or '')")
+BACKEND=$(python3 -c "import json;print(json.load(open('$RUN_DIR/frontmatter.json')).get('backend') or 'claude')")
+if [ "$BACKEND" = "codex" ]; then
+  if ! command -v codex >/dev/null 2>&1 && [ -z "$VOICEPROMPTKIT_CODEX_CLI" ]; then
+    echo "error: backend=codex but 'codex' CLI not found on PATH. Install Codex (https://github.com/openai/codex), run 'codex login', or set backend=claude."
+    exit 1
+  fi
+  echo "BACKEND=codex CODEX_MODEL=${CODEX_MODEL:-<default>}"
+fi
+```
+
+The rest of this section documents the **`claude`** dispatch shapes; on the
+`codex` backend, substitute the `bin/codex-lens.py` invocation above for each
+`Agent` call while keeping the `inputs` / `output_paths` payload identical.
+
+---
 
 Five lens runs fan out in ONE assistant turn, in five parallel `Agent` calls:
 
@@ -1036,6 +1136,11 @@ Agent({
   isolation: "worktree"
 })
 ```
+
+**Backend note (codex):** when `frontmatter.backend == "codex"`, do NOT emit
+this `Agent` call. Instead write the `{ "inputs": {...}, "output_path": "<.../drift.json>" }`
+object above to `$RUN_DIR/drift.payload.json` and run
+`python3 "$REPO_ROOT/bin/codex-lens.py" --agent-spec "$REPO_ROOT/agents/drift-runner.md" --payload "$RUN_DIR/drift.payload.json" --repo-root "$REPO_ROOT" --lens drift --model "$CODEX_MODEL" --timeout 1800` (pass `--model "$CODEX_MODEL"` unconditionally — empty omits `-m`; drift gets the longer `--timeout 1800` since simulation + judging is the heaviest runner). See "Backend selection" at the top of Phases 4 + 6 for the full contract, model semantics, and failure handling.
 
 Populate `expand_count_override` with `user_intent.expand_count` from Phase 3.5 (the per-run integer the user picked in the lens-selection wizard). The drift-runner uses this override when present, falling back to `frontmatter.expand_count` only when the override is absent.
 
