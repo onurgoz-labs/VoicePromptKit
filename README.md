@@ -24,6 +24,8 @@ Then install the plugin:
 
 The plugin auto-loads in every Claude Code session after that. No API keys, no SDK installs — the optional drift lens runs inside a single Claude Code subagent.
 
+**Optional:** to run the lens analysis through OpenAI's Codex CLI instead of Claude Code subagents, install [`codex`](https://github.com/openai/codex), run `codex login`, and set `backend: codex`. See [Codex CLI backend](#codex-cli-backend-v0100).
+
 ## Usage
 
 ```
@@ -496,6 +498,9 @@ Commit this file so your team gets the same defaults. Unknown keys are ignored (
 | `VOICEPROMPTKIT_TR_PHONETIC` | Truthy (`1/true/yes/on`) enables the Turkish phonetic lens | project config → `false` |
 | `VOICEPROMPTKIT_MAX_CHAR_LIMIT` | Positive integer triggers compact mode when body exceeds this many chars. `0` disables compact mode. | project config → `50000` |
 | `VOICEPROMPTKIT_REPORT_LANGUAGE` | `tr` or `en`. Sets skill-render language. | project config → `tr` |
+| `VOICEPROMPTKIT_BACKEND` | `claude` (default) or `codex`. Selects the engine that runs the lens analysis (Phases 4–6). See [Codex CLI backend](#codex-cli-backend-v0100). | project config → `claude` |
+| `VOICEPROMPTKIT_CODEX_MODEL` | Codex model passed as `codex exec -m <model>` when `backend=codex`. Empty ⇒ Codex's own configured default. | project config → Codex default |
+| `VOICEPROMPTKIT_CODEX_CLI` | Absolute path to a non-PATH `codex` binary (escape hatch). | `codex` on PATH |
 | `VOICEPROMPTKIT_TIMING` | Truthy (`true`) writes a millisecond-precision phase-boundary log to `$RUN_DIR/timing.log`. Diagnostic only — leave off in normal use. | off |
 
 **Timing logs (diagnostic):** when `VOICEPROMPTKIT_TIMING=true`, the skill writes `timing.log` to the run directory with one line per phase boundary (`phase_2_start`, `phase_2_end`, etc., in milliseconds since the Unix epoch). Use this when a run feels slow — `awk -F'[][]' '{print $2}' timing.log | sort -n` gives you the ordered timestamps; diffing adjacent timestamps surfaces the slowest phase. Drift simulation and subagent dispatch are common hotspots. Leave the env var off in everyday use — the log grows on every run.
@@ -522,6 +527,8 @@ expand_count: 6                  # overrides project config + env-var
 tr_phonetic: true                # overrides project config + env-var
 max_char_limit: 100000           # this prompt is large; raise the threshold so compact mode does NOT trigger
 report_language: en              # this prompt gets an English report even though repo default is tr
+backend: codex                   # run the lens analysis through Codex CLI instead of Claude Code's Agent tool
+codex_model: gpt-5-codex         # optional — Codex model for this prompt; omit to use Codex's default
 anchors:                         # always per-prompt — never inherited
   - input: "I am furious! Your product is garbage!"
     rubric: "de-escalates; remains professional"
@@ -533,6 +540,80 @@ anchors:                         # always per-prompt — never inherited
 ```
 
 Every field is optional. Most users only override `anchors` (per-prompt regression seeds) and let the repo defaults handle everything else.
+
+### Codex CLI backend (v0.10.0)
+
+By default `/prompt-check` runs its lens analysis (Phases 4–6) through Claude Code's `Agent` tool. Set `backend: codex` to run **the same runners through OpenAI's [Codex CLI](https://github.com/openai/codex)** (`codex exec`) instead — useful when you want the background analysis driven by Codex.
+
+Enable it in any layer:
+
+```yaml
+# frontmatter (one prompt)        OR   .voicepromptkit.json (repo)       OR   shell / settings.json
+backend: codex                          { "backend": "codex" }                VOICEPROMPTKIT_BACKEND=codex
+codex_model: gpt-5-codex                { "codex_model": "gpt-5-codex" }      VOICEPROMPTKIT_CODEX_MODEL=gpt-5-codex
+```
+
+**Prerequisite:** `codex` must be on your PATH and authenticated (`codex login` once). If `backend=codex` but Codex is not found, the run aborts with a clear error pointing you back to `backend: claude`.
+
+**How it works.** `bin/codex-lens.py` is a thin, deterministic dispatcher. For each lens it would otherwise hand to a subagent, it assembles the runner spec (`agents/<runner>.md`) plus the exact same JSON payload (`{inputs, output_paths}`) the `Agent` call would carry, pipes it to `codex exec` on stdin (`--sandbox workspace-write --cd <repo>`), and verifies the runner wrote valid JSON. **The on-disk artefacts are byte-for-byte the same contract** — `report.md`, `findings.json`, and the interactive review (Phases 9–10) are identical regardless of backend. The interactive review always runs inside Claude Code.
+
+**What differs on Codex:**
+- **Model semantics.** `target_model` / `worker_model` / `judge_model` are Claude IDs and do not apply. On Codex the runner's in-context model (the "model under test" for the drift lens) is Codex's own model — set `codex_model` to pick it, or let Codex use its configured default.
+- **Sequential, not concurrent.** The five-Agents-in-one-turn fan-out is Claude-only; on Codex the lenses run as sequential `codex exec` subprocesses, so wall-clock is longer. The Phase 8 summary states this so a slow run is not mistaken for a hang.
+- **Caching.** `backend` is part of the resolved frontmatter that seeds the content-addressable cache key, so Claude-backend and Codex-backend runs cache independently — switching backends never serves a stale cross-engine artefact.
+- **Failure handling.** If a Codex lens fails (missing CLI, non-zero exit, or missing/invalid output), the skill writes the lens's empty placeholder plus a warning and continues, so Phase 7 still renders and the failure surfaces in the summary.
+
+**Escape hatches:** `VOICEPROMPTKIT_CODEX_CLI` points at a non-PATH `codex` binary; `VOICEPROMPTKIT_CODEX_EXEC_FLAGS` appends raw flags to every `codex exec` invocation.
+
+#### Running with Claude vs Codex — side by side
+
+You always invoke the same command — `/prompt-check path/to/prompt.md` — from inside Claude Code. The only thing that changes is which engine runs the lens analysis. Both produce the same `report.md` / `findings.json` and the same interactive review.
+
+**Run with Claude (default — nothing to configure):**
+
+```
+/prompt-check prompts/agent.md
+```
+
+The lenses run as Claude Code subagents (`Agent` tool), fanned out in parallel. This is the zero-setup path; if you never set `backend`, this is what you get.
+
+**Run with Codex (opt in):**
+
+1. Install + authenticate Codex once:
+   ```bash
+   # macOS
+   brew install codex          # or: npm i -g @openai/codex
+   codex login                 # one-time auth
+   codex --version             # sanity check
+   ```
+2. Turn the backend on, in whichever scope fits:
+   ```bash
+   # A) one shell / session — set before launching Claude Code
+   export VOICEPROMPTKIT_BACKEND=codex
+   export VOICEPROMPTKIT_CODEX_MODEL=gpt-5-codex   # optional; omit for Codex's default
+
+   # B) whole repo — commit to .voicepromptkit.json
+   #    { "backend": "codex", "codex_model": "gpt-5-codex" }
+
+   # C) one prompt — add to that prompt's frontmatter
+   #    backend: codex
+   ```
+3. Run the same command:
+   ```
+   /prompt-check prompts/agent.md
+   ```
+   The lenses now run as sequential `codex exec` subprocesses via `bin/codex-lens.py`.
+
+**Switching back to Claude** is just removing the override (unset the env var, delete the config key, or drop the frontmatter line) — or set `backend: claude` explicitly. Because `backend` is part of the cache key, the two engines never serve each other's cached results.
+
+| | Claude backend | Codex backend |
+|---|---|---|
+| Setup | none | install + `codex login`, set `backend: codex` |
+| Engine | Claude Code `Agent` subagents | `codex exec` via `bin/codex-lens.py` |
+| Concurrency | parallel fan-out (one turn) | sequential (one subprocess per lens) |
+| Model under test (drift) | `target_model` (Claude) | Codex's model (`codex_model`) |
+| Artefacts | `report.md` + `findings.json` | identical |
+| Interactive review | in Claude Code | in Claude Code (always) |
 
 ## Pipeline
 
@@ -559,7 +640,7 @@ Phase 9 and Phase 10 are the interactive layer — they run automatically after 
 
 ## Architecture
 
-The plugin is pure Claude Code skill orchestration. No Node, no TypeScript, no `npm install`, no `node_modules`, no `package.json` — four skill files, a handful of references, two commands, three subagent definitions (one always dispatched, two conditional), and two Python helper scripts.
+The plugin is pure Claude Code skill orchestration. No Node, no TypeScript, no `npm install`, no `node_modules`, no `package.json` — four skill files, a handful of references, two commands, three subagent definitions (one always dispatched, two conditional), and three Python helper scripts.
 
 ```
 .claude-plugin/
@@ -587,7 +668,8 @@ agents/
 └── tr-phonetic-runner.md        (conditional — advisory-only TR lens)
 bin/
 ├── prompt-chat-runner.py        (long-lived chat REPL orchestrator)
-└── read-anchors.py              (anchor sidecar reader / validator)
+├── read-anchors.py              (anchor sidecar reader / validator)
+└── codex-lens.py                (Codex CLI backend dispatcher — backend: codex)
 examples/
 ├── sample-system.md
 ├── sample-agent.md
