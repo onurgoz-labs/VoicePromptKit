@@ -58,7 +58,8 @@ if [ ! -f "$RUNNER" ]; then
 fi
 
 # Update session.json: record that we entered through the new-window path.
-python3 - "$RUN_DIR" <<'PY'
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+"$PYTHON_CLI" - "$RUN_DIR" <<'PY'
 import sys, json, os, datetime
 run_dir = sys.argv[1]
 session_path = os.path.join(run_dir, 'session.json')
@@ -80,7 +81,8 @@ echo "RUNNER=$RUNNER"
 Replace this Claude Code process with the Python script via `exec`. The Python runner owns the terminal from here onward: it prints the welcome screen, reads user stdin, manages slash commands (/save /history /reset /commit /quit), and shells out to a SINGLE long-lived `claude --input-format stream-json` subprocess for each non-slash user turn.
 
 ```bash
-exec python3 "$RUNNER" "$RUN_DIR"
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+exec "$PYTHON_CLI" "$RUNNER" "$RUN_DIR"
 ```
 
 After `exec`, this Claude Code session no longer drives the terminal — Python does. When the user runs `/quit` inside the Python REPL, the Python process exits with status 0 and the Terminal window can be closed.

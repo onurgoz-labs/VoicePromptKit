@@ -183,7 +183,7 @@ _TR_LAST_NAMES = [
 ]
 
 
-NEUTRAL_CWD = "/tmp"  # subprocess cwd — no CLAUDE.md auto-discovery here
+NEUTRAL_CWD = tempfile.gettempdir()  # subprocess cwd — neutral dir, no CLAUDE.md auto-discovery; portable (/tmp on POSIX, %TEMP% on Windows)
 CLAUDE_CLI = os.environ.get("VOICEPROMPTKIT_CLAUDE_CLI") or shutil.which("claude") or "claude"
 
 # v0.5.9 — text-based stand-in for production Vapi's `end-call-tool`. The bare
@@ -1925,7 +1925,7 @@ def _print_welcome(run_dir: str, abs_prompt: str, chat_model: str,
                     f"/set name=value to change") if detected else None
 
     title = (_c(_COL_BOLD, "/prompt-chat") +
-             _c(_COL_DIM, " · interactive persona simulator · v0.10.0"))
+             _c(_COL_DIM, " · interactive persona simulator · v0.11.0"))
     print()
     if report_language == "tr":
         lines = [

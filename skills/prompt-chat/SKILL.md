@@ -55,7 +55,8 @@ if [ "$ATTEMPT" -gt 100 ]; then
 fi
 
 # ---- 0.2: frontmatter + body parse (identical to /prompt-check Phase 2) ---
-python3 - "$ABS_PROMPT" "$RUN_DIR" "$REPO_ROOT" <<'PY'
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+"$PYTHON_CLI" - "$ABS_PROMPT" "$RUN_DIR" "$REPO_ROOT" <<'PY'
 import sys, re, json, os, hashlib, subprocess
 prompt_path, run_dir, repo_root = sys.argv[1], sys.argv[2], sys.argv[3]
 text = open(prompt_path, encoding='utf-8').read()
@@ -141,7 +142,8 @@ printf '[]' > "$RUN_DIR/saved_anchors.json"
 # time. The pre-v0.5.18 skill wrote None here and then patched the field
 # again after dispatch — separate bash block, extra permission prompt.
 # Since dispatch is now unconditional, the value is known up front.
-python3 - "$RUN_DIR" "$ABS_PROMPT" <<'PY'
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+"$PYTHON_CLI" - "$RUN_DIR" "$ABS_PROMPT" <<'PY'
 import sys, json, os, datetime
 run_dir, prompt_path = sys.argv[1], sys.argv[2]
 fm = json.load(open(os.path.join(run_dir, 'frontmatter.json'), encoding='utf-8'))
@@ -170,7 +172,8 @@ PY
 # user for values BEFORE the window opens. Writes detected.json (full
 # detected list + known values) and prints two stdout lines the skill
 # parses: DETECTED_JSON=... and UNBOUND_JSON=...
-python3 - "$ABS_PROMPT" "$RUN_DIR" <<'PY'
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+"$PYTHON_CLI" - "$ABS_PROMPT" "$RUN_DIR" <<'PY'
 import sys, re, json, os
 prompt_path, run_dir = sys.argv[1], sys.argv[2]
 body = open(os.path.join(run_dir, 'body.txt'), encoding='utf-8').read()
@@ -247,7 +250,8 @@ BOUND_VALUES_JSON='{}'
 # sidecar persists values prompt-level across chats. The prompt file itself
 # is NEVER touched → its SHA256 stays stable, cached /prompt-check audits
 # remain valid (same contract as <prompt>.anchors.yaml).
-python3 - "$RUN_DIR" "$ABS_PROMPT" "$BOUND_VALUES_JSON" <<'PY'
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+"$PYTHON_CLI" - "$RUN_DIR" "$ABS_PROMPT" "$BOUND_VALUES_JSON" <<'PY'
 import sys, json, os
 run_dir, prompt_path, bound_json = sys.argv[1], sys.argv[2], sys.argv[3]
 detected = json.load(open(os.path.join(run_dir, 'detected.json'), encoding='utf-8')).get('detected', [])
@@ -403,7 +407,8 @@ OSA
 esac
 
 # Echo enough for the main session to greet the user with the relative path.
-RUN_DIR_REL=$(python3 -c "import os, sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))" "$RUN_DIR" "$REPO_ROOT")
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+RUN_DIR_REL=$("$PYTHON_CLI" -c "import os, sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))" "$RUN_DIR" "$REPO_ROOT")
 echo "OK chat session launched in new window"
 echo "RUN_DIR_REL=$RUN_DIR_REL"
 ```
@@ -514,7 +519,8 @@ Dispatch:
 ### Step 5.1 — Locate the last turn (single-turn path)
 
 ```bash
-python3 - "$RUN_DIR" <<'PY'
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+"$PYTHON_CLI" - "$RUN_DIR" <<'PY'
 import sys, json, os
 run_dir = sys.argv[1]
 entries = []
@@ -646,7 +652,8 @@ options:
 ### Step 5.7 — Atomic append to saved_anchors.json
 
 ```bash
-python3 - "$RUN_DIR" "$USER_CONTENT" "$EXPECT_CONTAINS_JSON" "$EXPECT_NOT_CONTAINS_JSON" "$RUBRIC" "$CONTEXT_JSON" <<'PY'
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+"$PYTHON_CLI" - "$RUN_DIR" "$USER_CONTENT" "$EXPECT_CONTAINS_JSON" "$EXPECT_NOT_CONTAINS_JSON" "$RUBRIC" "$CONTEXT_JSON" <<'PY'
 import sys, json, os
 run_dir = sys.argv[1]
 user_content = sys.argv[2]
@@ -713,7 +720,8 @@ Trim whitespace. Empty → `None` (the reader/runner will fall back to the first
 **Step 5.F3 — Read and pre-process chat.jsonl.**
 
 ```bash
-python3 - "$RUN_DIR" <<'PY'
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+"$PYTHON_CLI" - "$RUN_DIR" <<'PY'
 import json, os, re, sys
 run_dir = sys.argv[1]
 
@@ -844,7 +852,7 @@ Return to chat loop.
 **v0.5.6 architecture pivot:** move the chat loop entirely out of the Claude Code skill / subagent world. Instead, `bin/prompt-chat-runner.py` (pure Python, stdlib + PyYAML) runs this way:
 
 1. The Python script is spawned ONCE (via the `/prompt-chat-session` skill's `exec python3 ...` call).
-2. The script in turn spawns ONE `claude` subprocess — `--input-format stream-json --output-format stream-json --include-partial-messages --system-prompt-file <body> --session-id <uuid> --disable-slash-commands --allowedTools "" --permission-mode bypassPermissions`. The subprocess cwd is `/tmp` (neutral) — the project CLAUDE.md is not auto-discovered.
+2. The script in turn spawns ONE `claude` subprocess — `--input-format stream-json --output-format stream-json --include-partial-messages --system-prompt-file <body> --session-id <uuid> --disable-slash-commands --allowedTools "" --permission-mode bypassPermissions`. The subprocess cwd is a neutral temp dir (`/tmp` on POSIX, `%TEMP%` on Windows — resolved via Python's `tempfile.gettempdir()`) — the project CLAUDE.md is not auto-discovered.
 3. For each user turn the Python script writes a single `{"type":"user","message":{...}}` JSON line to stdin, parses events from stdout, streams `text_delta` events to the user in real time (lower TTFT), and completes on the `result` event.
 4. The subprocess stays alive for the whole conversation — NO re-spawn per turn, NO permission prompt, NO body re-read.
 
@@ -888,7 +896,8 @@ User typed `/commit`. Atomic-write the staged anchors from `saved_anchors.json` 
 ### Step 7.1 — Load staged anchors
 
 ```bash
-STAGED_COUNT=$(python3 -c "import json; print(len(json.load(open('$RUN_DIR/saved_anchors.json'))))")
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+STAGED_COUNT=$("$PYTHON_CLI" -c "import json; print(len(json.load(open('$RUN_DIR/saved_anchors.json'))))")
 ```
 
 If `STAGED_COUNT == 0`:
@@ -903,7 +912,8 @@ If `STAGED_COUNT == 0`:
 The write is in three stages: build the new sidecar content, write to a temp file, validate the temp by parsing it back, then atomically rename. Rollback on any failure. **The prompt file itself is never touched** — only `<prompt>.anchors.yaml` is created or modified, so the prompt SHA256 stays stable and any cached `/prompt-check` audits remain valid.
 
 ```bash
-python3 - "$ABS_PROMPT" "$RUN_DIR/saved_anchors.json" <<'PY'
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+"$PYTHON_CLI" - "$ABS_PROMPT" "$RUN_DIR/saved_anchors.json" <<'PY'
 import sys, os, json, yaml, datetime, shutil
 
 prompt_path, staged_path = sys.argv[1], sys.argv[2]
@@ -1019,7 +1029,8 @@ User typed `/quit`. Offer to commit any uncommitted staged anchors, then print t
 ### Step 8.1 — Check staged anchors
 
 ```bash
-STAGED_COUNT=$(python3 -c "import json; print(len(json.load(open('$RUN_DIR/saved_anchors.json'))))")
+PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
+STAGED_COUNT=$("$PYTHON_CLI" -c "import json; print(len(json.load(open('$RUN_DIR/saved_anchors.json'))))")
 ```
 
 If `STAGED_COUNT > 0`, ask the user:
