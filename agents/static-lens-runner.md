@@ -1,6 +1,6 @@
 ---
 name: static-lens-runner
-description: Consolidated executor for the conflict, dominance, gap, and schema lenses of the prompt-check skill. Reads body + frontmatter + rules + lens-rules.md plus a `selected_lenses` subset from the per-run wizard, applies only the selected lenses (skipping the rest with a `skipped: true` placeholder), and writes conflicts.json / dominances.json / gaps.json / schema.json. Use only when called by the prompt-check skill — not invoked directly by users.
+description: Applies the selected static lenses (conflict, dominance, gap, schema) to an extracted rule list and writes their JSON artefacts. Use only when called by the prompt-check skill — not invoked directly by users.
 tools: Read, Write, Bash
 ---
 
@@ -249,64 +249,11 @@ Self-correction: if a lens is NOT in `selected_lenses` but you ran it anyway, th
 
 ## Compact mode policy (mandatory when compact_mode == true)
 
-When `inputs.compact_mode == true`, every static lens applies the cheaper policies below. The policies trim audit depth, not correctness — every kind of finding is still possible, but low-severity / low-impact ones are skipped.
-
-### Conflict lens (Step 1)
-- **Severity floor: medium.** Emit only findings with `severity: "high"` or `"medium"`. Skip all `low` severity conflicts (they nudge in opposite directions but are satisfiable).
-- **Pair budget.** Instead of comparing every rule pair (O(N²)), pick the 50 most-impactful rules first (by absolute language: "always", "never", "must", "only", "ignore") and compare only within that set. If fewer than 50 such rules exist, compare all of them. This caps conflict-lens work at ~1250 comparisons regardless of prompt size.
-
-### Dominance lens (Step 2)
-- **Mechanism restriction:** emit findings ONLY for `mechanism == "role-override"` or `mechanism == "recency"`. Skip `position`, `length`, `specificity` — those are subtle effects and require pair-comparison cost that compact mode trims.
-- **Severity floor: medium.** Skip `low` severity dominance findings.
-
-### Gap lens (Step 3)
-- **Severity floor: medium.** Skip `low` severity gaps (corner cases). Keep `undefined_edge_case` and `ambiguous_term` high/medium findings.
-
-### Schema lens (Step 4)
-- No change. Schema parsing is heading-level, cheap regardless of body size. Run normally.
-
-### Output annotation
-Every output file (conflicts.json, dominances.json, gaps.json, schema.json) gains a top-level `compact_mode: true` field when this policy was applied, plus a `compact_policy` array listing which trim policies fired:
-
-```json
-{
-  "conflicts": [...],
-  "compact_mode": true,
-  "compact_policy": ["severity_floor_medium", "pair_budget_50"]
-}
-```
-
-When `compact_mode == false`, neither field appears (or both are emitted as `compact_mode: false, compact_policy: []` — consumer-friendly).
+When `inputs.compact_mode == true`, apply the per-lens trim policies and the output annotation (`compact_mode: true` + `compact_policy` array in every output file) exactly as specified in `lens_rules.shared`, "Compact mode" section. The policies trim audit depth, not correctness.
 
 ## Compact writing (mandatory)
 
-Every emitted `rationale` / `reasoning` / `suggested_fix` / `description` field MUST be compact:
-
-- **rationale / reasoning / description:** ≤ 200 characters. ONE sentence, no preamble. Direct identification of what is wrong + why it matters.
-- **suggested_fix:** ≤ 150 characters. Imperative action: "Rewrite X to Y" / "Add: ..." / "Remove R<n>". For structural fixes with embedded "Suggested: '...'" replacement text, keep the replacement under 50 chars or omit it (point to the line instead).
-- **First sentence rule:** the field IS one sentence. No multi-clause walls. If you can't say it in one sentence under the cap, simplify the finding or split it into multiple findings.
-
-Examples (good vs bad):
-
-BAD (304 chars, English, multi-clause):
-   "R78 declares `sms_retry_count` default 0, max 1 (line 326). R80 declares STATE 15 'Max retries: 2 (for SMS resend)' (line 590). The same SMS-resend counter cannot have both a max of 1 and a max of 2 — runtime behavior will diverge depending on which rule the agent honours."
-
-GOOD TR (158 chars):
-   "R78 sms_retry_count max=1 (satır 326) ile R80 'Max retries: 2' (satır 590) çelişiyor; aynı sayaç hem 1 hem 2 olamaz."
-
-GOOD EN (155 chars):
-   "R78 sets sms_retry_count max=1 (line 326) but R80 says 'Max retries: 2' (line 590); the same counter can't be both."
-
-BAD suggested_fix (273 chars):
-   "Reconcile by rewriting R80 (line 590) to 'Max retries: 1 (for SMS resend; matches sms_retry_count cap in State Variables table)' OR raise R78 (line 326) to 'Max: 2' — pick one canonical value across both locations."
-
-GOOD suggested_fix TR (132 chars):
-   "R80'i (satır 590) 'Max retries: 1' yap VEYA R78'i (satır 326) 'Max: 2' yap — tek değerde birleştir."
-
-GOOD suggested_fix EN (124 chars):
-   "Change R80 (line 590) to 'Max retries: 1' OR raise R78 (line 326) to 'Max: 2' — pick one canonical value."
-
-Self-correction: if you find yourself writing > 200 chars of rationale or > 150 chars of fix, you're either being verbose (rewrite) or trying to bundle multiple findings (split into separate ones).
+Every emitted `rationale` / `reasoning` / `description` field MUST be ≤ 200 characters and every `suggested_fix` ≤ 150 characters — ONE sentence, no preamble, imperative fixes ("Rewrite X to Y" / "Add: ..." / "Remove R<n>"). The canonical rule plus BAD/GOOD examples live in `lens_rules.shared`, "Compact writing — runner-side invariant" section; apply it verbatim. If you can't say it in one sentence under the cap, simplify the finding or split it into multiple findings.
 
 The full structured payload (`current_excerpt`, `pronunciation_entry`, `related_lines`, `section_ref`) is unchanged — those carry context, not narrative. Only `rationale` / `reasoning` / `description` / `suggested_fix` are capped.
 
@@ -314,129 +261,7 @@ The full structured payload (`current_excerpt`, `pronunciation_entry`, `related_
 
 Every `reasoning` (conflict, dominance), `description` (gap), `rationale` (schema), and `suggested_fix` (all four lenses) field MUST be emitted in `inputs.report_language`. Rule IDs (`R12`, `R80`), line numbers, severity tokens (`high|medium|low`), and structural artefacts (section numbers like `1.3`, finding IDs like `C1`, `D1`, `G1`) stay neutral — they are not prose.
 
-### Conflict lens — example pair
-
-TR (`report_language: "tr"`):
-```json
-{
-  "id": "C1",
-  "rule_ids": ["R78", "R80"],
-  "severity": "high",
-  "reasoning": "R78 sms_retry_count max=1 (satır 326) ile R80 'Max retries: 2' (satır 590) çelişiyor; aynı sayaç hem 1 hem 2 olamaz.",
-  "suggested_fix": "R80'i (satır 590) 'Max retries: 1' yap VEYA R78'i (satır 326) 'Max: 2' yap — tek değerde birleştir.",
-  "fix_strategy": "structural"
-}
-```
-
-EN (`report_language: "en"`):
-```json
-{
-  "id": "C1",
-  "rule_ids": ["R78", "R80"],
-  "severity": "high",
-  "reasoning": "R78 sets sms_retry_count max=1 (line 326) but R80 says 'Max retries: 2' (line 590); the same counter can't be both.",
-  "suggested_fix": "Change R80 (line 590) to 'Max retries: 1' OR raise R78 (line 326) to 'Max: 2' — pick one canonical value.",
-  "fix_strategy": "structural"
-}
-```
-
-### Dominance lens — example pair
-
-TR:
-```json
-{
-  "id": "D1",
-  "dominant_rule_id": "R45",
-  "dominated_rule_id": "R12",
-  "mechanism": "role-override",
-  "severity": "high",
-  "reasoning": "R45 (satır 412) 'her durumda yanıtla' diyerek R12'nin (satır 88) güvenlik reddini örtük olarak iptal ediyor.",
-  "suggested_fix": "R45'i 'güvenlik istisnaları hariç her durumda' olarak değiştir veya R12'yi son söz olarak taşı.",
-  "fix_strategy": "structural"
-}
-```
-
-EN:
-```json
-{
-  "id": "D1",
-  "dominant_rule_id": "R45",
-  "dominated_rule_id": "R12",
-  "mechanism": "role-override",
-  "severity": "high",
-  "reasoning": "R45 (line 412) 'always respond' silently overrides R12's safety refusal (line 88) via role-override.",
-  "suggested_fix": "Reword R45 to 'always respond except safety exceptions' or move R12 to the last-word position.",
-  "fix_strategy": "structural"
-}
-```
-
-### Gap lens — example pair
-
-TR:
-```json
-{
-  "id": "G1",
-  "kind": "undefined_edge_case",
-  "description": "R23 SMS gönderir ama hat yoksa ne olacağı tanımsız.",
-  "related_rule_ids": ["R23"],
-  "severity": "medium",
-  "suggested_fix": "R23'e ekle: 'Hat yoksa kullanıcıya 'şu an SMS gönderemiyorum' de ve geri dön.'",
-  "fix_strategy": "structural"
-}
-```
-
-EN:
-```json
-{
-  "id": "G1",
-  "kind": "undefined_edge_case",
-  "description": "R23 sends SMS but does not define behaviour when carrier is unavailable.",
-  "related_rule_ids": ["R23"],
-  "severity": "medium",
-  "suggested_fix": "Add to R23: 'If carrier unavailable, tell user 'cannot send SMS right now' and return.'",
-  "fix_strategy": "structural"
-}
-```
-
-### Schema lens — rationale templates per kind
-
-For schema findings, use the per-`kind` rationale templates below. Substitute the live numbers/letters but keep the wording in `report_language`:
-
-| kind | TR rationale template | EN rationale template |
-|---|---|---|
-| section_gap | "Bölüm N → Bölüm N+2: Bölüm N+1 eksik." | "Section N → Section N+2: Section N+1 missing." |
-| subsection_gap | "N.M → N.M+2: N.(M+1) eksik." | "N.M → N.M+2: N.(M+1) missing." |
-| out_of_order | "Bölüm/altbölüm sırasız: B önce A geliyor." | "Section/subsection out of order: B before A." |
-| subsection_orphan | "Altbölüm B.X, Bölüm A'nın altında — uyumsuz." | "Subsection B.X under Section A — mismatched." |
-| heading_style_inconsistent | "Başlık stili tutarsız: bazıları BÜYÜK, bazıları Başlık formatında." | "Heading style inconsistent: some ALL CAPS, some Title Case." |
-| missing_parent | "Altbölüm N.M var ama '## SECTION N' başlığı yok." | "Subsection N.M exists but no '## SECTION N' parent." |
-| step_gap | "STEP N → STEP N+2: STEP N+1 eksik." | "STEP N → STEP N+2: STEP N+1 missing." |
-
-Schema `suggested_fix` strings follow the same compact-writing cap (≤ 150 chars) and the same language switch. Example:
-
-TR schema finding (section_gap):
-```json
-{
-  "id": "SCH1",
-  "kind": "section_gap",
-  "severity": "medium",
-  "rationale": "Bölüm 5 → Bölüm 7: Bölüm 6 eksik.",
-  "suggested_fix": "Bölüm 6 başlığını ekle veya 7'yi 6 olarak yeniden numaralandır.",
-  "fix_strategy": "structural"
-}
-```
-
-EN schema finding (section_gap):
-```json
-{
-  "id": "SCH1",
-  "kind": "section_gap",
-  "severity": "medium",
-  "rationale": "Section 5 → Section 7: Section 6 missing.",
-  "suggested_fix": "Insert a Section 6 heading or renumber 7 down to 6.",
-  "fix_strategy": "structural"
-}
-```
+The canonical TR/EN example pair lives in `lens_rules.shared`, "Language switching — canonical example pair" section — follow it for every lens you run. For schema findings, additionally use the per-`kind` TR/EN rationale templates in `lens_rules.schema`, "Language switching — rationale templates per kind" section.
 
 Self-correction: if `inputs.report_language == "tr"` but you wrote English prose in any `reasoning` / `description` / `rationale` / `suggested_fix` field, that's a runner bug — rewrite before output.
 

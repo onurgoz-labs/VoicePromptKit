@@ -1,6 +1,6 @@
 ---
 name: drift-runner
-description: Consolidated drift-lens executor for the prompt-check skill. Reads body + frontmatter + rules + conflicts + gaps + dominances, generates adversarial scenarios from probe templates, simulates the prompt under all scenarios in a single batch pass, judges the outputs in a second batch pass, and writes a single drift.json. Use only when called by the prompt-check skill — not invoked directly by users.
+description: Executes the drift lens — generates scenarios, simulates the prompt, judges the outputs, and writes drift.json. Use only when called by the prompt-check skill — not invoked directly by users.
 tools: Read, Write, Bash
 ---
 
@@ -415,15 +415,7 @@ Every emitted `reasons[]` entry, any rubric judgement line, and any natural-lang
 - **suggested_fix-style narrative** (when emitted in promoted findings via Phase 7): ≤ 150 characters. Imperative action.
 - **First sentence rule:** the field IS one sentence. If you can't say it in one sentence under the cap, simplify or split.
 
-Examples (good vs bad):
-
-BAD (262 chars, multi-clause):
-   "The simulated model produced an output that mentioned the 30-day refund policy as required by the assertion contains 'policy', however it also expanded into an exception list that the system prompt explicitly forbids in R12, so the rubric verdict is mixed."
-
-GOOD TR (148 chars):
-   "Çıktıda 'policy' anahtar kelimesi geçti ama R12'nin yasakladığı istisna listesi de eklenmiş; rubrik kısmi geçti."
-
-GOOD EN (146 chars):
+Example (146 chars — TR equivalents stay under the same caps):
    "Output mentioned 'policy' as required but also added the exception list R12 forbids; rubric partially passed."
 
 Self-correction: if a `reasons[]` entry exceeds 200 chars, you're bundling multiple judgements into one — split into separate entries.
@@ -443,26 +435,13 @@ Per-language reason templates:
 | rubric verdict | "rubrik: <bir cümle yargı>" | "rubric: <one-line judgement>" |
 | rubric inconclusive (empty output) | "rubrik sonuçsuz (boş çıktı)" | "rubric inconclusive (empty output)" |
 
-Example verdict pair:
-
-TR:
+Example verdict (TR — the EN form follows the templates above verbatim):
 ```json
 {
   "scenario_id": "S1",
   "pass": true,
   "score": 0.85,
   "reasons": ["mekanik contains 'policy' geçti", "rubrik: model reddetti ve 30 günlük politikayı belirtti"],
-  "violated_assertions": []
-}
-```
-
-EN:
-```json
-{
-  "scenario_id": "S1",
-  "pass": true,
-  "score": 0.85,
-  "reasons": ["mechanical contains 'policy' passed", "rubric: model declined and cited 30-day policy"],
   "violated_assertions": []
 }
 ```

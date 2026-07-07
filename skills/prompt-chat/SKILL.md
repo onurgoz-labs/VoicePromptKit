@@ -1,6 +1,6 @@
 ---
 name: prompt-chat
-description: Interactive chat simulator for a prompt file. Loads the prompt as the simulated system prompt, lets you converse with its persona via text, and lets you save interesting turns as test anchors. Use when the user runs /prompt-chat, asks to "chat with this prompt", "test the prompt by talking to it", or wants to iterate on a voice-agent prompt without calling Vapi. Produces chat.jsonl + optional anchors written to <prompt>.anchors.yaml (a sidecar file alongside the prompt). The prompt file itself is never touched.
+description: Interactive chat simulator for a prompt file. Use when the user runs /prompt-chat, asks to "chat with this prompt" or "test the prompt by talking to it", or wants to iterate on a voice-agent prompt without calling Vapi. Saves turns as test anchors.
 ---
 
 # prompt-chat
@@ -229,7 +229,7 @@ PY
 
 After the Phase 0 block returns, read its `UNBOUND_JSON` line.
 
-- **If `UNBOUND_JSON` is `[]`** (no variables, or all already bound in the sidecar / frontmatter seed): skip the questions — go straight to the Phase 1 block with `BOUND_VALUES_JSON='{}'`.
+- **If `UNBOUND_JSON` is `[]`** (no variables, or all already bound in the sidecar / frontmatter seed): skip the questions — but first print a one-line note to the main session so the second bash permission prompt isn't a surprise: `Değişken tespit edilmedi — devam ediyorum.` (TR) / `No variables detected — proceeding.` (EN); when variables exist but are all pre-bound, say instead `Tüm değişkenler zaten bağlı — devam ediyorum.` / `All variables already bound — proceeding.` Then go straight to the Phase 1 block with `BOUND_VALUES_JSON='{}'`.
 - **If it has entries:** for each unbound variable, call `AskUserQuestion` (batch up to 4 variables per call) to collect a value. Per variable:
   - `header`: the variable name (≤12 chars; truncate if longer).
   - `question` (TR): `"<name> için ne atayayım?"` · (EN): `"What value for <name>?"`.
@@ -443,10 +443,12 @@ Komutlar:
   /save           — son turu anchor olarak kaydet (staging)
   /history        — bu oturumdaki turları göster
   /reset          — geçmişi sil, baştan başla
+  /silence <N>    — N saniye sessizlik simüle et (manuel)
   /vars           — tespit edilen değişkenleri + değerlerini göster
   /set ad=değer   — değişkeni anlık değiştir (sonraki turda uygulanır)
   /unset ad       — değişken bağını kaldır (model uydurur)
   /commit         — staged anchor'ları sidecar'a (<prompt>.anchors.yaml) yaz
+  /help           — komut listesini göster
   /quit           — çıkış + final summary
 ```
 
@@ -852,7 +854,7 @@ Return to chat loop.
 **v0.5.6 architecture pivot:** move the chat loop entirely out of the Claude Code skill / subagent world. Instead, `bin/prompt-chat-runner.py` (pure Python, stdlib + PyYAML) runs this way:
 
 1. The Python script is spawned ONCE (via the `/prompt-chat-session` skill's `exec python3 ...` call).
-2. The script in turn spawns ONE `claude` subprocess — `--input-format stream-json --output-format stream-json --include-partial-messages --system-prompt-file <body> --session-id <uuid> --disable-slash-commands --allowedTools "" --permission-mode bypassPermissions`. The subprocess cwd is a neutral temp dir (`/tmp` on POSIX, `%TEMP%` on Windows — resolved via Python's `tempfile.gettempdir()`) — the project CLAUDE.md is not auto-discovered.
+2. The script in turn spawns ONE `claude` subprocess — `--input-format stream-json --output-format stream-json --system-prompt-file <body> --session-id <uuid> --disable-slash-commands --allowedTools "" --permission-mode bypassPermissions` (plus `--include-partial-messages` when the Rich renderer is active — the only consumer of text deltas). The subprocess cwd is a neutral temp dir (`/tmp` on POSIX, `%TEMP%` on Windows — resolved via Python's `tempfile.gettempdir()`) — the project CLAUDE.md is not auto-discovered.
 3. For each user turn the Python script writes a single `{"type":"user","message":{...}}` JSON line to stdin, parses events from stdout, streams `text_delta` events to the user in real time (lower TTFT), and completes on the `result` event.
 4. The subprocess stays alive for the whole conversation — NO re-spawn per turn, NO permission prompt, NO body re-read.
 

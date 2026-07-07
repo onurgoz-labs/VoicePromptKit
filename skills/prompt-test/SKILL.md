@@ -1,6 +1,6 @@
 ---
 name: prompt-test
-description: Runs the test anchors stored in a prompt's `<prompt>.anchors.yaml` sidecar (or its frontmatter, legacy) as regression scenarios and reports pass/fail per anchor. Use when the user runs /prompt-test, asks to "test the prompt against saved scenarios", "run anchor regression", or wants to verify that a prompt edit hasn't broken expected behaviour. Reuses the drift-runner subagent in regression_only mode — no scenario generation, no LLM analysis, just anchors → assistant turns → assertions.
+description: Runs the test anchors in a prompt's `<prompt>.anchors.yaml` sidecar as regression scenarios and reports pass/fail per anchor. Use when the user runs /prompt-test, asks to "run anchor regression", or "test the prompt against saved scenarios".
 ---
 
 # prompt-test

@@ -1,5 +1,5 @@
 ---
-description: Audit a prompt file interactively. Asks which lenses to apply, runs them in parallel, presents a summary, and lets you decide per-finding what to do (apply / overlay / dismiss / discuss). All decisions are logged to decisions.jsonl. The original prompt file is only modified when you explicitly choose "düzelt" on an apply-eligible finding (non-TR, or TR number_readability / punctuation).
+description: Entry point for the prompt-check skill — interactively audit a prompt file across six lenses (conflict, dominance, gap, drift, schema, Turkish phonetic) and decide per-finding what to do.
 argument-hint: <prompt-path>
 allowed-tools: Skill, Read, Write, Bash, Agent, AskUserQuestion
 ---

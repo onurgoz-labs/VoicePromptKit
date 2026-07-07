@@ -18,11 +18,42 @@ Cross-lens content every lens depends on:
 
 - Output invariant (every finding needs `suggested_fix`)
 - `fix_strategy` — substring vs structural
-- Rule extraction schema (used in Phase 3 of the skill)
 - Severity heuristics across lenses
 - Compact mode policy table (per-lens trim rules)
 - Section reference (`section_ref` field, lookup conventions, rendering rules)
-- Render contract (markdown table format, language switching, sort order)
+- Compact writing invariant (≤ 200 chars rationale, ≤ 150 chars fix)
+- Language switching — canonical TR/EN example pair
+
+The render contract (markdown table format, sort order) lives in SKILL.md Phase 7, with the `TEMPLATE_STRINGS` column translations in `references/render.md` — runners emit JSON, never tables, so it is not in `_shared.md`.
+
+## Rule extraction
+
+Used in Phase 3 of the skill (the skill's main context extracts rules; lens runners receive `rules.json` pre-built and never re-extract).
+
+You analyse the body text and extract every rule, instruction, constraint, or directive into a flat list of atomic rules.
+
+- One rule = one atomic obligation. Split compound sentences: "be polite and concise" → two rules.
+- Preserve absolute claims verbatim: "always", "never", "only", "must", "ignore".
+- `line` = lowest line number in `body.txt` where the rule begins.
+- `id` is `R1, R2, R3 …` in source order.
+- `category`:
+  - **behavior** — what the model should do (actions, workflow, decisions).
+  - **format** — how output is shaped (length, structure, JSON, markdown).
+  - **tone** — register, friendliness, formality.
+  - **policy** — refusal rules, safety, legal, scope.
+  - **persona** — who the model is, role, identity.
+- If the prompt contains examples, extract the rule the example illustrates, not the example itself.
+- If a section is unstructured prose, still split into atomic obligations.
+
+Schema:
+
+```json
+{
+  "rules": [
+    { "id": "R1", "category": "behavior|format|tone|policy|persona", "text": "<atomic, paraphrased to one sentence>", "line": 12, "source_excerpt": "<exact line or sub-clause that produced this rule, ≤ 200 chars>" }
+  ]
+}
+```
 
 ## What's in each lens slice
 
