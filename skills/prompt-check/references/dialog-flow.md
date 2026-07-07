@@ -6,7 +6,7 @@ This file defines templates, grammar, and routing rules only. It does NOT define
 
 ## 1 — Lens selection (Phase 9 entry)
 
-Before running any analysis, ask the user which lenses to apply. Use `AskUserQuestion` with `multiSelect: true`. Default to all five selected — the user can deselect.
+Before running any analysis, ask the user which lenses to apply. Use `AskUserQuestion` with `multiSelect: true`. The FIRST option is the fast-path preset; the six lens options follow, all pre-selected by default — the user can deselect.
 
 **Primary question:**
 
@@ -15,6 +15,7 @@ question: "Which lenses do you want to run on this prompt?"
 header:   "Lenses"
 multiSelect: true
 options:
+  - label: "Varsayılanlarla çalıştır"  description: "<preset lens list> (<last run | repo defaults>) — run now"
   - label: "conflict"     description: "Rules that contradict each other under realistic inputs"
   - label: "dominance"    description: "Silent overrides — one rule swallows another (position/length/recency/role)"
   - label: "gap"          description: "Undefined edge cases and ambiguous terms"
@@ -22,6 +23,17 @@ options:
   - label: "tr_phonetic"  description: "Turkish phonetic readability — voice/TTS only"
   - label: "schema"       description: "section numbering / ordering / heading consistency"
 ```
+
+**Fast-path preset (`Varsayılanlarla çalıştır` / `Defaults — run now`).** The
+description lists the preset's lenses and names its source: the per-prompt
+`last_lens_selection.json` persisted by the previous run ("last run") when it
+exists, otherwise repo defaults from `.voicepromptkit.json` + resolved
+frontmatter ("repo defaults"). Selecting this option adopts the preset verbatim
+(`selected_lenses`, `expand_count`, `tr_phonetic_enabled`; `drift_reuse: false`),
+ignores any other lenses checked in the same submission, and skips ALL
+follow-up questions below (expand_count, TR confirmation, drift cache, anchors
+advisory) — one click and the audit runs. Checking individual lenses instead
+follows the normal flow.
 
 The `schema` lens auto-skips on prompts with no numbered section headings (flat
 instruction sets). If you select it and the prompt is flat, the Phase 8
@@ -109,7 +121,7 @@ Hangilerini ne yapayım? Örnek:
   C1, C3 düzelt; G2 yorum bırak; T1..T5 konuşalım; gerisini atla
 
 Verbs: düzelt | yorum bırak | atla | konuşalım  (alias: apply | overlay | dismiss | discuss)
-Special: gerisini atla | gerisini yorum | hepsini düzelt | hepsini yorum bırak | hepsini atla | iptal
+Special: gerisini atla | gerisini yorum | hepsini düzelt | hepsini yorum bırak | hepsini atla | düşük atla | güvenli düzelt | iptal
 ```
 
 The summary table matches `report.md` exactly — same columns, same row format, same translations per `report_language`. Findings are full-text (no truncation); runners self-cap at ≤200 chars rationale / ≤150 chars fix. The decision prompt that follows references findings by id only: `C1, C3 düzelt; G2 yorum bırak; drift-S1..drift-S7 atla; gerisini atla`.
@@ -158,7 +170,18 @@ Verb tokens are language-agnostic — both TR and EN synonyms parse identically 
 | `hepsini yorum bırak` / `tümü overlay` / `all overlay` / `comment all` | Every finding → `overlay`, overriding any earlier per-id decision |
 | `hepsini atla` / `tümü atla` / `all skip` / `skip all` / `dismiss all` | Every finding → `dismissed`, overriding any earlier per-id decision |
 | `hepsini konuşalım` / `tümünü konuşalım` / `discuss all` | Every finding → `discussed` (rare; mainly for edge cases) |
+| `düşük atla` / `low skip` | All findings still `pending` with `severity == "low"` → `dismissed` |
+| `güvenli düzelt` / `safe apply` | All findings still `pending` with `fix_kind == "replace"` (concrete replace suggestion) → `applied` |
 | `iptal` / `cancel` | Abort; leave every finding at `pending`; do not run Phase 10 |
+
+**Filtered wildcards (`düşük` / `low`, `güvenli` / `safe`).** These are id-list
+filters over the still-pending findings, usable with any verb (`düşük atla` and
+`güvenli düzelt` are the canonical pairs; `düşük yorum bırak` is equally valid).
+They compose with the normal left-to-right evaluation exactly like `gerisini`:
+ids already decided earlier in the same string are untouched, and later
+segments (including `hepsini X`) can still override them. `güvenli` means "the
+fix is a concrete replacement" (`fix_kind: "replace"`) — TR advisory findings
+are never in the decision set, so the auto-file rule (§4) is unaffected.
 
 **`gerisini X` vs `hepsini X`.** `gerisini X` applies the verb only to findings the user did NOT explicitly mention earlier in the decision string. `hepsini X` applies the verb to ALL findings, overriding any earlier per-id decision. Concretely, in `C1 yorum bırak; hepsini düzelt`, C1 ends up as `applied` (the `hepsini` clause overrides the earlier `yorum bırak` for C1). If the user wants to preserve earlier decisions, they should use `gerisini düzelt` instead.
 
@@ -170,6 +193,7 @@ Verb tokens are language-agnostic — both TR and EN synonyms parse identically 
 | comma-list | `C1, C3, C7` | three findings |
 | range | `T1..T5` | inclusive range across same lens prefix (T1, T2, T3, T4, T5) |
 | wildcard | `gerisini` (rest) | every finding still `pending` at the moment this segment is evaluated |
+| filtered wildcard | `düşük` / `low`, `güvenli` / `safe` | pending findings matching the filter (severity low / `fix_kind: "replace"`) at the moment this segment is evaluated |
 | wildcard-all | `hepsini` / `tümü` / `tümünü` / `all` | every finding regardless of earlier decisions (overrides per-id decisions in the same string) |
 
 ### 3.2 — Segment grammar

@@ -1,6 +1,6 @@
 ---
 name: prompt-check
-description: Audit a prompt file (system prompt, agent definition, voice script, chained workflow) across six lenses — conflict, dominance, gap, drift, schema — plus an optional Turkish phonetic lens for voice agents. Use when the user invokes /prompt-check, asks to "audit a prompt", "check this prompt for contradictions / silent overrides / gaps / drift / voice readability", or passes a path to a prompt file for review. On first run in a repo, walks the user through a 7-question wizard and saves repo defaults to `.voicepromptkit.json`. Produces line-anchored findings as `report.md` + `findings.json` in an isolated run directory. Only modifies the original prompt file when you explicitly apply a fix in the interactive review.
+description: Audit a prompt file across six lenses (conflict, dominance, gap, drift, schema, Turkish phonetic). Use when the user invokes /prompt-check, asks to "audit a prompt", or to "check this prompt for contradictions/gaps/drift".
 ---
 
 # prompt-check
@@ -15,8 +15,9 @@ You audit a prompt file at the path supplied as `$1`. Read the prompt once, then
 - `references/probes.md` — adversarial probe templates; read by `drift-runner`.
 - `references/dialog-flow.md` — interactive templates, free-form decision grammar, lens-selection question shape, and the "konuşalım" sub-flow. Read by Phase 9 and Phase 10.
 - `references/overlay-format.md` — `inline-suggestions.md` layout, `decisions.jsonl` shape, and Phase 10 ordering rules. Read by Phase 10.
+- `references/render.md` — the bilingual `TEMPLATE_STRINGS` dictionary and the Python table-render helpers. Read by Phase 7 (and reused by Phase 9.2).
 
-The skill itself does not need to read the three lens reference files (`lens-rules.md`, `tr-phonetic.md`, `probes.md`) — it only passes their paths to the matching subagent. The two interactive references (`dialog-flow.md`, `overlay-format.md`) ARE read by the skill itself in Phase 9 and Phase 10.
+The skill itself does not need to read the three lens reference files (`lens-rules.md`, `tr-phonetic.md`, `probes.md`) — it only passes their paths to the matching subagent. The three skill-side references (`dialog-flow.md`, `overlay-format.md`, `render.md`) ARE read by the skill itself in Phases 7, 9, and 10.
 
 ## Phase 0 — Project config (wizard on first run)
 
@@ -88,6 +89,11 @@ Confirm to the user: `Saved repo defaults to <relative path>. Edit it any time o
 Run this Bash block once. It computes `$RUN_DIR`; the `latest` pointer is updated later, on success (Phase 8). Echo `$RUN_DIR` so later steps reference the same path.
 
 ```bash
+if [ ! -f "$1" ]; then
+  echo "error: Prompt file not found: $1"
+  echo "Check the path (relative paths resolve against the current working directory) and re-run /prompt-check with a valid file."
+  exit 1
+fi
 ABS_PROMPT=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 BASENAME=$(basename "$1" | sed 's/\.[^.]*$//')
 PROMPT_DIR=".voicepromptkit/$BASENAME"
@@ -115,15 +121,19 @@ fi
 
 # Timing instrumentation — env-gated, zero overhead when off.
 # When VOICEPROMPTKIT_TIMING=true, every phase boundary appends a
-# millisecond-precision line to $RUN_DIR/timing.log.
+# millisecond-precision line to $RUN_DIR/timing.log via log_t.
+# log_t is THE timing helper for every `log_t "<label>"` call in this skill.
+# If a later Bash call runs in a fresh shell where log_t is undefined,
+# re-paste these two one-line definitions (and TIMING_LOG) first — the log
+# format/labels must stay exactly as written at each call site.
+date_ms() { python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N; }
+log_t() { { [ "$VOICEPROMPTKIT_TIMING" = "true" ] && [ -n "$TIMING_LOG" ] && echo "[$(date_ms)] $1" >> "$TIMING_LOG"; } || true; }
 if [ "$VOICEPROMPTKIT_TIMING" = "true" ]; then
   TIMING_LOG="$RUN_DIR/timing.log"
   : > "$TIMING_LOG"
-  date_ms() { python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N; }
-  log_t() { [ -n "$TIMING_LOG" ] && echo "[$(date_ms)] $1" >> "$TIMING_LOG"; }
-  log_t "phase_1_end (run-dir allocated: $RUN_DIR)"
   export TIMING_LOG
 fi
+log_t "phase_1_end (run-dir allocated: $RUN_DIR)"
 
 # Bootstrap interactive state placeholders so Phase 9/10 can append without
 # checking existence. These start empty; Phase 9 writes the real session.json
@@ -136,6 +146,8 @@ echo "RUN_DIR=$RUN_DIR"
 echo "RUN_NAME=$RUN_NAME"
 echo "ABS_PROMPT=$ABS_PROMPT"
 ```
+
+If the block prints `error: Prompt file not found`, surface that message to the user verbatim and STOP — do not continue to Phase 2.
 
 **Invariants for the entire run:**
 - All artefacts go under `$RUN_DIR/`. Never `.voicepromptkit/.tmp/`.
@@ -154,12 +166,19 @@ Extract YAML frontmatter and merge it against env vars + project config + built-
 4. Built-in defaults
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_2_start" >> "$TIMING_LOG"
+log_t "phase_2_start"
 PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
 "$PYTHON_CLI" - "$ABS_PROMPT" "$RUN_DIR" "$CONFIG_PATH" "$REPO_ROOT" <<'PY'
 import sys, re, json, os, hashlib, subprocess
 prompt_path, run_dir, config_path, repo_root = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-text = open(prompt_path, encoding='utf-8').read()
+try:
+    text = open(prompt_path, encoding='utf-8').read()
+except FileNotFoundError:
+    print(f"error: Prompt file not found: {prompt_path}", file=sys.stderr)
+    sys.exit(1)
+except UnicodeDecodeError as e:
+    print(f"error: {prompt_path} is not valid UTF-8 ({e}). Re-encode it as UTF-8 (e.g. `iconv -f <charset> -t utf-8`) and re-run /prompt-check.", file=sys.stderr)
+    sys.exit(1)
 
 # D1: snapshot the prompt content hash for stale-audit detection in Phase 10's
 # applied step (SHA mismatch → auto-route applied decisions to overlay).
@@ -212,10 +231,8 @@ resolved['target_model'] = (
     or 'claude-opus-4-7'
 )
 
-# v0.5.2: judge_model is the smaller / cheaper model used by drift-runner for
-# rubric evaluation (Step 3). target_model still drives simulation (Step 2).
-# Default Haiku — yes/no rubric judgement is well within Haiku's capability,
-# while Opus per-token cost on Step 3 was the largest single drift-runner expense.
+# v0.5.2: judge_model — cheaper model for drift-runner rubric judging (Step 3);
+# target_model still drives simulation (Step 2). Default Haiku for cost.
 resolved['judge_model'] = (
     fm.get('judge_model')
     or env('VOICEPROMPTKIT_JUDGE_MODEL')
@@ -223,15 +240,9 @@ resolved['judge_model'] = (
     or 'claude-haiku-4-5-20251001'
 )
 
-# v0.5.3: worker_model is the infrastructure model for non-target subagent
-# calls — static lens pair comparison (conflict/dominance/gap/schema),
-# tr-phonetic pattern matching, drift scenario generation (Step 1). These
-# are structured tasks where frontier-model quality is overkill. Defaults
-# to Haiku — combined with judge_model swap (v0.5.2), this drops a typical
-# audit from ~500k Opus tokens to ~200k Haiku + ~50k Opus.
-#
-# target_model semantics narrows in v0.5.3: it ONLY drives drift Step 2
-# simulation and chat-simulator persona. Everything else uses worker_model.
+# v0.5.3: worker_model — infrastructure model for all non-target subagent calls
+# (static lenses, tr-phonetic, drift Step 1); default Haiku. target_model ONLY
+# drives drift Step 2 simulation + chat-simulator persona.
 resolved['worker_model'] = (
     fm.get('worker_model')
     or env('VOICEPROMPTKIT_WORKER_MODEL')
@@ -239,10 +250,8 @@ resolved['worker_model'] = (
     or 'claude-haiku-4-5-20251001'
 )
 
-# v0.5.3: model alias normalisation. The Claude Code Agent tool's `model`
-# parameter accepts only the short aliases sonnet / opus / haiku — not the
-# full versioned IDs that authors typically write in frontmatter. Map the
-# resolved values so dispatch can pass either form through.
+# Model alias normalisation: the Agent tool's `model` parameter accepts only
+# sonnet / opus / haiku, not full versioned IDs — map both forms through.
 def _model_alias(full_or_alias):
     if not full_or_alias:
         return None
@@ -282,10 +291,8 @@ if ec is None:
             ec = 3
 resolved['expand_count'] = int(ec)
 
-# v0.5.1: read anchors from sidecar file (<prompt>.anchors.yaml), falling back to
-# frontmatter.anchors[] with a deprecation warning. The helper at bin/read-anchors.py
-# also validates schema_version, expands silence_input sugar, and drops invalid
-# flow anchors per turn-alternation rules.
+# v0.5.1: anchors come from the <prompt>.anchors.yaml sidecar via bin/read-anchors.py
+# (validates schema, expands sugar); frontmatter.anchors[] is the deprecated fallback.
 _anchors_warnings = []
 try:
     _reader_result = subprocess.run(
@@ -368,11 +375,8 @@ else:
     # silent default-fallback when nothing was set at all.
     _rlang_unknown = rlang if rlang is not None else None
 
-# v0.10.0: execution backend for the lens runners (Phase 4/5/6).
-#   'claude' (default) → dispatch runners via Claude Code's Agent tool.
-#   'codex'            → dispatch runners via OpenAI's Codex CLI
-#                        (`codex exec`) through bin/codex-lens.py.
-# Standard override hierarchy: frontmatter > env > project config > default.
+# v0.10.0: lens-runner backend — 'claude' (Agent tool, default) or 'codex'
+# (Codex CLI via bin/codex-lens.py). Hierarchy: fm > env > config > default.
 be = fm.get('backend')
 if be is None:
     be = env('VOICEPROMPTKIT_BACKEND') or project.get('backend')
@@ -434,15 +438,17 @@ with open(os.path.join(run_dir, 'frontmatter.json'), 'w', encoding='utf-8') as f
 with open(os.path.join(run_dir, 'body.txt'), 'w', encoding='utf-8') as f:
     f.write(body)
 PY
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_2_end" >> "$TIMING_LOG"
+log_t "phase_2_end"
 ```
+
+If the Python block exits non-zero with an `error: Prompt file not found` or `error: ... is not valid UTF-8` message, surface that message to the user verbatim and STOP — do not continue with a raw traceback or a partial run.
 
 If no Python interpreter (`python3` / `python` / `py`) is available, fall back to reading the file yourself, splitting on the first two `---` lines, and applying the same merge logic by reasoning. State the fallback in the terminal summary.
 
 ## Phase 3 — Rule extraction (inline) + section_index build
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_3_start" >> "$TIMING_LOG"
+log_t "phase_3_start"
 ```
 
 **Phase 3 also produces `section_index.json` — a deterministic line-to-section map.**
@@ -556,13 +562,13 @@ Hold the rules in memory as JSON. Also write `$RUN_DIR/rules.json` with shape:
 If you extract zero rules, abort with an error written to `$RUN_DIR/error.txt` and surface that to the user.
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_3_end" >> "$TIMING_LOG"
+log_t "phase_3_end"
 ```
 
 ## Phase 3.5 — Lens-selection wizard (per-run)
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_3_5_start" >> "$TIMING_LOG"
+log_t "phase_3_5_start"
 ```
 
 This wizard runs **once per `/prompt-check` invocation**, after rule extraction and before lens dispatch. It is separate from the Phase 0 repo-level wizard (which governs `.voicepromptkit.json` defaults). Phase 3.5 captures per-run intent.
@@ -592,14 +598,42 @@ explicit error: "Phase 3.5 requires AskUserQuestion. Re-invoke
 /prompt-check from an interactive Claude Code session." Do not proceed
 with silent defaults.
 
+**Fast-path preset (compute before building the question).** Load the last
+per-run lens selection persisted for this prompt, if any:
+
+```bash
+LAST_SELECTION_PATH="$PROMPT_DIR/last_lens_selection.json"
+if [ -f "$LAST_SELECTION_PATH" ]; then cat "$LAST_SELECTION_PATH"; else echo "LAST_SELECTION=none"; fi
+```
+
+The preset is, in priority order: (1) the contents of
+`last_lens_selection.json` (written at the end of the previous Phase 3.5 for
+this prompt — "last run"); (2) repo defaults derived from `.voicepromptkit.json`
++ resolved frontmatter (all six lenses, `tr_phonetic` per the Phase 2 value,
+`expand_count` from `frontmatter.expand_count` — "repo defaults").
+
 The AskUserQuestion shape:
 - Question text: "Bu prompt için hangi mercekleri çalıştırayım?" (when
   `report_language == "tr"`) or "Which lenses should I run for this prompt?"
   (when `report_language == "en"`)
 - `multiSelect: true`
-- Options: the six lenses (conflict, dominance, gap, drift, tr_phonetic, schema)
-- Each option's selected state seeds from `.voicepromptkit.json` /
-  user_intent computed defaults.
+- Options: the fast-path preset option FIRST, then the six lenses
+  (conflict, dominance, gap, drift, tr_phonetic, schema)
+- Each lens option's selected state seeds from the fast-path preset (last
+  run if persisted, else `.voicepromptkit.json` / user_intent computed
+  defaults).
+
+**Fast path — first option, one click for returning users.** The FIRST option
+is a preset: label `Varsayılanlarla çalıştır` (TR) / `Defaults — run now` (EN),
+description listing the preset's lenses and naming the source, e.g.
+`conflict, dominance, gap, drift, schema (repo defaults) — run now` or
+`conflict, gap, tr_phonetic (last run) — run now`. If the user selects this
+option, adopt the preset verbatim — `selected_lenses`, `expand_count`, and
+`tr_phonetic_enabled` from the preset, `drift_reuse: false` — IGNORE any other
+lenses checked in the same submission, and SKIP follow-ups 2–4 entirely. The
+mandatory widget still fired; the fast path just collapses the 1–4 questions
+into one click. If the user instead checks individual lenses, the normal flow
+below (including follow-ups) applies.
 
 After the user submits, IF `expand_count` needs adjusting (drift selected)
 or anchors discussion is warranted, emit a SECOND AskUserQuestion or a
@@ -612,6 +646,7 @@ Ask the user via `AskUserQuestion`:
 
    ```
    options: [
+     { label: "Varsayılanlarla çalıştır", description: "<preset lens list> (<last run | repo defaults>) — run now" },
      { label: "conflict",     description: "logical contradictions" },
      { label: "dominance",    description: "silent overrides" },
      { label: "gap",          description: "undefined cases / ambiguous terms" },
@@ -650,6 +685,14 @@ Persist the answer in memory as `user_intent`:
 
 **Persist `user_intent.json` to disk** at the end of Phase 3.5, before Phase 3.6 runs. Phase 3.6 reads the file to hash the runtime selection into the cache key; Phase 9 reads it again when bootstrapping `session.json`. One write, two readers.
 
+**Persist the selection for re-audits.** In the same step (fast path or manual — both), write `$PROMPT_DIR/last_lens_selection.json` (atomic: write `.last_lens_selection.json.tmp` then `mv`) with:
+
+```json
+{ "selected_lenses": ["..."], "expand_count": 3, "tr_phonetic_enabled": true, "saved_at": "<ISO 8601 UTC>" }
+```
+
+This file is per-prompt run metadata (it sits next to `latest.txt`, one level above the `run-NNN` dirs) and only seeds the NEXT run's fast-path option. It is NOT part of the Phase 3.6 cache key — the per-run `user_intent.json` remains the deterministic cache input.
+
 After collecting all wizard answers, write the in-memory `user_intent` block to `$RUN_DIR/user_intent.json` using the Write tool (or a heredoc'd JSON). The file is pretty-printed (2-space indent), atomic write (write to `.user_intent.json.tmp` then `mv`). The skill MUST produce the file before Phase 3.6's Python block runs — Phase 3.6 reads it for cache-key composition. If the file is missing at Phase 3.6 entry, Phase 3.6 substitutes an empty `user_intent_keys` set into the cache key (degraded mode — cache effectively disabled for this run; subsequent runs that DO write the file get full cache benefits).
 
 `tr_phonetic_enabled` is the **runtime authoritative** value for whether to run the TR phonetic lens this pass — computed as `("tr_phonetic" in selected_lenses)` after the wizard answers + Phase 3.5 confirmation. Frontmatter's `tr_phonetic` is only the **default** that pre-selects the checkbox; once the user has answered, `user_intent.tr_phonetic_enabled` overrides it for this run.
@@ -662,10 +705,10 @@ Phase 9 writes this `user_intent` block into `session.json` at interactive entry
 - Phase 6 (TR phonetic): gate on `user_intent.tr_phonetic_enabled == true` — NOT on `frontmatter.tr_phonetic`. The user's runtime selection is authoritative. If false, skip Phase 6 entirely — no `tr_phonetic.json` is written, and Phase 7 treats missing files as "lens disabled".
 - **Schema is integrated into `static-lens-runner`** — there is no new subagent. If `schema` is unselected, the runner writes a skipped placeholder (`{"findings": [], "applicable": null, "skipped": true, "reason": "lens not selected in per-run wizard"}`) to `$RUN_DIR/schema.json`. If the prompt has no numbered section headings, the runner writes `{"findings": [], "applicable": false, "reason": "no numbered section headings detected"}` — auto-skip is the runner's decision, not the skill's.
 
-Phase 7 already handles missing per-lens JSON files as "lens disabled" — no change there.
+Phase 7 handles a missing per-lens JSON file as "lens disabled" ONLY for lenses that were deselected or gate-skipped. A SELECTED lens with no output file is a runner failure — Phase 7's missing-artifact check catches it and surfaces a WARNING (see Phase 7).
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_3_5_end" >> "$TIMING_LOG"
+log_t "phase_3_5_end"
 ```
 
 ## Phase 3.6 — Cache key compute (skip when bodies + config + refs are unchanged)
@@ -677,7 +720,7 @@ Same prompt body + same wizard config + same reference docs ⇒ same lens output
 **Cache directory:** `.voicepromptkit/_cache/<cache_key>/{lens}.json`. Repo-scoped (under `$REPO_ROOT`), not run-scoped. Run dirs (`run-NNN`) keep their full artefacts — cache hits copy from `_cache/` into `$RUN_DIR/` so the run dir remains self-contained.
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_3_6_start" >> "$TIMING_LOG"
+log_t "phase_3_6_start"
 
 CACHE_ROOT="$REPO_ROOT/.voicepromptkit/_cache"
 mkdir -p "$CACHE_ROOT"
@@ -775,7 +818,7 @@ PY
 # Source the printed CACHE_KEY / CACHE_DIR for use in Phase 4 / 5 / 6 / 8.
 eval $("$PYTHON_CLI" -c "import json,os; m=json.load(open('$RUN_DIR/cache_meta.json'));print(f\"CACHE_KEY={m['cache_key']}\\nCACHE_DIR={m['cache_dir']}\")")
 
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_3_6_end (cache_key=$CACHE_KEY)" >> "$TIMING_LOG"
+log_t "phase_3_6_end (cache_key=$CACHE_KEY)"
 ```
 
 **Persistence contract:** before Phase 3.6 runs, the skill writes `user_intent.json` to `$RUN_DIR` (the in-memory `user_intent` block from Phase 3.5). This file is the deterministic input to the user_intent portion of the cache key. The same file is read by Phase 9 when it bootstraps `session.json`, so the write is reused — no extra IO.
@@ -893,8 +936,8 @@ dispatch list and runs normally. Cache hits also apply to `tr_phonetic` (when
 the lens is selected via `user_intent.tr_phonetic_enabled == true`).
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_4_dispatch_start" >> "$TIMING_LOG"
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_6_dispatch_start" >> "$TIMING_LOG"
+log_t "phase_4_dispatch_start"
+log_t "phase_6_dispatch_start"
 
 # Cache lookup: for each selected static lens, copy cached artefact into $RUN_DIR if present.
 # CACHE_DIR is exported by Phase 3.6. SELECTED_LENSES comes from user_intent.selected_lenses.
@@ -913,9 +956,9 @@ for lens_file in conflicts dominances gaps schema tr_phonetic; do
     # Validate JSON before trusting the cache entry.
     if "$PYTHON_CLI" -c "import json; json.load(open('$CACHE_DIR/$lens_file.json'))" 2>/dev/null; then
       cp "$CACHE_DIR/$lens_file.json" "$RUN_DIR/$lens_file.json"
-      [ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] cache_hit: $lens_file" >> "$TIMING_LOG"
+      log_t "cache_hit: $lens_file"
     else
-      [ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] cache_corrupt: $lens_file (will re-dispatch)" >> "$TIMING_LOG"
+      log_t "cache_corrupt: $lens_file (will re-dispatch)"
     fi
   fi
 done
@@ -935,6 +978,14 @@ If every selected lens hits the cache, NO Agent calls are dispatched — Phase
 Detection criteria for the four static lenses (conflict, dominance, gap, schema) live in `references/lens-rules.md` — `static-lens-runner` reads that document. The TR phonetic criteria live in `references/tr-phonetic.md` — `tr-phonetic-runner` reads that document. The skill itself does no lens analysis.
 
 **Line-number contract:** every `line` field each subagent writes is a body.txt index (1-indexed, blank lines included). Phase 7 is the single place that translates these to original-file line numbers.
+
+**Progress line (print immediately before emitting the Agent calls).** Set the user's wall-clock expectation with ONE conversational line, where `<N>` is the number of lenses actually about to run (selected, minus cache hits and placeholders; count drift when its gate will pass):
+
+- `backend == "claude"`: `Running <N> lenses in parallel — this can take a few minutes.` (TR: `<N> mercek paralel çalışıyor — bu birkaç dakika sürebilir.`)
+- `backend == "codex"`: `Running <N> lenses sequentially via Codex — this can take several minutes.` (TR: `<N> mercek Codex üzerinden sırayla çalışıyor — bu birkaç dakika sürebilir.`)
+- `N == 0` (every selected lens hit the cache): `All selected lenses served from cache — skipping dispatch.` (TR: `Seçilen tüm mercekler önbellekten geldi — çalıştırma atlandı.`)
+
+If runner completions naturally surface as they land (background Agent notifications), you may echo a one-line tick per lens (`✓ conflict done`); otherwise the pre-dispatch line alone is sufficient.
 
 **Dispatch shape — emit all five Agent calls in ONE turn:**
 
@@ -1067,7 +1118,7 @@ If ALL four static lenses are deselected, no static-lens-runner dispatches happe
 `static-lens-runner` writes `$RUN_DIR/conflicts.json`, `$RUN_DIR/dominances.json`, `$RUN_DIR/gaps.json`, or `$RUN_DIR/schema.json` depending on which singleton call dispatched it. `tr-phonetic-runner` writes `$RUN_DIR/tr_phonetic.json`. The skill reads them in Phase 7 after awaiting ALL pending dispatches (the five lens runs plus drift, if drift was triggered).
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_4_dispatch_end" >> "$TIMING_LOG"
+log_t "phase_4_dispatch_end"
 ```
 
 ## Phase 5 — Drift (conditional)
@@ -1088,7 +1139,7 @@ Write `$RUN_DIR/drift.json` with `skipped_reason: "no anchors, conflicts, or rol
 In either skip case the file shape is `{"scenarios": [], "runs": [], "verdicts": [], "skipped_reason": "..."}`. Move on to Phase 6.
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_5_skip" >> "$TIMING_LOG"
+log_t "phase_5_skip"
 ```
 
 **Drift cache opt-in (Phase 3.6 cache key).** Drift output depends on LLM
@@ -1103,7 +1154,7 @@ if grep -q '"drift_reuse": *true' "$RUN_DIR/user_intent.json" 2>/dev/null \
    && [ -f "$CACHE_DIR/drift.json" ] \
    && "$PYTHON_CLI" -c "import json; json.load(open('$CACHE_DIR/drift.json'))" 2>/dev/null; then
   cp "$CACHE_DIR/drift.json" "$RUN_DIR/drift.json"
-  [ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] cache_hit: drift (opt-in)" >> "$TIMING_LOG"
+  log_t "cache_hit: drift (opt-in)"
   # Skip the drift-runner dispatch below.
 fi
 ```
@@ -1114,7 +1165,7 @@ call. Otherwise dispatch as documented below.
 Otherwise dispatch the `drift-runner` subagent (it is the only subagent this skill uses). Pass inputs and the output path as **separate** top-level fields so the subagent does not accidentally read its own future output:
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_5_start" >> "$TIMING_LOG"
+log_t "phase_5_start"
 ```
 
 ```
@@ -1157,7 +1208,7 @@ Populate `expand_count_override` with `user_intent.expand_count` from Phase 3.5 
 `drift-runner` generates scenarios, simulates the model on each, judges outputs, and writes `$RUN_DIR/drift.json` with shape `{scenarios, runs, verdicts}`. The skill never decomposes drift inline because it is the only step whose token cost scales with prompt length.
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_5_end" >> "$TIMING_LOG"
+log_t "phase_5_end"
 ```
 
 ## Phase 6 — Turkish phonetic lens (conditional — dispatched in the same turn as Phase 4)
@@ -1167,7 +1218,7 @@ Populate `expand_count_override` with `user_intent.expand_count` from Phase 3.5 
 **Dispatch ordering:** Phase 6's `tr-phonetic-runner` call is the FIFTH parallel Agent call emitted in the same assistant turn as the four Phase 4 static lens dispatches (see "Phases 4 + 6 — Parallel lens dispatch" above). The Phase 6 detail below documents the per-runner contract; the dispatch shape (along with `isolation: "worktree"`) is part of the combined Phase 4+6 fan-out.
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_6_skip" >> "$TIMING_LOG"
+log_t "phase_6_skip"
 ```
 
 When the gate passes, `tr-phonetic-runner` seeds `pronunciation_map` from any existing pronunciation guide block in the body, scans for new findings, dedupes against the seed, and writes a single `$RUN_DIR/tr_phonetic.json`. Every rule (skip rules, whitelist, strategy semantics, the "no semantic translation" hard rule, the three `fix_kind` values, the seed block formats and line-range tracking) lives in `references/tr-phonetic.md` — the subagent reads that document; the skill does not repeat the criteria here.
@@ -1213,16 +1264,30 @@ TR phonetic is already line-level / cheap; `compact_mode` has no effect on its a
 `tr-phonetic-runner` writes `$RUN_DIR/tr_phonetic.json` with shape `{ findings[], seed_entries[], warnings[] }`. The skill reads it in Phase 7.
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_6_dispatch_end" >> "$TIMING_LOG"
+log_t "phase_6_dispatch_end"
 ```
 
 ## Phase 7 — Render outputs
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_7_start" >> "$TIMING_LOG"
+log_t "phase_7_start"
 ```
 
 **Await all pending dispatches first.** Before reading any per-lens output, block until ALL in-flight Agent calls have returned: the four Phase 4 static-lens-runner singletons (conflict / dominance / gap / schema), the Phase 6 tr-phonetic-runner (if its gate passed), and the Phase 5 drift-runner (if its gate passed). Phase 7 is the synchronisation barrier — do not start reading per-lens JSONs until every dispatched runner has signalled completion (its output file is written).
+
+**Missing-artifact check (mandatory, right after the await).** A crashed runner leaves no output file; treating that as "lens disabled" would silently shrink the report. Diff the SELECTED lenses against the artefacts that actually landed:
+
+```bash
+MISSING_LENSES=""
+for pair in conflict:conflicts dominance:dominances gap:gaps schema:schema tr_phonetic:tr_phonetic drift:drift; do
+  lens="${pair%%:*}"; file="${pair##*:}"
+  grep -q "\"$lens\"" "$RUN_DIR/user_intent.json" 2>/dev/null || continue
+  [ -f "$RUN_DIR/$file.json" ] || MISSING_LENSES="$MISSING_LENSES $lens"
+done
+echo "MISSING_LENSES=${MISSING_LENSES:-none}"
+```
+
+A selected lens with no output file and no `skipped: true` placeholder is a **runner failure**, not a disabled lens. For each missing lens: (1) continue the merge without it so the run still completes; (2) prepend one line `WARNING: <lens> produced no output — re-run to cover it` to the top of `report.md` (above the summary table) and append the same string to `findings.json`'s top-level `warnings[]`; (3) repeat the same WARNING line in the Phase 8 terminal summary. Missing files for deselected or gate-skipped lenses stay normal — placeholders and skip gates already cover those, and the loop above only inspects selected lenses.
 
 Read every artefact that landed in `$RUN_DIR/` so far: `frontmatter.json`, `rules.json`, `conflicts.json`, `dominances.json`, `gaps.json`, `schema.json`, `drift.json`, and (if the TR gate ran) `tr_phonetic.json`. Build a single merged `findings.json` and a human-readable `report.md`. Both are line-anchored.
 
@@ -1264,116 +1329,7 @@ Apply this to every `findings[].line` and `findings[].related_lines[]`. After tr
 
 For backward compatibility: if `section_index.json` does not exist (older run dirs from before this feature), set `section_ref: null` for every finding without crashing. The renderer below also falls back to bare line markers when `section_ref` is null.
 
-**Language switching (mandatory):** Load `frontmatter.report_language` (`tr` or `en`; default `tr` — Phase 2 already normalised it). Use this as the key into `TEMPLATE_STRINGS` (defined below). Apply throughout the report.md render: title, top metadata labels, summary heading + column headers + lens row labels, findings heading, findings-table column headers, section/line cell prefixes, per-row lens + severity labels, drift `— / —` no-line marker, drift `passed — no fix` cell, and TODO / Intentional sentinel cell replacements.
-
-```
-TEMPLATE_STRINGS = {
-  "tr": {
-    "report_title": "VoicePromptKit Raporu — {basename}",
-    "prompt_label": "**Prompt:**",
-    "run_label": "**Çalıştırma:**",
-    "generated_label": "**Oluşturulma:**",
-    "target_model_label": "**Hedef model:**",
-    "summary_heading": "## Özet",
-    "lens_column": "Mercek",
-    "total_column": "Toplam",
-    "high_column": "Yüksek",
-    "medium_column": "Orta",
-    "low_column": "Düşük",
-    "conflict_row": "Çelişki",
-    "dominance_row": "Baskınlık",
-    "gap_row": "Boşluk",
-    "schema_row": "Şema",
-    "drift_row": "Davranışsal sapma",
-    "tr_phonetic_row": "Türkçe fonetik",
-    "findings_heading": "## Bulgular",
-    "high_severity_heading": "### Yüksek önem",
-    "medium_severity_heading": "### Orta önem",
-    "low_severity_heading": "### Düşük önem",
-    "conflicts_subheading": "#### Çelişkiler",
-    "dominances_subheading": "#### Baskınlıklar",
-    "gaps_subheading": "#### Boşluklar",
-    "schema_subheading": "#### Şema",
-    "drift_subheading": "#### Davranışsal sapma",
-    "tr_phonetic_subheading": "#### Türkçe fonetik",
-    "none_marker": "_(yok)_",
-    "section_prefix": "Bölüm",
-    "line_prefix": "Satır",
-    "lens_label_conflict": "çelişki",
-    "lens_label_dominance": "baskınlık",
-    "lens_label_gap": "boşluk",
-    "lens_label_schema": "şema",
-    "lens_label_drift": "davranışsal sapma",
-    "lens_label_tr_phonetic": "türkçe fonetik",
-    "severity_label_high": "yüksek",
-    "severity_label_medium": "orta",
-    "severity_label_low": "düşük",
-    "table_id_column": "id",
-    "table_lens_column": "mercek",
-    "table_severity_column": "önem",
-    "table_section_line_column": "bölüm / satır",
-    "table_rationale_column": "açıklama",
-    "table_fix_column": "düzeltme",
-    "drift_passed_no_fix": "(geçti — düzeltme yok)",
-    "sentinel_todo_render": "_TODO: {text}_",
-    "sentinel_intentional_render": "_Intentional — atla_",
-    "no_line_marker": "— / —",
-    "no_section_marker": "—"
-  },
-  "en": {
-    "report_title": "VoicePromptKit Report — {basename}",
-    "prompt_label": "**Prompt:**",
-    "run_label": "**Run:**",
-    "generated_label": "**Generated:**",
-    "target_model_label": "**Target model:**",
-    "summary_heading": "## Summary",
-    "lens_column": "Lens",
-    "total_column": "Total",
-    "high_column": "High",
-    "medium_column": "Medium",
-    "low_column": "Low",
-    "conflict_row": "Conflict",
-    "dominance_row": "Dominance",
-    "gap_row": "Gap",
-    "schema_row": "Schema",
-    "drift_row": "Drift",
-    "tr_phonetic_row": "TR phonetic",
-    "findings_heading": "## Findings",
-    "high_severity_heading": "### HIGH severity",
-    "medium_severity_heading": "### MEDIUM severity",
-    "low_severity_heading": "### LOW severity",
-    "conflicts_subheading": "#### Conflicts",
-    "dominances_subheading": "#### Dominances",
-    "gaps_subheading": "#### Gaps",
-    "schema_subheading": "#### Schema",
-    "drift_subheading": "#### Drift",
-    "tr_phonetic_subheading": "#### TR phonetic",
-    "none_marker": "_None._",
-    "section_prefix": "Section",
-    "line_prefix": "L",
-    "lens_label_conflict": "conflict",
-    "lens_label_dominance": "dominance",
-    "lens_label_gap": "gap",
-    "lens_label_schema": "schema",
-    "lens_label_drift": "drift",
-    "lens_label_tr_phonetic": "tr phonetic",
-    "severity_label_high": "high",
-    "severity_label_medium": "medium",
-    "severity_label_low": "low",
-    "table_id_column": "id",
-    "table_lens_column": "lens",
-    "table_severity_column": "sev",
-    "table_section_line_column": "section / line",
-    "table_rationale_column": "rationale",
-    "table_fix_column": "fix",
-    "drift_passed_no_fix": "(passed — no fix)",
-    "sentinel_todo_render": "_TODO: {text}_",
-    "sentinel_intentional_render": "_Intentional — dismiss_",
-    "no_line_marker": "— / —",
-    "no_section_marker": "—"
-  }
-}
-```
+**Language switching (mandatory):** Load `frontmatter.report_language` (`tr` or `en`; default `tr` — Phase 2 already normalised it). **Read `references/render.md` now** — it defines the full bilingual `TEMPLATE_STRINGS` dictionary and the Python render helpers (`escape_cell`, `build_section_line_cell`, `render_fix_cell`, `render_finding_row`, `render_findings_table`) used throughout this phase and Phase 9.2; use them verbatim. `report_language` is the key into `TEMPLATE_STRINGS`. Apply throughout the report.md render: title, top metadata labels, summary heading + column headers + lens row labels, findings heading, findings-table column headers, section/line cell prefixes, per-row lens + severity labels, drift `— / —` no-line marker, drift `passed — no fix` cell, and TODO / Intentional sentinel cell replacements.
 
 Lens-generated content (`rationale`, `suggested_fix`, `current_excerpt`) is NOT translated — it stays in whatever language the runner produced. Only the skill-side template strings above switch language. So an English conflict rationale remains English in a TR report; the surrounding section headings and labels translate.
 
@@ -1425,60 +1381,7 @@ The column header strings come from `TEMPLATE_STRINGS[lang]` (`table_id_column`,
 
 **The full rationale + suggested_fix remain available in findings.json verbatim (no escaping there).** The runner emits compact text; the renderer pipes it through pipe-escape + line-break-escape for the markdown table only.
 
-Python helper:
-
-```python
-def escape_cell(text):
-    if not text:
-        return ""
-    return text.replace("|", "\\|").replace("\n", "<br>")
-
-def build_section_line_cell(f, T):
-    sref = f.get("section_ref")
-    line = f.get("line")
-    # Drift "— / —" rule: both line and section_ref are null.
-    if line is None and sref is None:
-        return T["no_line_marker"]
-    sec_p = T["section_prefix"]
-    line_p = T["line_prefix"]
-    if sref is not None and sref.get("subsection"):
-        return f"{sec_p} {sref['subsection']} / {line_p}{line}"
-    if sref is not None and sref.get("section"):
-        return f"{sec_p} {sref['section']} / {line_p}{line}"
-    # section_ref null but line present (preamble line)
-    return f"{line_p}{line}"
-
-def render_fix_cell(f, T):
-    suggested = f.get("suggested_fix") or ""
-    if not suggested.strip():
-        if f.get("lens") == "drift":
-            return T["drift_passed_no_fix"]
-        return ""
-    if suggested.startswith("TODO:"):
-        return T["sentinel_todo_render"]
-    if suggested.startswith("Intentional —") or suggested.startswith("Intentional -"):
-        return T["sentinel_intentional_render"]
-    return suggested  # verbatim — no truncation
-
-def render_finding_row(f, lang):
-    T = TEMPLATE_STRINGS[lang]
-    lens_label = T[f"lens_label_{f['lens']}"]
-    sev_label = T[f"severity_label_{f.get('severity','low')}"]
-    section_line = build_section_line_cell(f, T)
-    rationale = escape_cell(f.get("rationale", ""))
-    fix = escape_cell(render_fix_cell(f, T))
-    return f"| {f['id']} | {lens_label} | {sev_label} | {section_line} | {rationale} | {fix} |"
-
-def render_findings_table(findings, lang):
-    T = TEMPLATE_STRINGS[lang]
-    header = (
-        f"| {T['table_id_column']} | {T['table_lens_column']} | {T['table_severity_column']} "
-        f"| {T['table_section_line_column']} | {T['table_rationale_column']} | {T['table_fix_column']} |"
-    )
-    sep = "|---|---|---|---|---|---|"
-    rows = [render_finding_row(f, lang) for f in findings]
-    return "\n".join([header, sep] + rows)
-```
+The Python render helpers (`escape_cell`, `build_section_line_cell`, `render_fix_cell`, `render_finding_row`, `render_findings_table`) live in `references/render.md` — already read at the "Language switching" step above; use them verbatim.
 
 ### `$RUN_DIR/findings.json`
 
@@ -1637,7 +1540,7 @@ Each row is built by `render_finding_row` (see "Table-format finding render" abo
 **Removed output modes:** `inline` (v0.2) and `html` (v0.3.1) are no longer supported. Phase 2 strips them with a warning; this phase need not handle them.
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_7_end" >> "$TIMING_LOG"
+log_t "phase_7_end"
 ```
 
 ## Phase 8 — Terminal summary
@@ -1645,7 +1548,7 @@ Each row is built by `render_finding_row` (see "Table-format finding render" abo
 After all writes succeed, **mirror per-lens artefacts into the content-addressable cache, then update the `latest` pointer** so it points at this run (the run is now durable), then print the summary:
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_8_start" >> "$TIMING_LOG"
+log_t "phase_8_start"
 
 # Cache write: mirror this run's per-lens artefacts into the content-addressable cache.
 # Atomic via temp-then-rename. Idempotent — overwriting an existing entry is fine
@@ -1663,7 +1566,7 @@ if [ -n "$CACHE_DIR" ] && [ -d "$CACHE_DIR" ]; then
       cp "$src" "$tmp" && mv "$tmp" "$CACHE_DIR/$lens_file.json"
     fi
   done
-  [ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] cache_write_complete (key=$CACHE_KEY)" >> "$TIMING_LOG"
+  log_t "cache_write_complete (key=$CACHE_KEY)"
 fi
 
 # Update the `latest` pointer to this run (commit point). Cross-platform:
@@ -1687,7 +1590,7 @@ esac
 - Cache write is best-effort: a failed `cp` does not abort the run. The user still sees a successful audit; only the cache miss on the next run is the cost.
 - The atomic temp-then-rename pattern (`.lens.json.tmp.$$`) prevents partial writes from being read as valid cache entries on a concurrent run.
 
-If `frontmatter.config_warnings[]` is non-empty, include them in the summary so the user notices typos / removed fields.
+If `frontmatter.config_warnings[]` is non-empty, include them in the summary so the user notices typos / removed fields. Likewise, if Phase 7's missing-artifact check flagged any selected lens, repeat each `WARNING: <lens> produced no output — re-run to cover it` line in the summary — never present a partial report as clean.
 
 **Language switching.** The Phase 8 summary block also honours `frontmatter.report_language`. The body of the summary (file paths, counts, run identifier) stays the same across languages — only the human-readable labels translate. Two canonical templates follow.
 
@@ -1710,6 +1613,7 @@ Pronunciations:  .voicepromptkit/<basename>/pronunciations.md (<M> unique terms 
 Previous runs: .voicepromptkit/<basename>/ (run-001 … run-NNN)
 Repo defaults: <relative path to .voicepromptkit.json>
 Body size: <body_char_count> chars [compact mode <ACTIVE | inactive — under <max_char_limit> char threshold | DISABLED via max_char_limit=0>]
+Cache: <N>/<M> lenses served from cache
 
 Entering interactive review (Phase 9). Use a compact decision string such as
   "C1, C3 düzelt; G2 yorum bırak; T1..T5 konuşalım; gerisini atla"
@@ -1736,6 +1640,7 @@ Telaffuz ana:    .voicepromptkit/<basename>/pronunciations.md (<M> benzersiz ter
 Önceki koşular: .voicepromptkit/<basename>/ (run-001 … run-NNN)
 Repo varsayılan: <relative path to .voicepromptkit.json>
 Body boyutu: <body_char_count> chars [compact mode <AKTİF | inaktif — <max_char_limit> char eşiğin altında | DEVRE DIŞI (max_char_limit=0)>]
+Önbellek: <N>/<M> mercek önbellekten sunuldu
 
 Etkileşimli incelemeye geçiyorum (Faz 9). Karar dizesi olarak şu örneği kullanabilirsin:
   "C1, C3 düzelt; G2 yorum bırak; T1..T5 konuşalım; gerisini atla"
@@ -1764,7 +1669,9 @@ The `Pronunciations master:` line surfaces `.voicepromptkit/<basename>/pronuncia
 
 When compact mode is active, downstream lenses apply cheaper analysis policies — low-severity findings may be skipped, drift simulation halves its scenario budget, and rule extraction trims verbose explanations. To audit at full depth, set `max_char_limit: 0` in `.voicepromptkit.json` or pass `VOICEPROMPTKIT_MAX_CHAR_LIMIT=0`.
 
-When `VOICEPROMPTKIT_TIMING=true`, append one extra line to the summary block above (after the `Body size:` line and before the blank line preceding "Entering interactive review"):
+**Cache line — render rules:** `<M>` = number of lenses selected this run (count drift when its gate passed), `<N>` = number whose artefact was copied from `$CACHE_DIR` instead of dispatching a runner (the Phase 4 / 5 cache-hit copies — the skill knows which artefacts came from cache). Always render the line; `0/6` is meaningful (all output freshly computed). This is also where a user re-running an interrupted audit sees that already-completed lenses were served from the content-addressable cache.
+
+When `VOICEPROMPTKIT_TIMING=true`, append one extra line to the summary block above (after the `Cache:` line and before the blank line preceding "Entering interactive review"):
 
 ```
 Timing log: <relative path to $RUN_DIR/timing.log>
@@ -1773,7 +1680,7 @@ Timing log: <relative path to $RUN_DIR/timing.log>
 Otherwise omit — users without timing enabled see no change.
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_8_end" >> "$TIMING_LOG"
+log_t "phase_8_end"
 ```
 
 After printing this block, **do not stop** — automatically transition to Phase 9 in the same turn. Phase 9 + Phase 10 are part of the default `/prompt-check` flow; the audit is not finished until the user either resolves every finding or explicitly cancels with "iptal".
@@ -1781,7 +1688,7 @@ After printing this block, **do not stop** — automatically transition to Phase
 ## Phase 9 — Interactive selection
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_9_start" >> "$TIMING_LOG"
+log_t "phase_9_start"
 ```
 
 Triggered automatically once Phase 8 has printed its summary. There is no separate trigger phrase — the audit flow always passes through Phase 9. (The `/prompt-check-resume` slash command re-enters Phase 9 for a pending run from a previous session.)
@@ -1838,7 +1745,7 @@ Print a single markdown table containing every finding in DECISION_SET. The tabl
 
 Sort by the global Phase 7 order (severity desc → lens group → line asc). For drift findings without a severity, treat `fail` as `high` and `pass` as `low` for sort placement.
 
-Cells are populated VERBATIM from the runner's text via the Phase 7 helpers (`build_section_line_cell`, `render_fix_cell`, `escape_cell`). NO truncation, NO `short_*` derivations. The `section / line` cell renders as `— / —` when both `line` and `section_ref` are null (drift). For TR phonetic findings still in DECISION_SET (`number_readability` / `punctuation`), the `fix` cell is the verbatim `suggested_fix` — `pronunciation_entry` rendering is no longer needed in the table because TR advisory findings are filtered out by the partition.
+Cells are populated VERBATIM from the runner's text via the render helpers from `references/render.md` (`build_section_line_cell`, `render_fix_cell`, `escape_cell`). NO truncation, NO `short_*` derivations. The `section / line` cell renders as `— / —` when both `line` and `section_ref` are null (drift). For TR phonetic findings still in DECISION_SET (`number_readability` / `punctuation`), the `fix` cell is the verbatim `suggested_fix` — `pronunciation_entry` rendering is no longer needed in the table because TR advisory findings are filtered out by the partition.
 
 If `AUTO_FILED_SET` is non-empty, append a single line directly below the summary table (before the decision prompt):
 
@@ -1864,7 +1771,7 @@ If the user types `iptal` (or `cancel`), write `session.json.phase = "paused"`, 
 
 This sub-section (9.4) is **Stage 1 — parse only, no I/O writes**. Stage 2 (commit) lives in 9.6 and is gated on Stage 1.5's confirmation.
 
-The detailed grammar (id-lists, ranges with `..`, wildcards like `gerisini` / `rest`, verb aliases for `düzelt`/`fix`/`apply`, `yorum bırak`/`overlay`/`note`, `atla`/`skip`/`dismiss`, `konuşalım`/`discuss`/`talk`) lives in `references/dialog-flow.md`. Implement the parser as a single Python heredoc so it is deterministic. The block below **parses into memory and emits a plan JSON to stdout** — it must NOT open `decisions.jsonl` or `session.json` for writing. Skeleton:
+The detailed grammar (id-lists, ranges with `..`, wildcards like `gerisini` / `rest`, filtered wildcards like `düşük atla` / `güvenli düzelt`, verb aliases for `düzelt`/`fix`/`apply`, `yorum bırak`/`overlay`/`note`, `atla`/`skip`/`dismiss`, `konuşalım`/`discuss`/`talk`) lives in `references/dialog-flow.md`. Implement the parser as a single Python heredoc so it is deterministic. The block below **parses into memory and emits a plan JSON to stdout** — it must NOT open `decisions.jsonl` or `session.json` for writing. Skeleton:
 
 ```bash
 PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
@@ -1907,6 +1814,20 @@ VERBS = {
 
 WILDCARDS = {'gerisini','geri kalan','rest','others','remaining','all'}
 
+# Filtered wildcards (dialog-flow.md §3.1): id-list filters over still-pending
+# findings. They compose left-to-right like `gerisini` — ids decided earlier in
+# the same string are skipped via seen_ids, never overridden.
+#   düşük / low    → severity == "low"
+#   güvenli / safe → fix_kind == "replace" (concrete replace suggestion)
+FILTERED_WILDCARDS = {
+    'düşük':   lambda f: f.get('severity') == 'low',
+    'dusuk':   lambda f: f.get('severity') == 'low',
+    'low':     lambda f: f.get('severity') == 'low',
+    'güvenli': lambda f: f.get('fix_kind') == 'replace',
+    'guvenli': lambda f: f.get('fix_kind') == 'replace',
+    'safe':    lambda f: f.get('fix_kind') == 'replace',
+}
+
 def now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds').replace('+00:00','Z')
 
@@ -1915,6 +1836,10 @@ def expand_id_token(tok, known):
     if not tok: return []
     if tok.lower() in WILDCARDS:
         return [fid for fid, st in findings_state.items() if st['status'] == 'pending']
+    if tok.lower() in FILTERED_WILDCARDS:
+        pred = FILTERED_WILDCARDS[tok.lower()]
+        return [fid for fid, st in findings_state.items()
+                if st['status'] == 'pending' and pred(findings_by_id.get(fid, {}))]
     if '..' in tok:
         a, b = tok.split('..', 1)
         a, b = a.strip(), b.strip()
@@ -2189,13 +2114,13 @@ Parsed N decisions: A applied, B overlay, C dismissed, D discussed, E TR-routed 
 The `F auto-filed` segment is appended only when `plan.auto_filed > 0`. Then hand off to Phase 10 in the same turn. Do not wait for further confirmation — the user already confirmed at Stage 1.5.
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_9_end" >> "$TIMING_LOG"
+log_t "phase_9_end"
 ```
 
 ## Phase 10 — Action dispatch
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_10_start" >> "$TIMING_LOG"
+log_t "phase_10_start"
 ```
 
 Phase 10 reads `session.json` and `decisions.jsonl` from Phase 9 and executes each decided action. The order below is fixed — see `references/overlay-format.md` Section 4 for the rationale.
@@ -2464,6 +2389,11 @@ Interactive review complete — <run-NNN>
 Overlay file: <relative path to $RUN_DIR/inline-suggestions.md>  (if any overlays exist)
 Decisions log: <relative path to $RUN_DIR/decisions.jsonl>
 Session state: <relative path to $RUN_DIR/session.json>
+
+What next:
+  /prompt-chat <prompt-path>       — reproduce a behavioural finding in live chat; lock it as an anchor with /save
+  /prompt-test <prompt-path>       — run the saved anchors as a regression suite over your edits
+  /prompt-check-resume <run-NNN>   — continue the decisions you left pending
 ```
 
 - `Applied` = `applied_count` from 10.3 (the number of `applied` lines in `decisions.jsonl` for this pass; never inflated by failed-feasibility findings). The `of which <S> structural via Edit tool` split surfaces `structural_applied_count` so the user can see how many writes went through the risk-warned Edit path versus plain substring replacement.
@@ -2471,45 +2401,20 @@ Session state: <relative path to $RUN_DIR/session.json>
 - `Sentinel Intentional` = `sentinel_intentional_count` from 10.3 (findings the runner pre-marked as benign, dismissed without overlay).
 - `Manually overlay` = findings whose Phase 9 decision was `overlay` (or `konuşalım → overlay`). Does NOT include the auto-routed bucket — those are reported separately to avoid double-counting.
 - `Revised` = findings that went through the `konuşalım → revised` path in 10.4. The `A applied, B overlay` split reflects the terminal action chosen for each revised entry.
+- **`What next` footer** — always render the `/prompt-chat` and `/prompt-test` lines; render the `/prompt-check-resume` line ONLY when pending findings remain (i.e. `session.json.phase` is being set to `"paused"` below). When `report_language == "tr"`, translate the labels (`Sırada ne var:` / `davranışsal bir bulguyu canlı sohbette yeniden üret; /save ile anchor olarak kilitle` / `kaydedilen anchor'ları regresyon olarak çalıştır` / `bekleyen kararlara devam et`); the command tokens stay verbatim.
 
 Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. If any findings remain `pending` at this point (user did not address them and did not type `gerisini atla`), set `session.json.phase = "paused"` instead and remind the user they can resume with `/prompt-check-resume <run-NNN>`.
 
 ```bash
-[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_10_end" >> "$TIMING_LOG"
+log_t "phase_10_end"
 ```
 
-## Don'ts
+## Don'ts (cross-cutting)
 
-- Don't extract frontmatter with an LLM pass; use Bash/Python — it's deterministic and free.
-- Don't read the original prompt more than once per phase; pass `body.txt` between steps.
+Point-of-use rules live in their own phases; only run-wide invariants are repeated here.
+
+- Don't write outside `$RUN_DIR/` — the only exceptions are `.voicepromptkit.json` (Phase 0, explicit wizard consent), the per-prompt metadata files (`latest.txt` / `latest`, `pronunciations.md`, `last_lens_selection.json`, `_cache/`), and the original prompt file (Phase 10's applied step ONLY, under SHA guard + explicit user decision).
 - Don't run lens analysis inline in the skill. Each lens family has a dedicated subagent (`static-lens-runner`, `drift-runner`, `tr-phonetic-runner`); the skill only dispatches and reads outputs.
-- Don't write outside `$RUN_DIR/` (except for `.voicepromptkit.json` in Phase 0 with explicit wizard consent, and the original prompt file in Phase 10's applied step under SHA guard + user decision).
-- Don't modify the original prompt file in any phase other than Phase 10's applied step — and even there, only when the SHA matches and the user explicitly decided `applied`.
-- Don't run the Phase 0 wizard if `.voicepromptkit.json` already exists. The user owns that file.
-- Don't reintroduce batch / apply-mode. There is no `/prompt-check-apply` anymore — its semantics are folded into Phase 10. Resume uses `/prompt-check-resume`.
-- Don't define `inline-suggestions.md` format, `decisions.jsonl` shape, or the decision grammar inline in this skill — they live in `references/overlay-format.md` and `references/dialog-flow.md`.
-- Don't read `decisions.jsonl` or `session.json` in the same sub-step that writes to them — finish the write, then move on.
-- Don't append duplicate entries to `decisions.jsonl` on resume — append only NEW actions, not re-statements of historical decisions. Resume reads the existing file as history and continues from there.
-- Don't keep `findings_state[*].status` at `"discussed"` or `"revised"` as a terminal state — both are transient. Every finding must end at `pending` (only if the run is paused), `applied`, `overlay`, or `dismissed`.
-- Don't use `AskUserQuestion` for the free-form decision string in Phase 9.3 — it must be conversational so the user can express ranges, wildcards, and verb aliases in one line. Use `AskUserQuestion` only for the four-option choice inside the Phase 10.4 sub-flow.
-- Don't substitute prose questions for AskUserQuestion in Phase 3.5 (lens selection) or Phase 10.4 (konuşalım four-option choice). The tool is mandatory at those points; prose is a workflow regression.
-- Don't dispatch the four static lenses in a single Agent call. Phase 4 emits FIVE parallel Agent calls (conflict / dominance / gap / schema / tr_phonetic) in one assistant turn. Serial dispatch defeats the parallel design.
-- Don't wait for schema or tr_phonetic to finish before starting drift. Drift only needs conflict + dominance + gap outputs; schema and tr are independent.
-- Don't write an `applied` line to `decisions.jsonl` for a finding that didn't actually modify the prompt file. The feasibility check must precede the log write — single event per finding outcome. A failed-feasibility finding produces exactly one `routed_to_overlay` line followed by exactly one `overlay` line; an applicable finding produces exactly one `applied` line. Never two events that imply a prompt-file mutation when none occurred.
-- Don't sort findings by line number alone — severity-first grouping is mandatory for both findings.json and report.md.
-- Don't enable VOICEPROMPTKIT_TIMING in production runs unless debugging. The overhead is small but the timing.log file grows on every run and clutters the run dir.
-- Don't re-compare the prompt file's SHA to `findings.json.prompt_sha256` after the first apply in a Phase 10 pass. The stale-audit guard is computed ONCE in Phase 10's Pre-flight and checks for *pre-audit* drift; intra-pass mutations from successful applies are intended and must not feed back into the comparison. The `new_sha256` field in `decisions.jsonl` is archival only.
-- Don't write to `decisions.jsonl` or `session.json` during Phase 9.4 parsing — those writes are gated on explicit user confirmation in Phase 9.6 (Stage 2). The parser emits an in-memory plan only; the commit block runs after `evet`/`yes`/`onayla`/`ok`/`tamam`/`confirm`.
-- Don't emit JSONL decision records missing the spec-required keys `ts`, `finding`, `lens`, `action`. The commit block self-checks every record and refuses to write incomplete lines (see `references/overlay-format.md` Section 2).
-- Don't force-route every TR finding to overlay. Only TR findings with `fix_kind: "advisory"` (categories `foreign_word` and `abbreviation`) bypass the prompt file. TR findings with `fix_kind: "replace"` (categories `number_readability` and `punctuation`) follow the normal apply flow in Phase 10.3.
-- Don't ask the user about TR pronunciation findings (foreign_word + abbreviation) in Phase 9. They auto-file to the overlay's Pronunciation map. Showing them in the summary table or decision prompt is a UX regression — the pronunciation hint is never going to be applied (advisory rule), so surfacing it as a decision wastes the user's attention. They appear ONLY in Phase 8's auto-filed count line and in `inline-suggestions.md`'s bottom Pronunciation map section.
-- Don't apply a TODO/Intentional sentinel as if it were a regular structural fix. The sentinel guard in Phase 10.3 (step 4) intercepts them: `TODO:` routes to overlay (`sentinel_todo`), `Intentional —` is dismissed (`sentinel_intentional`). Neither ever reaches the Edit tool.
-- Don't overwrite the `## Custom additions` block in `pronunciations.md`. The author owns content between the `<!-- voicepromptkit:custom-additions:start -->` and `<!-- voicepromptkit:custom-additions:end -->` markers; the rebuild MUST preserve that block verbatim.
-- Don't merge schema findings into findings.json when `schema.json.applicable == false`. Auto-skipped lenses contribute zero findings — the summary just notes the reason. Adding a phantom `Schema: 0` row without applicability context is misleading on flat prompts.
-- Don't apply compact mode when `max_char_limit == 0`. Zero explicitly disables the threshold; the body can be arbitrarily large without triggering cheaper policies.
-- Don't treat compact mode as a hard abort. The audit STILL runs — it just runs with cheaper-per-lens policies. Severity floors, pair budgets, and drift halving are the contract; never use compact mode as an excuse to skip a lens entirely.
-- Don't translate lens-generated content (rationale, suggested_fix, current_excerpt) in Phase 7. Only skill-side template strings translate. A lens runner that wrote an English rationale stays English in a TR report.
-- Don't omit `section_ref: null` from findings.json — emit it explicitly (null is a valid value, signalling "line outside any numbered section"). Absent field is ambiguous; explicit null is clear.
-- Don't render Current / Suggested / Action labels as separate blocks in Phase 7. Phase 7 emits a single markdown TABLE (id | lens | sev | section / line | rationale | fix) — one row per finding.
-- Don't truncate rationale or suggested_fix in the renderer. Runners self-cap at ≤200 chars rationale and ≤150 chars fix (per their "Compact writing" invariants); the renderer uses the runner's text VERBATIM. If a runner exceeded the cap, that's a runner error — surface it as-is.
-- Don't render `Satır 1` / `L1` for drift findings whose `line` and `section_ref` are both null. Use the literal `— / —` marker (= `TEMPLATE_STRINGS[lang]["no_line_marker"]`) so behavioural findings are visually distinct from anchored ones.
+- Don't define the overlay format, `decisions.jsonl` shape, decision grammar, or render strings inline — they live in `references/overlay-format.md`, `references/dialog-flow.md`, and `references/render.md`.
+- Don't write to `decisions.jsonl` or `session.json` before the Phase 9.6 confirmation gate, and never read either file in the same sub-step that writes it.
+- Don't write an `applied` line to `decisions.jsonl` for a finding that did not actually modify the prompt file — feasibility precedes logging; exactly one event per finding outcome.

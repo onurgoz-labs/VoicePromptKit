@@ -8,6 +8,12 @@ allowed-tools: Skill, Read, Write, Bash, Agent, AskUserQuestion
 
 Resume an unfinished interactive VoicePromptKit session — replay the Phase 9 summary view and Phase 10 action dispatch over the findings whose `session.json` status is still `pending`.
 
+## Scope — what "resume" covers (and what it does not)
+
+Resume covers **only pending decisions after a completed analysis**: Phases 1–8 finished, `report.md` + `findings.json` exist, and one or more findings are still `pending` in `session.json`. It replays the interactive review (Phases 9–10) — it does NOT re-run any lens.
+
+An audit that was interrupted **during analysis** (Phases 4–7 — lens dispatch through render) cannot be resumed: there is no complete `findings.json` to review. Re-run `/prompt-check <prompt-path>` instead. This is cheaper than it sounds — every lens that completed before the interruption was mirrored into the content-addressable cache, so the re-run serves those lenses from cache and only re-dispatches the ones that never finished (the Phase 8 summary shows `Cache: N/M lenses served from cache`).
+
 Procedure:
 
 1. **Resolve the run directory from `$1`.**
