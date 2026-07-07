@@ -18,33 +18,6 @@ Every finding from the conflict, dominance, and gap lenses MUST also carry a `fi
 
 **Mapping to fix_kind:** `fix_strategy` is orthogonal to `fix_kind`. A finding can be `fix_kind: "replace" + fix_strategy: "substring"` (apply via substring-replace), `fix_kind: "replace" + fix_strategy: "structural"` (apply via Edit tool + risk warning), or `fix_kind: "advisory" + fix_strategy: "substring"` (overlay, but if user manually applies, substring-replace is the natural method).
 
-## Rule extraction
-
-You analyse the body text and extract every rule, instruction, constraint, or directive into a flat list of atomic rules.
-
-- One rule = one atomic obligation. Split compound sentences: "be polite and concise" → two rules.
-- Preserve absolute claims verbatim: "always", "never", "only", "must", "ignore".
-- `line` = lowest line number in `body.txt` where the rule begins.
-- `id` is `R1, R2, R3 …` in source order.
-- `category`:
-  - **behavior** — what the model should do (actions, workflow, decisions).
-  - **format** — how output is shaped (length, structure, JSON, markdown).
-  - **tone** — register, friendliness, formality.
-  - **policy** — refusal rules, safety, legal, scope.
-  - **persona** — who the model is, role, identity.
-- If the prompt contains examples, extract the rule the example illustrates, not the example itself.
-- If a section is unstructured prose, still split into atomic obligations.
-
-Schema:
-
-```json
-{
-  "rules": [
-    { "id": "R1", "category": "behavior|format|tone|policy|persona", "text": "<atomic, paraphrased to one sentence>", "line": 12, "source_excerpt": "<exact line or sub-clause that produced this rule, ≤ 200 chars>" }
-  ]
-}
-```
-
 ## Severity heuristics across lenses
 
 When unsure, ask: "How many realistic inputs trigger this?"
@@ -147,86 +120,48 @@ When `section_ref` is null:
 
 Section title is NOT included in the inline header (would make the line too long); it appears once in the section-level summary at the top of report.md / inline-suggestions.md.
 
-## Render contract — table format + compact writing
+## Compact writing — runner-side invariant
 
-Every finding emitted by every lens (conflict, dominance, gap, schema, drift, tr_phonetic) is rendered downstream as a row in a markdown TABLE. Phase 7 of the skill produces `report.md` with one table per severity bucket (or one combined table sorted by severity); the same table format appears in Phase 9's summary view shown to the user.
-
-### Table columns
-
-| Language | id | lens | severity | section/line | rationale | fix |
-|---|---|---|---|---|---|---|
-| TR | `id` | `mercek` | `önem` | `bölüm / satır` | `açıklama` | `düzeltme` |
-| EN | `id` | `lens` | `sev` | `section / line` | `rationale` | `fix` |
-
-### Column content rules
-
-- **id**: finding id verbatim (`C1`, `D3`, `G2`, `S1`, `T1`, `drift-S1`).
-- **lens / mercek**: translated lens name. Lookup table:
-
-  | English | Türkçe |
-  |---|---|
-  | conflict | çelişki |
-  | dominance | baskınlık |
-  | gap | boşluk |
-  | schema | şema |
-  | drift | davranışsal sapma |
-  | tr phonetic | türkçe fonetik |
-
-- **severity / önem**: translated severity. Lookup table:
-
-  | English | Türkçe |
-  |---|---|
-  | high | yüksek |
-  | medium | orta |
-  | low | düşük |
-
-  For drift findings, severity is inferred from the verdict score: `score ≤ 0.5` → high, `score ≤ 0.75` → medium, else low.
-
-- **section/line**: composite cell derived from `section_ref` + `line`:
-
-  | section_ref state | line state | TR render | EN render |
-  |---|---|---|---|
-  | subsection set | line set | `Bölüm 7.2 / Satır 284` | `Section 7.2 / L284` |
-  | section only | line set | `Bölüm 7 / Satır 284` | `Section 7 / L284` |
-  | null | line set | `— / Satır 284` | `— / L284` |
-  | null | null (drift only) | `— / —` | `— / —` |
-
-- **rationale / açıklama**: the runner-emitted `rationale` field verbatim — NO TRUNCATION. Runners self-cap at ≤200 chars per the compact writing invariant; render uses full text. Multi-sentence rationales are rare (compact writing prefers one sentence) but acceptable when needed.
-
-- **fix / düzeltme**: the runner-emitted `suggested_fix` field. Renders directly. Sentinel suggestions:
-  - `TODO: <text>` → renders as italic `_TODO: <text>_`
-  - `Intentional — dismiss this finding` → renders as italic `_Intentional — atla_` (TR) / `_Intentional — dismiss_` (EN)
-  - Drift findings with no fix: `(geçti — düzeltme yok)` (TR) / `(passed — no fix)` (EN)
-  - Empty/null fix for other lenses: `_(see rationale)_` / `_(bkz. açıklama)_`
-
-### Sort order (unchanged from v0.4.9)
-
-Severity descending (high → medium → low) → lens group → line ascending. Tied (same severity, same lens, same line): order by finding id.
-
-### Compact writing — runner-side invariant (also documented per-lens-runner)
-
-Every runner MUST write `rationale` ≤ 200 characters and `suggested_fix` ≤ 150 characters. One sentence preferred. No preamble ("This finding indicates..."). Direct identification + reason + actionable fix.
+Every runner MUST write `rationale` / `reasoning` / `description` ≤ 200 characters and `suggested_fix` ≤ 150 characters. One sentence preferred. No preamble ("This finding indicates..."). Direct identification + reason + actionable fix. For structural fixes with embedded "Suggested: '...'" replacement text, keep the replacement under 50 chars or omit it (point to the line instead).
 
 The render layer assumes runners obey this invariant. If a runner emits oversized text, the render still uses it verbatim (no truncation) but the report becomes ugly — runners are responsible for the contract.
 
-### No truncation in render
+Example (bad vs good):
 
-v0.4.9 had `≤120 chars rationale, ≤100 chars fix` truncation at the render layer with ellipsis. v0.4.10 REMOVES this. The new contract: runner self-caps; render uses full text. Truncation cut sentences mid-clause and made reports unreadable; pushing the constraint to the runner ensures the output is meaningful within the limit.
+BAD (304 chars, multi-clause):
+   "R78 declares `sms_retry_count` default 0, max 1 (line 326). R80 declares STATE 15 'Max retries: 2 (for SMS resend)' (line 590). The same SMS-resend counter cannot have both a max of 1 and a max of 2 — runtime behavior will diverge depending on which rule the agent honours."
 
-### Canonical example — TR
+GOOD (155 chars):
+   "R78 sets sms_retry_count max=1 (line 326) but R80 says 'Max retries: 2' (line 590); the same counter can't be both."
 
-```markdown
-| id | mercek | önem | bölüm / satır | açıklama | düzeltme |
-|---|---|---|---|---|---|
-| C2 | çelişki | yüksek | Bölüm 5 / Satır 326 | R78 sms_retry_count max=1 ile R80 max=2 çelişiyor; aynı sayaç iki değer alamaz. | R80'i (satır 590) max=1 yap VEYA R78'i max=2 yap — tek değerde birleştir. |
-| G5 | boşluk | orta | Bölüm 0.1 / Satır 7 | R4 "step instructions require it" tanımsız; hangi step'lerin 35 kelimeye gittiği belirsiz. | R4'ü "Verbatim mandatory scripts muaftır, kısa tutulamaz" diye netleştir. |
-| drift-S1 | davranışsal sapma | düşük | — / — | regression senaryosu geçti (0.93). | (geçti — düzeltme yok) |
+Self-correction: if you find yourself writing > 200 chars of rationale or > 150 chars of fix, you're either being verbose (rewrite) or trying to bundle multiple findings (split into separate ones).
+
+## Language switching — canonical example pair
+
+Every prose field a runner emits (`reasoning`, `description`, `rationale`, `suggested_fix`, `pronunciation_entry.note`) MUST be written in `inputs.report_language`. Rule IDs (`R12`, `R80`), line numbers, severity tokens (`high|medium|low`), and structural artefacts (section numbers like `1.3`, finding IDs like `C1`, `D1`, `G1`) stay neutral — they are not prose.
+
+Canonical example (conflict lens; the same TR/EN switch applies to every static lens):
+
+TR (`report_language: "tr"`):
+```json
+{
+  "id": "C1",
+  "rule_ids": ["R78", "R80"],
+  "severity": "high",
+  "reasoning": "R78 sms_retry_count max=1 (satır 326) ile R80 'Max retries: 2' (satır 590) çelişiyor; aynı sayaç hem 1 hem 2 olamaz.",
+  "suggested_fix": "R80'i (satır 590) 'Max retries: 1' yap VEYA R78'i (satır 326) 'Max: 2' yap — tek değerde birleştir.",
+  "fix_strategy": "structural"
+}
 ```
 
-### Canonical example — EN
-
-```markdown
-| id | lens | sev | section / line | rationale | fix |
-|---|---|---|---|---|---|
-| C2 | conflict | high | Section 5 / L326 | R78 sets sms_retry_count max=1 but R80 says max=2; same counter cannot be both. | Change R80 (line 590) to max=1 OR R78 to max=2 — pick one canonical value. |
+EN (`report_language: "en"`):
+```json
+{
+  "id": "C1",
+  "rule_ids": ["R78", "R80"],
+  "severity": "high",
+  "reasoning": "R78 sets sms_retry_count max=1 (line 326) but R80 says 'Max retries: 2' (line 590); the same counter can't be both.",
+  "suggested_fix": "Change R80 (line 590) to 'Max retries: 1' OR raise R78 (line 326) to 'Max: 2' — pick one canonical value.",
+  "fix_strategy": "structural"
+}
 ```

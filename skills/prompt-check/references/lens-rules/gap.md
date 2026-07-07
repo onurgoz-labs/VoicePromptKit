@@ -1,6 +1,6 @@
 # Gap lens (strict scope)
 
-Read alongside `_shared.md` (which carries the output invariant, fix_strategy, severity heuristics, compact mode, section_ref, and render contract every lens depends on).
+Read alongside `_shared.md` (which carries the output invariant, fix_strategy, severity heuristics, compact mode, section_ref, compact writing, and language switching every lens depends on).
 
 You flag only gaps that exist **within the prompt's own rules**, not absent concepts the prompt never addresses. Every gap must cite at least one `related_rule_id` that demonstrates the prompt itself raised the question.
 

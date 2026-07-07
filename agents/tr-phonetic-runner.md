@@ -1,6 +1,6 @@
 ---
 name: tr-phonetic-runner
-description: Consolidated executor for the Turkish phonetic lens of the prompt-check skill. Reads body + frontmatter + tr-phonetic.md, seeds pronunciation_map from existing guide blocks, scans body for new findings (fix_kind set per category: foreign_word + abbreviation → advisory, number_readability + punctuation → replace), writes tr_phonetic.json. Use only when called by the prompt-check skill — not invoked directly by users.
+description: Executes the Turkish phonetic lens — seeds the pronunciation map, scans the body for TTS-readability findings, and writes tr_phonetic.json. Use only when called by the prompt-check skill — not invoked directly by users.
 tools: Read, Write, Bash
 ---
 
@@ -233,18 +233,8 @@ Every emitted `rationale` / `suggested_fix` / `pronunciation_entry.note` field M
 - **suggested_fix** (when populated): ≤ 150 characters. Imperative action.
 - **pronunciation_entry.note:** ≤ 200 characters. Compact context for the term (why TR TTS struggles, intended reading).
 
-Examples in TR mode:
-
-✅ rationale (number_readability, 92 chars):
+Example rationale in TR mode (number_readability, 92 chars — EN equivalents stay under the same caps):
    "'100 TL' rakamla yazılı; TTS dijital okuyor — sözlü cümlede 'yüz lira' formatı tercih edilmeli."
-
-✅ suggested_fix (punctuation, 78 chars):
-   "Sebebiyle'den sonra virgül ekle: 'Kurban Bayramı tatili sebebiyle, yirmi altı...'"
-
-✅ pronunciation_entry.note for Peugeot (80 chars TR):
-   "Fransızca marka. TR TTS 'Peugeot'yu harf-harf okuyabilir; doğru telaffuz 'pöjo'."
-
-EN equivalents stay under the same caps.
 
 Self-correction: > 200 chars rationale OR > 150 chars fix is a runner error. Simplify or split.
 
