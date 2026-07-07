@@ -815,6 +815,11 @@ class _SubprocessCtx:
         # send() would consume those stale events first and return the
         # PREVIOUS turn's reply, leaving the session one turn out of sync
         # for the rest of its life.
+        # Limitation: this only discards events ALREADY queued. If the old
+        # turn is still streaming when the next send() runs, its remaining
+        # events arrive after the drain and can still desync that one turn
+        # (fully closing this would need per-turn correlation ids or a
+        # subprocess respawn on timeout).
         while True:
             try:
                 self.stdout_queue.get_nowait()
@@ -869,8 +874,10 @@ class _SubprocessCtx:
                 full = "".join(chunks).strip() if chunks else (evt.get("result") or "").strip()
                 return full
         raise RuntimeError(
-            f"claude timed out waiting for reply (>{timeout}s); the late "
-            f"reply, if any, will be discarded before the next turn")
+            f"claude timed out waiting for reply (>{timeout}s); any late "
+            f"reply already received is discarded before the next turn "
+            f"(a reply still streaming in may bleed into it — /reset if "
+            f"the next answer looks stale)")
 
     def close(self) -> None:
         if self.proc is None:

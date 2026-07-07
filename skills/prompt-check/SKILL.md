@@ -121,19 +121,12 @@ fi
 
 # Timing instrumentation — env-gated, zero overhead when off.
 # When VOICEPROMPTKIT_TIMING=true, every phase boundary appends a
-# millisecond-precision line to $RUN_DIR/timing.log via log_t.
-# log_t is THE timing helper for every `log_t "<label>"` call in this skill.
-# If a later Bash call runs in a fresh shell where log_t is undefined,
-# re-paste these two one-line definitions (and TIMING_LOG) first — the log
-# format/labels must stay exactly as written at each call site.
-date_ms() { python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N; }
-log_t() { { [ "$VOICEPROMPTKIT_TIMING" = "true" ] && [ -n "$TIMING_LOG" ] && echo "[$(date_ms)] $1" >> "$TIMING_LOG"; } || true; }
-if [ "$VOICEPROMPTKIT_TIMING" = "true" ]; then
-  TIMING_LOG="$RUN_DIR/timing.log"
-  : > "$TIMING_LOG"
-  export TIMING_LOG
-fi
-log_t "phase_1_end (run-dir allocated: $RUN_DIR)"
+# millisecond-precision line to $RUN_DIR/timing.log. Each timing line below
+# is a SELF-CONTAINED one-liner (no shared helper): every phase runs in a
+# fresh shell, so functions/vars from this block would not survive. Keep the
+# log format/labels exactly as written at each call site.
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && : > "$RUN_DIR/timing.log"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_1_end (run-dir allocated: $RUN_DIR)" >> "$RUN_DIR/timing.log" || true
 
 # Bootstrap interactive state placeholders so Phase 9/10 can append without
 # checking existence. These start empty; Phase 9 writes the real session.json
@@ -166,7 +159,7 @@ Extract YAML frontmatter and merge it against env vars + project config + built-
 4. Built-in defaults
 
 ```bash
-log_t "phase_2_start"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_2_start" >> "$RUN_DIR/timing.log" || true
 PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
 "$PYTHON_CLI" - "$ABS_PROMPT" "$RUN_DIR" "$CONFIG_PATH" "$REPO_ROOT" <<'PY'
 import sys, re, json, os, hashlib, subprocess
@@ -438,7 +431,7 @@ with open(os.path.join(run_dir, 'frontmatter.json'), 'w', encoding='utf-8') as f
 with open(os.path.join(run_dir, 'body.txt'), 'w', encoding='utf-8') as f:
     f.write(body)
 PY
-log_t "phase_2_end"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_2_end" >> "$RUN_DIR/timing.log" || true
 ```
 
 If the Python block exits non-zero with an `error: Prompt file not found` or `error: ... is not valid UTF-8` message, surface that message to the user verbatim and STOP — do not continue with a raw traceback or a partial run.
@@ -448,7 +441,7 @@ If no Python interpreter (`python3` / `python` / `py`) is available, fall back t
 ## Phase 3 — Rule extraction (inline) + section_index build
 
 ```bash
-log_t "phase_3_start"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_3_start" >> "$RUN_DIR/timing.log" || true
 ```
 
 **Phase 3 also produces `section_index.json` — a deterministic line-to-section map.**
@@ -562,13 +555,13 @@ Hold the rules in memory as JSON. Also write `$RUN_DIR/rules.json` with shape:
 If you extract zero rules, abort with an error written to `$RUN_DIR/error.txt` and surface that to the user.
 
 ```bash
-log_t "phase_3_end"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_3_end" >> "$RUN_DIR/timing.log" || true
 ```
 
 ## Phase 3.5 — Lens-selection wizard (per-run)
 
 ```bash
-log_t "phase_3_5_start"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_3_5_start" >> "$RUN_DIR/timing.log" || true
 ```
 
 This wizard runs **once per `/prompt-check` invocation**, after rule extraction and before lens dispatch. It is separate from the Phase 0 repo-level wizard (which governs `.voicepromptkit.json` defaults). Phase 3.5 captures per-run intent.
@@ -708,7 +701,7 @@ Phase 9 writes this `user_intent` block into `session.json` at interactive entry
 Phase 7 handles a missing per-lens JSON file as "lens disabled" ONLY for lenses that were deselected or gate-skipped. A SELECTED lens with no output file is a runner failure — Phase 7's missing-artifact check catches it and surfaces a WARNING (see Phase 7).
 
 ```bash
-log_t "phase_3_5_end"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_3_5_end" >> "$RUN_DIR/timing.log" || true
 ```
 
 ## Phase 3.6 — Cache key compute (skip when bodies + config + refs are unchanged)
@@ -720,8 +713,7 @@ Same prompt body + same wizard config + same reference docs ⇒ same lens output
 **Cache directory:** `.voicepromptkit/_cache/<cache_key>/{lens}.json`. Repo-scoped (under `$REPO_ROOT`), not run-scoped. Run dirs (`run-NNN`) keep their full artefacts — cache hits copy from `_cache/` into `$RUN_DIR/` so the run dir remains self-contained.
 
 ```bash
-log_t "phase_3_6_start"
-
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_3_6_start" >> "$RUN_DIR/timing.log" || true
 CACHE_ROOT="$REPO_ROOT/.voicepromptkit/_cache"
 mkdir -p "$CACHE_ROOT"
 
@@ -818,7 +810,7 @@ PY
 # Source the printed CACHE_KEY / CACHE_DIR for use in Phase 4 / 5 / 6 / 8.
 eval $("$PYTHON_CLI" -c "import json,os; m=json.load(open('$RUN_DIR/cache_meta.json'));print(f\"CACHE_KEY={m['cache_key']}\\nCACHE_DIR={m['cache_dir']}\")")
 
-log_t "phase_3_6_end (cache_key=$CACHE_KEY)"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_3_6_end (cache_key=$CACHE_KEY)" >> "$RUN_DIR/timing.log" || true
 ```
 
 **Persistence contract:** before Phase 3.6 runs, the skill writes `user_intent.json` to `$RUN_DIR` (the in-memory `user_intent` block from Phase 3.5). This file is the deterministic input to the user_intent portion of the cache key. The same file is read by Phase 9 when it bootstraps `session.json`, so the write is reused — no extra IO.
@@ -936,9 +928,8 @@ dispatch list and runs normally. Cache hits also apply to `tr_phonetic` (when
 the lens is selected via `user_intent.tr_phonetic_enabled == true`).
 
 ```bash
-log_t "phase_4_dispatch_start"
-log_t "phase_6_dispatch_start"
-
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_4_dispatch_start" >> "$RUN_DIR/timing.log" || true
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_6_dispatch_start" >> "$RUN_DIR/timing.log" || true
 # Cache lookup: for each selected static lens, copy cached artefact into $RUN_DIR if present.
 # CACHE_DIR is exported by Phase 3.6. SELECTED_LENSES comes from user_intent.selected_lenses.
 PYTHON_CLI=$(command -v python3 || command -v python || command -v py || echo python3)
@@ -956,9 +947,9 @@ for lens_file in conflicts dominances gaps schema tr_phonetic; do
     # Validate JSON before trusting the cache entry.
     if "$PYTHON_CLI" -c "import json; json.load(open('$CACHE_DIR/$lens_file.json'))" 2>/dev/null; then
       cp "$CACHE_DIR/$lens_file.json" "$RUN_DIR/$lens_file.json"
-      log_t "cache_hit: $lens_file"
+      [ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] cache_hit: $lens_file" >> "$RUN_DIR/timing.log" || true
     else
-      log_t "cache_corrupt: $lens_file (will re-dispatch)"
+      [ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] cache_corrupt: $lens_file (will re-dispatch)" >> "$RUN_DIR/timing.log" || true
     fi
   fi
 done
@@ -1118,7 +1109,7 @@ If ALL four static lenses are deselected, no static-lens-runner dispatches happe
 `static-lens-runner` writes `$RUN_DIR/conflicts.json`, `$RUN_DIR/dominances.json`, `$RUN_DIR/gaps.json`, or `$RUN_DIR/schema.json` depending on which singleton call dispatched it. `tr-phonetic-runner` writes `$RUN_DIR/tr_phonetic.json`. The skill reads them in Phase 7 after awaiting ALL pending dispatches (the five lens runs plus drift, if drift was triggered).
 
 ```bash
-log_t "phase_4_dispatch_end"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_4_dispatch_end" >> "$RUN_DIR/timing.log" || true
 ```
 
 ## Phase 5 — Drift (conditional)
@@ -1139,7 +1130,7 @@ Write `$RUN_DIR/drift.json` with `skipped_reason: "no anchors, conflicts, or rol
 In either skip case the file shape is `{"scenarios": [], "runs": [], "verdicts": [], "skipped_reason": "..."}`. Move on to Phase 6.
 
 ```bash
-log_t "phase_5_skip"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_5_skip" >> "$RUN_DIR/timing.log" || true
 ```
 
 **Drift cache opt-in (Phase 3.6 cache key).** Drift output depends on LLM
@@ -1154,7 +1145,7 @@ if grep -q '"drift_reuse": *true' "$RUN_DIR/user_intent.json" 2>/dev/null \
    && [ -f "$CACHE_DIR/drift.json" ] \
    && "$PYTHON_CLI" -c "import json; json.load(open('$CACHE_DIR/drift.json'))" 2>/dev/null; then
   cp "$CACHE_DIR/drift.json" "$RUN_DIR/drift.json"
-  log_t "cache_hit: drift (opt-in)"
+  [ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] cache_hit: drift (opt-in)" >> "$RUN_DIR/timing.log" || true
   # Skip the drift-runner dispatch below.
 fi
 ```
@@ -1165,7 +1156,7 @@ call. Otherwise dispatch as documented below.
 Otherwise dispatch the `drift-runner` subagent (it is the only subagent this skill uses). Pass inputs and the output path as **separate** top-level fields so the subagent does not accidentally read its own future output:
 
 ```bash
-log_t "phase_5_start"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_5_start" >> "$RUN_DIR/timing.log" || true
 ```
 
 ```
@@ -1208,7 +1199,7 @@ Populate `expand_count_override` with `user_intent.expand_count` from Phase 3.5 
 `drift-runner` generates scenarios, simulates the model on each, judges outputs, and writes `$RUN_DIR/drift.json` with shape `{scenarios, runs, verdicts}`. The skill never decomposes drift inline because it is the only step whose token cost scales with prompt length.
 
 ```bash
-log_t "phase_5_end"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_5_end" >> "$RUN_DIR/timing.log" || true
 ```
 
 ## Phase 6 — Turkish phonetic lens (conditional — dispatched in the same turn as Phase 4)
@@ -1218,7 +1209,7 @@ log_t "phase_5_end"
 **Dispatch ordering:** Phase 6's `tr-phonetic-runner` call is the FIFTH parallel Agent call emitted in the same assistant turn as the four Phase 4 static lens dispatches (see "Phases 4 + 6 — Parallel lens dispatch" above). The Phase 6 detail below documents the per-runner contract; the dispatch shape (along with `isolation: "worktree"`) is part of the combined Phase 4+6 fan-out.
 
 ```bash
-log_t "phase_6_skip"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_6_skip" >> "$RUN_DIR/timing.log" || true
 ```
 
 When the gate passes, `tr-phonetic-runner` seeds `pronunciation_map` from any existing pronunciation guide block in the body, scans for new findings, dedupes against the seed, and writes a single `$RUN_DIR/tr_phonetic.json`. Every rule (skip rules, whitelist, strategy semantics, the "no semantic translation" hard rule, the three `fix_kind` values, the seed block formats and line-range tracking) lives in `references/tr-phonetic.md` — the subagent reads that document; the skill does not repeat the criteria here.
@@ -1264,13 +1255,13 @@ TR phonetic is already line-level / cheap; `compact_mode` has no effect on its a
 `tr-phonetic-runner` writes `$RUN_DIR/tr_phonetic.json` with shape `{ findings[], seed_entries[], warnings[] }`. The skill reads it in Phase 7.
 
 ```bash
-log_t "phase_6_dispatch_end"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_6_dispatch_end" >> "$RUN_DIR/timing.log" || true
 ```
 
 ## Phase 7 — Render outputs
 
 ```bash
-log_t "phase_7_start"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_7_start" >> "$RUN_DIR/timing.log" || true
 ```
 
 **Await all pending dispatches first.** Before reading any per-lens output, block until ALL in-flight Agent calls have returned: the four Phase 4 static-lens-runner singletons (conflict / dominance / gap / schema), the Phase 6 tr-phonetic-runner (if its gate passed), and the Phase 5 drift-runner (if its gate passed). Phase 7 is the synchronisation barrier — do not start reading per-lens JSONs until every dispatched runner has signalled completion (its output file is written).
@@ -1540,7 +1531,7 @@ Each row is built by `render_finding_row` (see "Table-format finding render" abo
 **Removed output modes:** `inline` (v0.2) and `html` (v0.3.1) are no longer supported. Phase 2 strips them with a warning; this phase need not handle them.
 
 ```bash
-log_t "phase_7_end"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_7_end" >> "$RUN_DIR/timing.log" || true
 ```
 
 ## Phase 8 — Terminal summary
@@ -1548,8 +1539,7 @@ log_t "phase_7_end"
 After all writes succeed, **mirror per-lens artefacts into the content-addressable cache, then update the `latest` pointer** so it points at this run (the run is now durable), then print the summary:
 
 ```bash
-log_t "phase_8_start"
-
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_8_start" >> "$RUN_DIR/timing.log" || true
 # Cache write: mirror this run's per-lens artefacts into the content-addressable cache.
 # Atomic via temp-then-rename. Idempotent — overwriting an existing entry is fine
 # because the cache_key already encodes every invalidating input.
@@ -1566,7 +1556,7 @@ if [ -n "$CACHE_DIR" ] && [ -d "$CACHE_DIR" ]; then
       cp "$src" "$tmp" && mv "$tmp" "$CACHE_DIR/$lens_file.json"
     fi
   done
-  log_t "cache_write_complete (key=$CACHE_KEY)"
+  [ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] cache_write_complete (key=$CACHE_KEY)" >> "$RUN_DIR/timing.log" || true
 fi
 
 # Update the `latest` pointer to this run (commit point). Cross-platform:
@@ -1680,7 +1670,7 @@ Timing log: <relative path to $RUN_DIR/timing.log>
 Otherwise omit — users without timing enabled see no change.
 
 ```bash
-log_t "phase_8_end"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_8_end" >> "$RUN_DIR/timing.log" || true
 ```
 
 After printing this block, **do not stop** — automatically transition to Phase 9 in the same turn. Phase 9 + Phase 10 are part of the default `/prompt-check` flow; the audit is not finished until the user either resolves every finding or explicitly cancels with "iptal".
@@ -1688,7 +1678,7 @@ After printing this block, **do not stop** — automatically transition to Phase
 ## Phase 9 — Interactive selection
 
 ```bash
-log_t "phase_9_start"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_9_start" >> "$RUN_DIR/timing.log" || true
 ```
 
 Triggered automatically once Phase 8 has printed its summary. There is no separate trigger phrase — the audit flow always passes through Phase 9. (The `/prompt-check-resume` slash command re-enters Phase 9 for a pending run from a previous session.)
@@ -2114,13 +2104,13 @@ Parsed N decisions: A applied, B overlay, C dismissed, D discussed, E TR-routed 
 The `F auto-filed` segment is appended only when `plan.auto_filed > 0`. Then hand off to Phase 10 in the same turn. Do not wait for further confirmation — the user already confirmed at Stage 1.5.
 
 ```bash
-log_t "phase_9_end"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_9_end" >> "$RUN_DIR/timing.log" || true
 ```
 
 ## Phase 10 — Action dispatch
 
 ```bash
-log_t "phase_10_start"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_10_start" >> "$RUN_DIR/timing.log" || true
 ```
 
 Phase 10 reads `session.json` and `decisions.jsonl` from Phase 9 and executes each decided action. The order below is fixed — see `references/overlay-format.md` Section 4 for the rationale.
@@ -2406,7 +2396,7 @@ What next:
 Update `session.json.phase = "complete"` and `session.json.updated_at` on exit. If any findings remain `pending` at this point (user did not address them and did not type `gerisini atla`), set `session.json.phase = "paused"` instead and remind the user they can resume with `/prompt-check-resume <run-NNN>`.
 
 ```bash
-log_t "phase_10_end"
+[ "$VOICEPROMPTKIT_TIMING" = "true" ] && echo "[$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s%3N)] phase_10_end" >> "$RUN_DIR/timing.log" || true
 ```
 
 ## Don'ts (cross-cutting)

@@ -182,6 +182,9 @@ ids already decided earlier in the same string are untouched, and later
 segments (including `hepsini X`) can still override them. `güvenli` means "the
 fix is a concrete replacement" (`fix_kind: "replace"`) — TR advisory findings
 are never in the decision set, so the auto-file rule (§4) is unaffected.
+Both filters match on EXPLICIT field values only: drift findings, which may
+carry no `severity` / `fix_kind` field, are never matched by `düşük` or
+`güvenli` (the safe direction — a drift verdict needs an explicit decision).
 
 **`gerisini X` vs `hepsini X`.** `gerisini X` applies the verb only to findings the user did NOT explicitly mention earlier in the decision string. `hepsini X` applies the verb to ALL findings, overriding any earlier per-id decision. Concretely, in `C1 yorum bırak; hepsini düzelt`, C1 ends up as `applied` (the `hepsini` clause overrides the earlier `yorum bırak` for C1). If the user wants to preserve earlier decisions, they should use `gerisini düzelt` instead.
 
