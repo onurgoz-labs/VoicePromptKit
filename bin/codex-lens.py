@@ -228,14 +228,18 @@ def main(argv=None):
         return 2
 
     # --- Run codex exec (exit 3 on failure / timeout) -----------------------
+    # With --log, Codex's JSONL event stream goes STRAIGHT to the log file
+    # instead of being buffered in RAM for the whole run (runs can last up
+    # to --timeout seconds and emit a large event stream). Without --log,
+    # stdout is still captured in memory for the failure tail.
     log_handle = open(args.log, "w", encoding="utf-8") if args.log else None
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            input=prompt,
+            stdin=subprocess.PIPE,
+            stdout=log_handle if log_handle else subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            capture_output=True,
-            timeout=args.timeout,
         )
     except FileNotFoundError:
         print(f"error: could not execute {codex_cli!r} — is Codex installed?",
@@ -244,7 +248,17 @@ def main(argv=None):
         if log_handle:
             log_handle.close()
         return 2
+    try:
+        # communicate() feeds the prompt, waits, and enforces the timeout;
+        # stdout_text is None when stdout is redirected to the log file.
+        stdout_text, stderr_text = proc.communicate(input=prompt,
+                                                    timeout=args.timeout)
     except subprocess.TimeoutExpired:
+        # kill() + wait() mirrors subprocess.run's own timeout handling —
+        # communicate() here could block again on pipes inherited by
+        # grandchild processes that survive the kill.
+        proc.kill()
+        proc.wait()
         print(f"error: codex exec for {label} timed out after {args.timeout}s.",
               file=sys.stderr)
         _safe_unlink(last_msg_path)
@@ -253,12 +267,15 @@ def main(argv=None):
         return 3
 
     if log_handle:
-        log_handle.write(result.stdout or "")
         log_handle.close()
 
-    if result.returncode != 0:
-        tail = (result.stderr or result.stdout or "").strip()[-800:]
-        print(f"error: codex exec for {label} exited {result.returncode}: {tail}",
+    if proc.returncode != 0:
+        # Prefer stderr; fall back to the captured stdout, or — when stdout
+        # was streamed to the log file — to the tail of that file.
+        tail = (stderr_text or stdout_text or "").strip()[-800:]
+        if not tail and args.log:
+            tail = _file_tail(args.log, 800)
+        print(f"error: codex exec for {label} exited {proc.returncode}: {tail}",
               file=sys.stderr)
         _safe_unlink(last_msg_path)
         return 3
@@ -297,6 +314,19 @@ def _safe_unlink(path):
         os.unlink(path)
     except OSError:
         pass
+
+
+def _file_tail(path, n):
+    """Last `n` characters of a file, read without loading the whole file.
+    Used for the failure tail when stdout was streamed to the --log file."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 4 * n))
+            return f.read().decode("utf-8", "replace").strip()[-n:]
+    except OSError:
+        return ""
 
 
 if __name__ == "__main__":
