@@ -1,6 +1,6 @@
 # Schema lens
 
-Read alongside `_shared.md` (which carries the output invariant, fix_strategy, severity heuristics, compact mode, section_ref, and render contract every lens depends on).
+Read alongside `_shared.md` (which carries the output invariant, fix_strategy, severity heuristics, compact mode, section_ref, compact writing, and language switching every lens depends on).
 
 Detects structural issues in prompts that use numbered sections (e.g. system prompts, voice agent scripts, structured Vapi flows). The lens parses the body for ATX heading patterns and reports anomalies in section numbering, ordering, parent-child consistency, and heading style.
 
@@ -87,6 +87,22 @@ For `step_gap`:
 ```
 
 Schema findings use `lens: "schema"` when merged into `findings.json`. `rule_ids: []` is intentional — the schema lens parses headings directly, not the rule list. It does **not** depend on `rules.json`.
+
+## Language switching — rationale templates per kind
+
+For schema findings, use the per-`kind` rationale templates below. Substitute the live numbers/letters but keep the wording in `report_language`:
+
+| kind | TR rationale template | EN rationale template |
+|---|---|---|
+| section_gap | "Bölüm N → Bölüm N+2: Bölüm N+1 eksik." | "Section N → Section N+2: Section N+1 missing." |
+| subsection_gap | "N.M → N.M+2: N.(M+1) eksik." | "N.M → N.M+2: N.(M+1) missing." |
+| out_of_order | "Bölüm/altbölüm sırasız: B önce A geliyor." | "Section/subsection out of order: B before A." |
+| subsection_orphan | "Altbölüm B.X, Bölüm A'nın altında — uyumsuz." | "Subsection B.X under Section A — mismatched." |
+| heading_style_inconsistent | "Başlık stili tutarsız: bazıları BÜYÜK, bazıları Başlık formatında." | "Heading style inconsistent: some ALL CAPS, some Title Case." |
+| missing_parent | "Altbölüm N.M var ama '## SECTION N' başlığı yok." | "Subsection N.M exists but no '## SECTION N' parent." |
+| step_gap | "STEP N → STEP N+2: STEP N+1 eksik." | "STEP N → STEP N+2: STEP N+1 missing." |
+
+Schema `suggested_fix` strings follow the same compact-writing cap (≤ 150 chars) and the same language switch (both defined in `_shared.md`).
 
 ## fix_kind dispatch
 

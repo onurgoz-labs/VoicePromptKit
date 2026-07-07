@@ -81,7 +81,7 @@ After Phase 7 produces `findings.json`, the skill renders a single markdown tabl
 
 **Sort order:** severity descending (`high` → `medium` → `low`) → lens group → `line` ascending. Stable sort — preserve `findings.json` order on ties.
 
-**Columns:** the table matches `report.md` exactly — six columns, translated per `report_language`. See `lens-rules.md` "Render contract — table format + compact writing" for the canonical column definitions, content rules, and translations.
+**Columns:** the table matches `report.md` exactly — six columns, translated per `report_language`. The canonical column definitions, content rules, and translations live in SKILL.md Phase 7 (`TEMPLATE_STRINGS` + findings-table contract).
 
 | Language | id | lens | severity | section/line | rationale | fix |
 |---|---|---|---|---|---|---|
