@@ -24,7 +24,7 @@ Cross-lens content every lens depends on:
 - Compact writing invariant (≤ 200 chars rationale, ≤ 150 chars fix)
 - Language switching — canonical TR/EN example pair
 
-The render contract (markdown table format, column translations, sort order) lives in SKILL.md Phase 7 (`TEMPLATE_STRINGS` + findings-table contract) — runners emit JSON, never tables, so it is not in `_shared.md`.
+The render contract (markdown table format, sort order) lives in SKILL.md Phase 7, with the `TEMPLATE_STRINGS` column translations in `references/render.md` — runners emit JSON, never tables, so it is not in `_shared.md`.
 
 ## Rule extraction
 

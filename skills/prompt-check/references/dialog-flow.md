@@ -85,7 +85,7 @@ options:
 
 This question is **advisory only** — anchors live in the `<prompt>.anchors.yaml` sidecar, not in `session.json`. If the user says `Evet, sonra`, set `user_intent.anchors_added: false` and add a one-line reminder to the summary footer: `_Reminder: add anchors to <prompt>.anchors.yaml before the next audit._`
 
-**Report language (wizard's 7th question).** After the 6 lens-related questions, the wizard asks a 7th question: `report_language` (`tr` / `en`, default `tr`). This controls the language of skill-rendered text in report.md, the Phase 8 terminal summary, and Phase 9 dialog prompts. Lens-generated content (rationale, suggested_fix, current_excerpt) stays in whatever language the runner produced — only the skill's template strings translate. The full TEMPLATE_STRINGS dictionary lives in SKILL.md Phase 7; this file just acknowledges the field exists and its scope (template-only translation).
+**Report language (wizard's 7th question).** After the 6 lens-related questions, the wizard asks a 7th question: `report_language` (`tr` / `en`, default `tr`). This controls the language of skill-rendered text in report.md, the Phase 8 terminal summary, and Phase 9 dialog prompts. Lens-generated content (rationale, suggested_fix, current_excerpt) stays in whatever language the runner produced — only the skill's template strings translate. The full TEMPLATE_STRINGS dictionary lives in `references/render.md` (read at SKILL.md Phase 7); this file just acknowledges the field exists and its scope (template-only translation).
 
 ## 2 — Summary view rendering (Phase 9, after audit completes)
 
@@ -93,7 +93,7 @@ After Phase 7 produces `findings.json`, the skill renders a single markdown tabl
 
 **Sort order:** severity descending (`high` → `medium` → `low`) → lens group → `line` ascending. Stable sort — preserve `findings.json` order on ties.
 
-**Columns:** the table matches `report.md` exactly — six columns, translated per `report_language`. The canonical column definitions, content rules, and translations live in SKILL.md Phase 7 (`TEMPLATE_STRINGS` + findings-table contract).
+**Columns:** the table matches `report.md` exactly — six columns, translated per `report_language`. The canonical column definitions and content rules live in SKILL.md Phase 7 (findings-table contract); the `TEMPLATE_STRINGS` translations live in `references/render.md`.
 
 | Language | id | lens | severity | section/line | rationale | fix |
 |---|---|---|---|---|---|---|
