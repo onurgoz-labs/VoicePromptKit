@@ -1,6 +1,6 @@
 ---
 name: prompt-chat-session
-description: Resume an in-progress /prompt-chat session at the given run directory. Launched by /prompt-chat's "Open new window" isolation mode (`claude '/prompt-chat-session <run-dir>'`) in a fresh Claude Code window — validates the run dir, then immediately execs the Python orchestrator (`bin/prompt-chat-runner.py`) which owns the actual chat loop. Not normally invoked manually.
+description: Resume an in-progress /prompt-chat session at the given run directory. Launched by /prompt-chat in a fresh window (`claude '/prompt-chat-session <run-dir>'`) — validates the run dir, then execs bin/prompt-chat-runner.py. Not normally invoked manually.
 ---
 
 # prompt-chat-session

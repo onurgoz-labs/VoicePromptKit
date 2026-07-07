@@ -45,7 +45,9 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import uuid
+from collections import deque
 from queue import Empty, Queue
 
 # v0.5.11: readline is stdlib on macOS/Linux but not bundled on Windows.
@@ -517,10 +519,15 @@ def main() -> int:
     report_language = fm.get("report_language", "tr")
     chat_model = fm.get("chat_model_alias") or "haiku"
 
+    # Startup session mutations are BATCHED: the fields below are set in
+    # memory and persisted by the single _atomic_write_json call before the
+    # welcome banner. A first run used to rewrite session.json 4 times here;
+    # one write is enough and still lands before the subprocess spawn (the
+    # ordering guarantee callers rely on).
+
     # Persist the chat_session_uuid across runs of this script. /reset clears it.
     if not session.get("chat_session_uuid"):
         session["chat_session_uuid"] = str(uuid.uuid4())
-        _atomic_write_json(session_path, session)
     chat_session_uuid = session["chat_session_uuid"]
 
     # v0.5.19: stamp the session start time the first time this run dir is
@@ -531,7 +538,6 @@ def main() -> int:
     if not session.get("session_started_at"):
         session["session_started_at"] = datetime.datetime.now(
             datetime.timezone.utc).isoformat()
-        _atomic_write_json(session_path, session)
 
     if not (os.path.exists(CLAUDE_CLI) or shutil.which("claude")):
         msg = ("error: 'claude' CLI not found on PATH. Install Claude Code first."
@@ -547,7 +553,6 @@ def main() -> int:
         first = random.choice(_TR_FIRST_NAMES)
         last = random.choice(_TR_LAST_NAMES)
         session["caller_name"] = f"{first} {last}"
-        _atomic_write_json(session_path, session)
     caller_name = session["caller_name"]
 
     # v0.6.0: resolve this chat's variable bindings — run-dir variables.json
@@ -564,6 +569,8 @@ def main() -> int:
     if bound_caller and session.get("caller_name") != bound_caller:
         session["caller_name"] = bound_caller
         caller_name = bound_caller
+    # Single batched persist of all startup mutations (uuid, start stamp,
+    # caller identity, bound caller) — must stay ahead of ctx.start().
     _atomic_write_json(session_path, session)
 
     # Welcome banner prints inline in the user's terminal.
@@ -677,6 +684,11 @@ def _strip_end_call_marker(reply: str) -> tuple[str, bool]:
 # first line of its opening reply; we extract X and strip the line.
 _PERSONA_NAME_RE = re.compile(r"^\s*\[PERSONA_NAME:\s*([^\]\n]+?)\s*\]\s*\n?", re.MULTILINE)
 
+# Silence-turn convention used by /silence and recognised when rebuilding a
+# flow anchor from chat.jsonl (`_build_flow_anchor`). Compiled once at module
+# level instead of per loop iteration.
+_SILENCE_INPUT_RE = re.compile(r"^\s*\[silence for (\d+) seconds\]\s*$", re.IGNORECASE)
+
 
 def _strip_persona_name_marker(reply: str) -> tuple[str, str | None]:
     """Returns (clean_reply, persona_name_or_None)."""
@@ -705,7 +717,7 @@ class _SubprocessCtx:
         self.model = model
         self.proc: subprocess.Popen | None = None
         self.stdout_queue: Queue = Queue()
-        self.stderr_buf: list[str] = []
+        self.stderr_buf: "deque[str]" = deque(maxlen=100)
         self._reader_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
         self._first_send_done = False
@@ -719,7 +731,6 @@ class _SubprocessCtx:
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--verbose",                          # required for stream-json output
-            "--include-partial-messages",          # v0.5.6: stream text deltas for low TTFT
             "--effort", "low",                     # v0.5.11: persona roleplay doesn't need extended thinking — ~%19 faster
             "--exclude-dynamic-system-prompt-sections",  # v0.5.11: better cross-turn cache reuse
             "--model", self.model,
@@ -727,6 +738,12 @@ class _SubprocessCtx:
             "--allowedTools", "",
             "--permission-mode", "bypassPermissions",
         ]
+        if _RICH:
+            # v0.5.6: stream text deltas for low TTFT. Only the Rich Live
+            # renderer displays them — the stdlib fallback buffers the full
+            # reply behind a spinner — so in non-Rich mode we skip the flag
+            # instead of parsing partial events nobody renders.
+            cmd.insert(cmd.index("--verbose") + 1, "--include-partial-messages")
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -744,7 +761,9 @@ class _SubprocessCtx:
         # `None` into the new queue. That stale sentinel was the intermittent
         # "claude subprocess EOF before result" seen right after a respawn.
         q: Queue = Queue()
-        buf: list[str] = []
+        # Bounded: _stderr_tail only ever reports the last 10 lines, so an
+        # unbounded list would just grow for the session lifetime.
+        buf: "deque[str]" = deque(maxlen=100)
         self.stdout_queue = q
         self.stderr_buf = buf
         self._reader_thread = threading.Thread(
@@ -769,7 +788,7 @@ class _SubprocessCtx:
             q.put(line)
         q.put(None)  # sentinel: eof
 
-    def _read_stderr(self, buf: list) -> None:
+    def _read_stderr(self, buf: "deque[str]") -> None:
         proc = self.proc
         if proc is None or proc.stderr is None:
             return
@@ -789,6 +808,18 @@ class _SubprocessCtx:
         assert self.proc is not None and self.proc.stdin is not None
         if self.proc.poll() is not None:
             raise RuntimeError(f"claude subprocess died: {self._stderr_tail()}")
+
+        # Drain any stale events left over from a previous timed-out turn.
+        # On a turn timeout send() raises but the reader thread keeps pushing
+        # the late reply's events into the queue; without this drain the NEXT
+        # send() would consume those stale events first and return the
+        # PREVIOUS turn's reply, leaving the session one turn out of sync
+        # for the rest of its life.
+        while True:
+            try:
+                self.stdout_queue.get_nowait()
+            except Empty:
+                break
 
         msg = {
             "type": "user",
@@ -837,7 +868,9 @@ class _SubprocessCtx:
                 # they're identical content, but chunks reflect what the user saw.
                 full = "".join(chunks).strip() if chunks else (evt.get("result") or "").strip()
                 return full
-        raise RuntimeError(f"claude timed out waiting for reply (>{timeout}s)")
+        raise RuntimeError(
+            f"claude timed out waiting for reply (>{timeout}s); the late "
+            f"reply, if any, will be discarded before the next turn")
 
     def close(self) -> None:
         if self.proc is None:
@@ -853,11 +886,11 @@ class _SubprocessCtx:
             self.proc.kill()
 
     def _stderr_tail(self) -> str:
-        return "\n".join(self.stderr_buf[-10:])
+        # deque doesn't support slicing — materialise before taking the tail.
+        return "\n".join(list(self.stderr_buf)[-10:])
 
 
 def _now_monotonic() -> float:
-    import time
     return time.monotonic()
 
 
@@ -1349,7 +1382,7 @@ def _build_flow_anchor(entries: list, report_language: str) -> "dict | None":
           else "\nAssertions per bot turn (Enter = generic rubric):")
     flow_turns = []
     for idx, (u, a) in enumerate(pairs):
-        m = re.match(r"^\s*\[silence for (\d+) seconds\]\s*$", u, re.IGNORECASE)
+        m = _SILENCE_INPUT_RE.match(u)
         if m:
             flow_turns.append({"kind": "silence_input", "duration_seconds": int(m.group(1))})
         else:
